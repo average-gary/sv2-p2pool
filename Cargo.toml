@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sv2-p2pool-engine",
+    "crates/sv2-p2pool-pool",
+    "crates/sv2-p2pool-ipc",
+]
+# Vendored crates live in their own workspaces under vendor/{sv2-apps,p2poolv2}/.
+# `exclude` makes the boundary explicit so cargo's workspace discovery doesn't
+# attach vendored crates to OUR workspace when our members reference them via
+# path deps.
+exclude = [
+    "vendor/sv2-apps",
+    "vendor/p2poolv2",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/average-gary/sv2-p2pool"
+rust-version = "1.88"
+publish = false
+
+[workspace.dependencies]
+async-trait = "0.1"
+dashmap     = "6"
+tokio       = { version = "1.44", features = ["full"] }
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow      = "1"
+thiserror   = "2"
+serde       = { version = "1", features = ["derive"] }
+toml        = "0.8"
+
+# Cap'n Proto — pinned tight so generated bindings don't churn.
+capnp     = "=0.25"
+capnp-rpc = "=0.25"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+strip = "symbols"
+panic = "abort"

@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# don't track local config overrides
+/config/local.*.toml

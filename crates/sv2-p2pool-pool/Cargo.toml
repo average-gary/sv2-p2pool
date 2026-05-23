@@ -1,0 +1,23 @@
+[package]
+name = "sv2-p2pool-pool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "SV2 mining pool binary using p2poolv2 as share-chain backend"
+
+[[bin]]
+name = "sv2-p2pool"
+path = "src/main.rs"
+
+[dependencies]
+sv2-p2pool-engine = { path = "../sv2-p2pool-engine" }
+
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow             = { workspace = true }
+serde              = { workspace = true }
+toml               = { workspace = true }

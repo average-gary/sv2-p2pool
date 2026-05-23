@@ -1,0 +1,13 @@
+[package]
+name = "sv2-p2pool-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Cap'n Proto client for talking to a p2poolv2 IPC daemon (Phase 2)"
+
+[dependencies]
+# Phase 2 will add: capnp = { workspace = true }, capnp-rpc = { workspace = true }
+# Empty for now — depends on a p2poolv2 upstream PR that has not yet landed.

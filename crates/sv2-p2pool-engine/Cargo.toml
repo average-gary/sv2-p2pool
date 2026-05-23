@@ -1,0 +1,24 @@
+[package]
+name = "sv2-p2pool-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "JobValidationEngine implementation backed by p2poolv2's share chain"
+
+[dependencies]
+async-trait = { workspace = true }
+dashmap     = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+anyhow      = { workspace = true }
+thiserror   = { workspace = true }
+
+# sv2-apps trait we implement
+jd_server_sv2 = { path = "../../vendor/sv2-apps/pool-apps/jd-server" }
+stratum-apps  = { path = "../../vendor/sv2-apps/stratum-apps" }
+
+# p2poolv2 share-chain backend (Phase 1: in-process)
+p2poolv2_lib = { path = "../../vendor/p2poolv2/p2poolv2_lib" }

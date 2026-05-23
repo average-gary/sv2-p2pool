@@ -1,0 +1,26 @@
+# sv2-p2pool example config (Phase 0 stub — not yet consumed)
+
+[pool]
+listen_address = "0.0.0.0:34254"
+authority_secret_key = "REPLACE_ME"
+authority_public_key = "REPLACE_ME"
+cert_validity_sec = 3600
+
+[jds]
+listen_address = "0.0.0.0:34264"
+supported_extensions = []
+required_extensions = []
+
+[p2pool]
+mode = "embedded"  # or "ipc" once Phase 2 lands
+config_path = "./vendor-config/p2pool.toml"
+
+[bitcoind]
+url = "http://localhost:38332"
+user = "user"
+password = "password"
+zmq_block = "tcp://localhost:28332"
+
+[monitoring]
+listen_address = "127.0.0.1:9090"
+cache_refresh_secs = 15
