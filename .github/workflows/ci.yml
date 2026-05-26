@@ -5,6 +5,17 @@ on:
   push:
     branches: [main]
 
+# Least-privilege default: build/test/lint only need read access to repo
+# contents. No deploy/comment/release surface is required for this workflow.
+permissions:
+  contents: read
+
+# Cancel in-flight runs for the same ref (PR or branch) when a new commit
+# is pushed, so successive pushes don't stack up CI runners.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -22,13 +33,23 @@ jobs:
           submodules: recursive
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@stable
+        # Pinned to @v1 (tag) rather than the floating @stable branch ref
+        # so a compromised force-push to the action repo's stable branch
+        # cannot silently change what runs in our CI.
+        uses: dtolnay/rust-toolchain@v1
         with:
           # rust-toolchain.toml pins channel = "1.88" with rustfmt + clippy.
           # We name it explicitly here so the action installs the right
           # components even before cargo reads the toolchain file.
           toolchain: "1.88"
           components: rustfmt, clippy
+
+      # bitcoin-capnp-types (pulled in transitively via sv2-apps's
+      # bitcoin-core-sv2 crate) has a build script that shells out to the
+      # `capnp` binary. The GitHub-hosted ubuntu-latest image does not
+      # ship it, so install it before any cargo invocation.
+      - name: Install capnproto
+        run: sudo apt-get update && sudo apt-get install -y capnproto
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
@@ -38,14 +59,14 @@ jobs:
       - name: cargo fmt --all -- --check
         run: cargo fmt --all -- --check
 
-      - name: cargo check --workspace
-        run: cargo check --workspace
+      - name: cargo check --workspace --locked
+        run: cargo check --workspace --locked
 
       - name: cargo clippy --workspace --all-targets -- -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: cargo test --workspace
-        run: cargo test --workspace
+      - name: cargo test --workspace --locked
+        run: cargo test --workspace --locked
 
   # Secondary job: sanity-check that the vendored sv2-apps subworkspaces
   # still compile at their own declared MSRV (1.85). sv2-apps lives in its
@@ -61,9 +82,14 @@ jobs:
           submodules: recursive
 
       - name: Install Rust 1.85
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: "1.85"
+
+      # Same rationale as the workspace job: bitcoin-core-sv2 transitively
+      # depends on bitcoin-capnp-types, whose build script needs capnp.
+      - name: Install capnproto
+        run: sudo apt-get update && sudo apt-get install -y capnproto
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
@@ -71,13 +97,13 @@ jobs:
           shared-key: sv2-apps-1.85
 
       - name: cargo check pool-apps
-        run: cargo check --manifest-path vendor/sv2-apps/pool-apps/Cargo.toml
+        run: cargo check --locked --manifest-path vendor/sv2-apps/pool-apps/Cargo.toml
 
       - name: cargo check miner-apps
-        run: cargo check --manifest-path vendor/sv2-apps/miner-apps/Cargo.toml
+        run: cargo check --locked --manifest-path vendor/sv2-apps/miner-apps/Cargo.toml
 
       - name: cargo check stratum-apps
-        run: cargo check --manifest-path vendor/sv2-apps/stratum-apps/Cargo.toml
+        run: cargo check --locked --manifest-path vendor/sv2-apps/stratum-apps/Cargo.toml
 
       - name: cargo check bitcoin-core-sv2
-        run: cargo check --manifest-path vendor/sv2-apps/bitcoin-core-sv2/Cargo.toml
+        run: cargo check --locked --manifest-path vendor/sv2-apps/bitcoin-core-sv2/Cargo.toml
