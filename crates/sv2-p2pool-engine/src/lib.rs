@@ -27,9 +27,12 @@ use stratum_apps::utils::types::JdToken;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
+pub mod coinbase;
+mod engine_impl;
 pub mod recent_solutions;
 pub mod reorg_detector;
 
+pub use coinbase::{CoinbaseReconstructError, merkle_path, reconstruct_coinbase};
 pub use recent_solutions::RecentSolutions;
 pub use reorg_detector::{DEFAULT_POLL_PERIOD, ReorgDetector};
 
@@ -120,15 +123,25 @@ impl DeclaredJobCache {
     }
 }
 
-/// Token-allocation tracking. Mirrors
-/// `BitcoinCoreIPCEngine::allocated_token_entries` but stores the
-/// per-token payout script chosen by the JDC at allocation time
-/// (per ADR 0002 § Decision § 1).
+/// Token-payout binding. Per ADR 0002 § Decision § 1.
 ///
-/// The map is populated by the binary's token-allocation interceptor
-/// (Phase 1.5) BEFORE the JDS sees the message. The engine reads from it
-/// inside `handle_push_solution` to credit the right p2pool miner.
+/// Maps each `JdToken` to the miner's coinbase payout script chosen by
+/// the JDC at allocation time. Populated by the binary's token-allocation
+/// interceptor (Phase 1.5) BEFORE the JDS sees the message. The engine
+/// reads from it inside `handle_push_solution` to credit the right
+/// p2pool miner.
 pub type TokenPayoutMap = Arc<DashMap<JdToken, ScriptBuf>>;
+
+/// Token → request_id binding. Mirrors
+/// `BitcoinCoreIPCEngine::allocated_token_entries`'s lookup role at
+/// `vendor/sv2-apps/pool-apps/jd-server/src/lib/job_declarator/job_validation/bitcoin_core_ipc.rs:213`.
+///
+/// `handle_declare_mining_job` writes (token, request_id) on Success;
+/// `handle_set_custom_mining_job` reads + removes the entry to find the
+/// matching declared-job snapshot. Decoupled from `TokenPayoutMap`
+/// because the latter is owned by the binary's interceptor and lives
+/// across the trait boundary, while this map is engine-internal state.
+pub type AllocatedTokenMap = Arc<DashMap<JdToken, RequestId>>;
 
 /// Phase 1 engine surface.
 ///
@@ -144,6 +157,7 @@ pub type TokenPayoutMap = Arc<DashMap<JdToken, ScriptBuf>>;
 /// The trait impl methods land in Phase 1.2 — 1.4 below.
 pub struct P2poolV2Engine {
     declared_jobs: DeclaredJobCache,
+    allocated_tokens: AllocatedTokenMap,
     token_payout: TokenPayoutMap,
     recent_solutions: Arc<RecentSolutions>,
     /// Bitcoin network this engine targets. Used by accounting + payout.
@@ -165,11 +179,17 @@ impl P2poolV2Engine {
     pub fn new(network: bitcoin::Network) -> Self {
         Self {
             declared_jobs: DeclaredJobCache::new(),
+            allocated_tokens: Arc::new(DashMap::new()),
             token_payout: Arc::new(DashMap::new()),
             recent_solutions: Arc::new(RecentSolutions::new(DEFAULT_RECENT_SOLUTIONS_TTL)),
             network,
             reorg_watcher: None,
         }
+    }
+
+    /// Internal access to the allocated-tokens map for the trait impl.
+    pub(crate) fn allocated_tokens(&self) -> &AllocatedTokenMap {
+        &self.allocated_tokens
     }
 
     /// Access the declared-jobs cache.
