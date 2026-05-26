@@ -23,15 +23,17 @@
 use std::sync::Arc;
 
 use jd_server_sv2::job_declarator::job_validation::JobValidationEngine;
+use pool_sv2::config::PoolConfig;
 use sv2_p2pool_engine::P2poolV2Engine;
+
+use crate::Pool;
 
 /// Composes a [`P2poolV2Engine`] with the bits sv2-apps needs to start
 /// a `JobDeclarator`.
 ///
-/// Phase 1.5 scope: enough to construct the engine + expose it as
-/// `Arc<dyn JobValidationEngine>` for `JobDeclarator::new`. Phase 1.7
-/// will compose this into a runnable binary; Phase 1.6 wires
-/// ChannelManager.
+/// Phase 1.5/1.6 scope: enough to construct the engine, expose it as
+/// `Arc<dyn JobValidationEngine>` for `JobDeclarator::new`, and produce
+/// a [`Pool`] given a loaded [`PoolConfig`].
 pub struct PoolBuilder {
     network: bitcoin::Network,
 }
@@ -58,6 +60,12 @@ impl PoolBuilder {
     /// can be passed to `jd_server_sv2::JobDeclarator::new`.
     pub fn build_engine_arc(&self) -> Arc<dyn JobValidationEngine> {
         Arc::new(self.build_engine())
+    }
+
+    /// Build a [`Pool`] from a loaded [`PoolConfig`]. The pool isn't
+    /// started until [`Pool::start`] is called.
+    pub fn build_pool(self, config: PoolConfig) -> Pool {
+        Pool::new(config)
     }
 }
 
