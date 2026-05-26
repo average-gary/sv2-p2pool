@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least-privilege default: build/test/lint only need read access to repo
+# contents. No deploy/comment/release surface is required for this workflow.
+permissions:
+  contents: read
+
+# Cancel in-flight runs for the same ref (PR or branch) when a new commit
+# is pushed, so successive pushes don't stack up CI runners.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Primary job: build/test/lint OUR workspace at the root toolchain (1.88,
+  # pinned by rust-toolchain.toml). Submodules are checked out recursively
+  # because our path-deps point into vendor/sv2-apps and vendor/p2poolv2.
+  workspace:
+    name: workspace (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        # Pinned to @v1 (tag) rather than the floating @stable branch ref
+        # so a compromised force-push to the action repo's stable branch
+        # cannot silently change what runs in our CI.
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          # rust-toolchain.toml pins channel = "1.88" with rustfmt + clippy.
+          # We name it explicitly here so the action installs the right
+          # components even before cargo reads the toolchain file.
+          toolchain: "1.88"
+          components: rustfmt, clippy
+
+      # bitcoin-capnp-types (pulled in transitively via sv2-apps's
+      # bitcoin-core-sv2 crate) has a build script that shells out to the
+      # `capnp` binary AND imports `/capnp/c++.capnp` from the standard
+      # include path. On Ubuntu the binary lives in `capnproto` and the
+      # schema headers live in `libcapnp-dev`; we need both.
+      - name: Install capnproto
+        run: sudo apt-get update && sudo apt-get install -y capnproto libcapnp-dev
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-1.88
+
+      - name: cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo check --workspace --locked
+        run: cargo check --workspace --locked
+
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test --workspace --locked
+        run: cargo test --workspace --locked
+
+  # Secondary job: sanity-check that the vendored sv2-apps subworkspaces
+  # still compile at their own declared MSRV (1.85). sv2-apps lives in its
+  # own workspace tree under vendor/sv2-apps and is `exclude`d from ours,
+  # so we drive cargo against each subworkspace's manifest explicitly.
+  sv2-apps-msrv:
+    name: sv2-apps MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.85"
+
+      # Same rationale as the workspace job: bitcoin-core-sv2 transitively
+      # depends on bitcoin-capnp-types, whose build script needs both the
+      # `capnp` binary and the `libcapnp-dev` schema headers (for
+      # `/capnp/c++.capnp` imports).
+      - name: Install capnproto
+        run: sudo apt-get update && sudo apt-get install -y capnproto libcapnp-dev
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sv2-apps-1.85
+
+      # NOTE on `--locked`: we intentionally do NOT pass --locked to these
+      # vendored manifest-path checks. Each sv2-apps subworkspace ships
+      # its own Cargo.lock that we don't author, and at least
+      # bitcoin-core-sv2 pins `stratum-core` to a moving git branch — so
+      # locking us to upstream's Cargo.lock would make our CI red whenever
+      # upstream's branch tip moves, even though our own deps are
+      # untouched. The MSRV job's job is to flag rustc-version regressions
+      # in vendored code; the workspace job's `--locked` already guards
+      # OUR Cargo.lock.
+      - name: cargo check pool-apps
+        run: cargo check --manifest-path vendor/sv2-apps/pool-apps/Cargo.toml
+
+      - name: cargo check miner-apps
+        run: cargo check --manifest-path vendor/sv2-apps/miner-apps/Cargo.toml
+
+      - name: cargo check stratum-apps
+        run: cargo check --manifest-path vendor/sv2-apps/stratum-apps/Cargo.toml
+
+      - name: cargo check bitcoin-core-sv2
+        run: cargo check --manifest-path vendor/sv2-apps/bitcoin-core-sv2/Cargo.toml
