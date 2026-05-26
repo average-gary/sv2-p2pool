@@ -16,9 +16,17 @@ tracing     = { workspace = true }
 anyhow      = { workspace = true }
 thiserror   = { workspace = true }
 
+# Bitcoin types — pinned to the same version p2poolv2_lib pulls in (0.32.x) so
+# `BlockHash` is the same type across the engine boundary.
+bitcoin     = "0.32"
+
 # sv2-apps trait we implement
 jd_server_sv2 = { path = "../../vendor/sv2-apps/pool-apps/jd-server" }
 stratum-apps  = { path = "../../vendor/sv2-apps/stratum-apps" }
 
 # p2poolv2 share-chain backend (Phase 1: in-process)
 p2poolv2_lib = { path = "../../vendor/p2poolv2/p2poolv2_lib" }
+
+[dev-dependencies]
+proptest = "1"
+tokio    = { workspace = true, features = ["full", "test-util"] }
