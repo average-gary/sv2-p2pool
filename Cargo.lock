@@ -4688,6 +4688,7 @@ name = "sv2-p2pool-pool"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bitcoin",
  "serde",
  "sv2-p2pool-engine",
  "tokio",

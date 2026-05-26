@@ -15,6 +15,10 @@ path = "src/main.rs"
 [dependencies]
 sv2-p2pool-engine = { path = "../sv2-p2pool-engine" }
 
+# Bitcoin types — pinned to the same version sv2-p2pool-engine pulls in
+# (0.32.x) so the Network enum is the same type across the boundary.
+bitcoin            = "0.32"
+
 tokio              = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
