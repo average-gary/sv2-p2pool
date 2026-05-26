@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod recent_solutions;
+
 /// Placeholder so the crate compiles before the Phase 1 implementation lands.
 pub struct P2poolV2Engine;
 
