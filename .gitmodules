@@ -3,4 +3,8 @@
 	url = https://github.com/stratum-mining/sv2-apps
 [submodule "vendor/p2poolv2"]
 	path = vendor/p2poolv2
-	url = https://github.com/p2poolv2/p2poolv2
+	# Pointing at the maintainer's fork so we can host upstream-PR-bound
+	# branches (feat/bitcoind-trait, feat/capnp-ipc) for CI without
+	# pushing to the canonical p2poolv2/p2poolv2 repo.
+	# Fork tracks upstream main; feature branches are pushed only here.
+	url = https://github.com/average-gary/p2pool-v2
