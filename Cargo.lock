@@ -4689,6 +4689,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "bitcoin",
+ "jd_server_sv2",
  "serde",
  "sv2-p2pool-engine",
  "tokio",
