@@ -29,7 +29,7 @@ use tracing::{debug, info, warn};
 pub mod recent_solutions;
 pub mod reorg_detector;
 
-pub use reorg_detector::{ReorgDetector, DEFAULT_POLL_PERIOD};
+pub use reorg_detector::{DEFAULT_POLL_PERIOD, ReorgDetector};
 
 /// Opaque request-id used to key declared-job cache entries. Mirrors
 /// `BitcoinCoreIPCEngine::declared_custom_jobs`'s
@@ -200,10 +200,7 @@ impl Default for P2poolV2Engine {
 /// Drains tip-change broadcasts and invalidates the cache for each.
 ///
 /// Lives outside `P2poolV2Engine` so the spawned task doesn't borrow `self`.
-async fn reorg_invalidator_loop(
-    mut rx: broadcast::Receiver<BlockHash>,
-    cache: DeclaredJobCache,
-) {
+async fn reorg_invalidator_loop(mut rx: broadcast::Receiver<BlockHash>, cache: DeclaredJobCache) {
     loop {
         match rx.recv().await {
             Ok(new_tip) => {
@@ -235,8 +232,8 @@ async fn reorg_invalidator_loop(
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use std::time::Duration;
 
@@ -295,8 +292,7 @@ mod tests {
         }
 
         // Observer should have seen tip_b (the change), and cache should be empty.
-        let received =
-            tokio::time::timeout(Duration::from_millis(500), observer.recv()).await;
+        let received = tokio::time::timeout(Duration::from_millis(500), observer.recv()).await;
         assert_eq!(
             received.expect("recv timed out").ok(),
             Some(hash_from_u64(2))
