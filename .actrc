@@ -1,0 +1,17 @@
+# Default config for nektos/act (https://github.com/nektos/act).
+# Lets contributors run our GitHub Actions CI locally without burning
+# GitHub-hosted runner minutes. See README.md "Local CI" for usage.
+
+# Map ubuntu-latest to a medium-size catthehacker image. The default `act`
+# slim image is ~200MB but lacks build tools (gcc, make, curl, sudo) that
+# our cargo + capnproto + apt-get steps need. The `act-latest` medium
+# image (~1.5GB) ships those tools and is the de-facto standard for
+# CI-parity runs.
+-P ubuntu-latest=catthehacker/ubuntu:act-latest
+
+# GitHub-hosted ubuntu-latest runners are amd64. On Apple Silicon hosts,
+# act would otherwise default to arm64 images and silently diverge from
+# production behavior (different apt package availability, different
+# rustc host triple). Pin to amd64 so local runs match what GitHub will
+# actually run. Costs some emulation overhead on M-series Macs.
+--container-architecture linux/amd64
