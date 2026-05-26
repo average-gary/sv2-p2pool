@@ -206,6 +206,21 @@ impl P2poolV2Engine {
         Arc::clone(&self.token_payout)
     }
 
+    /// Look up the payout script for a token. Returns `None` if the
+    /// token has no specific binding — caller should fall back to the
+    /// pool-wide `coinbase_reward_script`.
+    ///
+    /// Per ADR 0002, per-miner payout scripts are populated by the
+    /// binary's interceptor; until Phase 2 lands a JDC TLV extension
+    /// for sending the per-miner script in `AllocateMiningJobToken`,
+    /// this map will be empty in production and every miner gets the
+    /// pool-wide fallback.
+    pub fn lookup_payout_script(&self, token: JdToken) -> Option<ScriptBuf> {
+        self.token_payout
+            .get(&token)
+            .map(|entry| entry.value().clone())
+    }
+
     /// Access the recent-solutions buffer (cloneable `Arc`).
     ///
     /// Used by `handle_push_solution` to record block-finder credit
