@@ -1,0 +1,29 @@
+[package]
+name = "sv2-p2pool-testenv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Regtest test harness for sv2-p2pool — bitcoind + (future) p2poolv2 + (future) sv2-p2pool spawners"
+
+[lib]
+name = "sv2_p2pool_testenv"
+path = "src/lib.rs"
+
+[dependencies]
+# corepc-node spawns bitcoind regtest via auto-downloaded binary or
+# BITCOIND_EXE env override. This is the foundation primitive per the
+# research synthesis at
+# ~/wiki/topics/sv2-p2pool-integration/wiki/topics/regtest-harness-design.md.
+corepc-node = { version = "0.6", features = ["28_0"] }
+
+# Bitcoin types — pinned to the same version sv2-p2pool-engine pulls in
+# (0.32.x).
+bitcoin = "0.32"
+
+anyhow  = { workspace = true }
+tokio   = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
