@@ -21,14 +21,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bitcoin::BlockHash;
+use bitcoin::{BlockHash, ScriptBuf, Txid};
 use dashmap::DashMap;
+use stratum_apps::utils::types::JdToken;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 pub mod recent_solutions;
 pub mod reorg_detector;
 
+pub use recent_solutions::RecentSolutions;
 pub use reorg_detector::{DEFAULT_POLL_PERIOD, ReorgDetector};
 
 /// Opaque request-id used to key declared-job cache entries. Mirrors
@@ -39,12 +41,31 @@ pub use reorg_detector::{DEFAULT_POLL_PERIOD, ReorgDetector};
 /// wait for the JDS wiring to land.
 pub type RequestId = u32;
 
-/// Minimal stand-in for a cached declared job. The Phase 1 invalidation
-/// rule is "drop everything on any tip change" so the value type is opaque
-/// to the cache machinery (`()`) — the real `DeclaredCustomJob` shape lives
-/// upstream in `BitcoinCoreIPCEngine` and will be mirrored here once the
-/// full engine impl lands.
-pub type DeclaredJob = ();
+/// Snapshot of a declared mining job, cached after `handle_declare_mining_job`
+/// returns `Success` (or `MissingTransactions`, with `validated = false`).
+///
+/// Mirrors `BitcoinCoreIPCEngine`'s `DeclaredCustomJob` shape (see
+/// `vendor/sv2-apps/pool-apps/jd-server/src/lib/job_declarator/job_validation/bitcoin_core_ipc.rs:62-68`)
+/// without taking a hard dep on the upstream type.
+///
+/// Phase 1.1: shape is defined; field population happens in Phase 1.2.
+#[derive(Clone, Debug)]
+pub struct DeclaredJob {
+    /// Block version from the original `DeclareMiningJob`.
+    pub version: u32,
+    /// Coinbase prefix bytes (first part of the coinbase, before the extranonce).
+    pub coinbase_tx_prefix: Vec<u8>,
+    /// Coinbase suffix bytes (after the extranonce).
+    pub coinbase_tx_suffix: Vec<u8>,
+    /// Full wtxid list (including coinbase wtxid at index 0).
+    pub wtxid_list: Vec<bitcoin::Wtxid>,
+    /// Txid list, computed from full transaction bodies after `Success`.
+    /// `None` while waiting for `ProvideMissingTransactions`.
+    pub txid_list: Option<Vec<Txid>>,
+    /// Whether the job has been fully validated.
+    /// Set to `true` once `handle_declare_mining_job` returns `Success`.
+    pub validated: bool,
+}
 
 /// In-memory cache of declared jobs, keyed by `RequestId`.
 ///
@@ -99,21 +120,54 @@ impl DeclaredJobCache {
     }
 }
 
+/// Token-allocation tracking. Mirrors
+/// `BitcoinCoreIPCEngine::allocated_token_entries` but stores the
+/// per-token payout script chosen by the JDC at allocation time
+/// (per ADR 0002 § Decision § 1).
+///
+/// The map is populated by the binary's token-allocation interceptor
+/// (Phase 1.5) BEFORE the JDS sees the message. The engine reads from it
+/// inside `handle_push_solution` to credit the right p2pool miner.
+pub type TokenPayoutMap = Arc<DashMap<JdToken, ScriptBuf>>;
+
 /// Phase 1 engine surface.
 ///
-/// Holds the cached declared-jobs map and a handle to the (optional)
-/// reorg-watcher background task. The full `JobValidationEngine` impl will
-/// be added once the JDS wiring lands.
+/// Holds:
+/// - The cached declared-jobs map (`DeclaredJobCache`)
+/// - A handle to the optional reorg-watcher background task
+/// - Token → payout-script binding (`TokenPayoutMap`, populated by the
+///   binary's allocation interceptor — see ADR 0002 § Decision § 1)
+/// - The most-recent-solutions buffer for the PushSolution race (PR #17)
+/// - Backend handles: bitcoind RPC trait, network, and a tip-source closure
+///   stored as the watcher's input (set during `start_reorg_watcher`)
+///
+/// The trait impl methods land in Phase 1.2 — 1.4 below.
 pub struct P2poolV2Engine {
     declared_jobs: DeclaredJobCache,
+    token_payout: TokenPayoutMap,
+    recent_solutions: Arc<RecentSolutions>,
+    /// Bitcoin network this engine targets. Used by accounting + payout.
+    network: bitcoin::Network,
     /// Active watcher task; aborted on drop.
     reorg_watcher: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// Default TTL for the `RecentSolutions` buffer — long enough to cover
+/// reasonable share-submission latency after a `PushSolution` arrives.
+pub const DEFAULT_RECENT_SOLUTIONS_TTL: Duration = Duration::from_secs(30);
+
 impl P2poolV2Engine {
-    pub fn new() -> Self {
+    /// Construct an engine for the given network. The binary is responsible
+    /// for wiring in the bitcoind backend and tip source via
+    /// [`P2poolV2Engine::start_reorg_watcher`] (Phase 1.2 — 1.4 will widen
+    /// this to take an `Arc<dyn BitcoindLike>` and `ChainStoreHandle` once
+    /// the trait impl lands).
+    pub fn new(network: bitcoin::Network) -> Self {
         Self {
             declared_jobs: DeclaredJobCache::new(),
+            token_payout: Arc::new(DashMap::new()),
+            recent_solutions: Arc::new(RecentSolutions::new(DEFAULT_RECENT_SOLUTIONS_TTL)),
+            network,
             reorg_watcher: None,
         }
     }
@@ -121,6 +175,29 @@ impl P2poolV2Engine {
     /// Access the declared-jobs cache.
     pub fn declared_jobs(&self) -> &DeclaredJobCache {
         &self.declared_jobs
+    }
+
+    /// Access the token-payout map (cloneable `Arc`).
+    ///
+    /// The binary's token-allocation interceptor (Phase 1.5) writes into
+    /// this map at `AllocateMiningJobToken` time; the engine reads from it
+    /// in `handle_push_solution`.
+    pub fn token_payout(&self) -> TokenPayoutMap {
+        Arc::clone(&self.token_payout)
+    }
+
+    /// Access the recent-solutions buffer (cloneable `Arc`).
+    ///
+    /// Used by `handle_push_solution` to record block-finder credit
+    /// before the matching `SubmitSharesExtended` arrives. The
+    /// `ChannelManager`'s share-submission path (Phase 1.6) drains it.
+    pub fn recent_solutions(&self) -> Arc<RecentSolutions> {
+        Arc::clone(&self.recent_solutions)
+    }
+
+    /// The Bitcoin network this engine targets.
+    pub fn network(&self) -> bitcoin::Network {
+        self.network
     }
 
     /// Spawn the reorg watcher.
@@ -192,8 +269,10 @@ impl Drop for P2poolV2Engine {
 }
 
 impl Default for P2poolV2Engine {
+    /// Default-constructs an engine on regtest. Use [`P2poolV2Engine::new`]
+    /// to target a different network.
     fn default() -> Self {
-        Self::new()
+        Self::new(bitcoin::Network::Regtest)
     }
 }
 
@@ -247,12 +326,23 @@ mod tests {
         BlockHash::from_byte_array(bytes)
     }
 
+    fn dummy_job(version: u32) -> DeclaredJob {
+        DeclaredJob {
+            version,
+            coinbase_tx_prefix: vec![],
+            coinbase_tx_suffix: vec![],
+            wtxid_list: vec![],
+            txid_list: None,
+            validated: false,
+        }
+    }
+
     #[test]
     fn declared_job_cache_invalidate_all_drops_everything() {
         let cache = DeclaredJobCache::new();
-        cache.insert(1, ());
-        cache.insert(2, ());
-        cache.insert(3, ());
+        cache.insert(1, dummy_job(1));
+        cache.insert(2, dummy_job(2));
+        cache.insert(3, dummy_job(3));
         assert_eq!(cache.len(), 3);
 
         let dropped = cache.invalidate_all();
@@ -265,11 +355,31 @@ mod tests {
         assert!(cache.is_empty());
     }
 
+    #[test]
+    fn engine_default_constructs_with_empty_state() {
+        let engine = P2poolV2Engine::default();
+        assert_eq!(engine.network(), bitcoin::Network::Regtest);
+        assert!(engine.declared_jobs().is_empty());
+        assert_eq!(engine.token_payout().len(), 0);
+    }
+
+    #[test]
+    fn engine_token_payout_is_shared_arc() {
+        let engine = P2poolV2Engine::new(bitcoin::Network::Regtest);
+        let map_a = engine.token_payout();
+        let map_b = engine.token_payout();
+        // Both clones point at the same underlying DashMap.
+        let script = ScriptBuf::new();
+        map_a.insert(42, script.clone());
+        assert_eq!(map_b.len(), 1);
+        assert_eq!(map_b.get(&42).map(|r| r.value().clone()), Some(script));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn engine_invalidates_cache_on_tip_change() {
-        let mut engine = P2poolV2Engine::new();
-        engine.declared_jobs().insert(1, ());
-        engine.declared_jobs().insert(2, ());
+        let mut engine = P2poolV2Engine::new(bitcoin::Network::Regtest);
+        engine.declared_jobs().insert(1, dummy_job(1));
+        engine.declared_jobs().insert(2, dummy_job(2));
         assert_eq!(engine.declared_jobs().len(), 2);
 
         // Scripted tip source: tip_a, tip_a, tip_b.
