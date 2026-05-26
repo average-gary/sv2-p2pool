@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Primary job: build/test/lint OUR workspace at the root toolchain (1.88,
+  # pinned by rust-toolchain.toml). Submodules are checked out recursively
+  # because our path-deps point into vendor/sv2-apps and vendor/p2poolv2.
+  workspace:
+    name: workspace (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # rust-toolchain.toml pins channel = "1.88" with rustfmt + clippy.
+          # We name it explicitly here so the action installs the right
+          # components even before cargo reads the toolchain file.
+          toolchain: "1.88"
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-1.88
+
+      - name: cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo check --workspace
+        run: cargo check --workspace
+
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+  # Secondary job: sanity-check that the vendored sv2-apps subworkspaces
+  # still compile at their own declared MSRV (1.85). sv2-apps lives in its
+  # own workspace tree under vendor/sv2-apps and is `exclude`d from ours,
+  # so we drive cargo against each subworkspace's manifest explicitly.
+  sv2-apps-msrv:
+    name: sv2-apps MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sv2-apps-1.85
+
+      - name: cargo check pool-apps
+        run: cargo check --manifest-path vendor/sv2-apps/pool-apps/Cargo.toml
+
+      - name: cargo check miner-apps
+        run: cargo check --manifest-path vendor/sv2-apps/miner-apps/Cargo.toml
+
+      - name: cargo check stratum-apps
+        run: cargo check --manifest-path vendor/sv2-apps/stratum-apps/Cargo.toml
+
+      - name: cargo check bitcoin-core-sv2
+        run: cargo check --manifest-path vendor/sv2-apps/bitcoin-core-sv2/Cargo.toml
