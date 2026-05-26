@@ -99,14 +99,23 @@ jobs:
         with:
           shared-key: sv2-apps-1.85
 
+      # NOTE on `--locked`: we intentionally do NOT pass --locked to these
+      # vendored manifest-path checks. Each sv2-apps subworkspace ships
+      # its own Cargo.lock that we don't author, and at least
+      # bitcoin-core-sv2 pins `stratum-core` to a moving git branch — so
+      # locking us to upstream's Cargo.lock would make our CI red whenever
+      # upstream's branch tip moves, even though our own deps are
+      # untouched. The MSRV job's job is to flag rustc-version regressions
+      # in vendored code; the workspace job's `--locked` already guards
+      # OUR Cargo.lock.
       - name: cargo check pool-apps
-        run: cargo check --locked --manifest-path vendor/sv2-apps/pool-apps/Cargo.toml
+        run: cargo check --manifest-path vendor/sv2-apps/pool-apps/Cargo.toml
 
       - name: cargo check miner-apps
-        run: cargo check --locked --manifest-path vendor/sv2-apps/miner-apps/Cargo.toml
+        run: cargo check --manifest-path vendor/sv2-apps/miner-apps/Cargo.toml
 
       - name: cargo check stratum-apps
-        run: cargo check --locked --manifest-path vendor/sv2-apps/stratum-apps/Cargo.toml
+        run: cargo check --manifest-path vendor/sv2-apps/stratum-apps/Cargo.toml
 
       - name: cargo check bitcoin-core-sv2
-        run: cargo check --locked --manifest-path vendor/sv2-apps/bitcoin-core-sv2/Cargo.toml
+        run: cargo check --manifest-path vendor/sv2-apps/bitcoin-core-sv2/Cargo.toml
