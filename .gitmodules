@@ -1,6 +1,6 @@
 [submodule "vendor/sv2-apps"]
 	path = vendor/sv2-apps
-	url = https://github.com/stratum-mining/sv2-apps
+	url = https://github.com/average-gary/sv2-apps
 [submodule "vendor/p2poolv2"]
 	path = vendor/p2poolv2
 	# Pointing at the maintainer's fork so we can host upstream-PR-bound
