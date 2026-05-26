@@ -2,8 +2,9 @@
 resolver = "2"
 members = [
     "crates/sv2-p2pool-engine",
-    "crates/sv2-p2pool-pool",
     "crates/sv2-p2pool-ipc",
+    "crates/sv2-p2pool-pool",
+    "crates/sv2-p2pool-testenv",
 ]
 # Vendored crates live in their own workspaces under vendor/{sv2-apps,p2poolv2}/.
 # `exclude` makes the boundary explicit so cargo's workspace discovery doesn't
