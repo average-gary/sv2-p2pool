@@ -47,6 +47,51 @@ This repo is **AGPL-3.0-or-later** because it links `p2poolv2_lib` (AGPL-3.0). T
 
 If you operate the pool publicly, AGPL §13 requires you to make the source available to network users. Hosting this Git repo (or a fork) publicly satisfies that obligation.
 
+## Local CI
+
+CI runs on GitHub Actions (`.github/workflows/ci.yml`), but you can iterate
+on it locally via [`act`](https://github.com/nektos/act) without burning
+GitHub-hosted runner minutes.
+
+Install:
+
+```sh
+# macOS
+brew install act
+
+# Linux: see https://nektosact.com/installation/index.html
+```
+
+Defaults live in `.actrc` at the repo root (medium-size
+`catthehacker/ubuntu:act-latest` image, `linux/amd64` to match
+GitHub-hosted runners on Apple Silicon hosts).
+
+Run the full `pull_request` event locally:
+
+```sh
+git submodule update --init --recursive   # required: workflow uses submodules: recursive
+act pull_request
+```
+
+Run a single job:
+
+```sh
+act -j workspace        # build/test/lint at root toolchain (1.88)
+act -j sv2-apps-msrv    # vendored sv2-apps MSRV (1.85) check
+```
+
+List jobs without pulling images:
+
+```sh
+act --list
+```
+
+You don't need `capnproto` installed on your host — the workflow's
+`Install capnproto` step runs inside the act container, same as on
+GitHub-hosted runners.
+
+First run will pull a multi-GB image; subsequent runs reuse it.
+
 ## Plan and design notes
 
 The full spec, including the SV2 ↔ p2poolv2 message-by-message mapping and `JobValidationEngine` skeleton, lives in the project author's research wiki. A sanitized version will land in `docs/architecture.md` once Phase 1 is underway.
