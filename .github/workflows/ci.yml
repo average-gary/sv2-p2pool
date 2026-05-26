@@ -46,10 +46,11 @@ jobs:
 
       # bitcoin-capnp-types (pulled in transitively via sv2-apps's
       # bitcoin-core-sv2 crate) has a build script that shells out to the
-      # `capnp` binary. The GitHub-hosted ubuntu-latest image does not
-      # ship it, so install it before any cargo invocation.
+      # `capnp` binary AND imports `/capnp/c++.capnp` from the standard
+      # include path. On Ubuntu the binary lives in `capnproto` and the
+      # schema headers live in `libcapnp-dev`; we need both.
       - name: Install capnproto
-        run: sudo apt-get update && sudo apt-get install -y capnproto
+        run: sudo apt-get update && sudo apt-get install -y capnproto libcapnp-dev
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
@@ -87,9 +88,11 @@ jobs:
           toolchain: "1.85"
 
       # Same rationale as the workspace job: bitcoin-core-sv2 transitively
-      # depends on bitcoin-capnp-types, whose build script needs capnp.
+      # depends on bitcoin-capnp-types, whose build script needs both the
+      # `capnp` binary and the `libcapnp-dev` schema headers (for
+      # `/capnp/c++.capnp` imports).
       - name: Install capnproto
-        run: sudo apt-get update && sudo apt-get install -y capnproto
+        run: sudo apt-get update && sudo apt-get install -y capnproto libcapnp-dev
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
