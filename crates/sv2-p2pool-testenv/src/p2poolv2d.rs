@@ -22,10 +22,11 @@
 //! - `[network]` listen on `127.0.0.1` random port, no dial peers
 //! - `[api] hostname = 127.0.0.1, port = 0` (random)
 //!
-//! `[stratum].network` is forced to `signet` because p2poolv2's genesis
-//! builder doesn't yet support regtest — this matches the Phase 2.5b
-//! workaround. Tests should compose the share-chain layer at signet
-//! difficulty against the regtest bitcoind.
+//! `[stratum].network` defaults to `Testnet4` since p2poolv2's genesis
+//! builder supports `Bitcoin` / `Testnet4` / `Signet` only (regtest is
+//! rejected). Override via [`P2poolV2DBuilder::with_network`]. The
+//! integration tests target testnet4 because that's the live
+//! deployment target with a public dashboard.
 //!
 //! ## Readiness
 //!
@@ -112,15 +113,19 @@ pub struct P2poolV2DBuilder<'a> {
     bitcoind: &'a BitcoinD,
     p2poolv2_exe: Option<PathBuf>,
     ready_timeout: Duration,
+    network: bitcoin::Network,
 }
 
 impl<'a> P2poolV2DBuilder<'a> {
     /// Start a builder for a `p2poolv2` running against `bitcoind`.
+    /// Defaults to `Network::Testnet4` because that's the supported
+    /// deployment target with a live p2poolv2 dashboard.
     pub fn new(bitcoind: &'a BitcoinD) -> Self {
         Self {
             bitcoind,
             p2poolv2_exe: None,
             ready_timeout: DEFAULT_READY_TIMEOUT,
+            network: bitcoin::Network::Testnet4,
         }
     }
 
@@ -134,6 +139,15 @@ impl<'a> P2poolV2DBuilder<'a> {
     /// [`DEFAULT_READY_TIMEOUT`]).
     pub fn with_ready_timeout(mut self, timeout: Duration) -> Self {
         self.ready_timeout = timeout;
+        self
+    }
+
+    /// Override the share-chain network (default `Testnet4`).
+    /// Supported: `Bitcoin`, `Testnet4`, `Signet`. `Regtest` and the
+    /// legacy `Testnet` are rejected by p2poolv2's genesis builder and
+    /// will fail at startup.
+    pub fn with_network(mut self, network: bitcoin::Network) -> Self {
+        self.network = network;
         self
     }
 
@@ -168,6 +182,9 @@ impl<'a> P2poolV2DBuilder<'a> {
         // corepc-node's parsed config — corepc exposes via `params()`.
         let (user, pass) = bitcoind_credentials(self.bitcoind);
 
+        let network_name = network_to_name(self.network);
+        let addr = address_for_network(self.network);
+
         let config_path = tempdir.path().join("p2pool.toml");
         let toml = format!(
             r#"
@@ -197,10 +214,10 @@ hostname = "127.0.0.1"
 port = {stratum_port}
 start_difficulty = 10000
 minimum_difficulty = 100
-solo_address = "tb1qyazxde6558qj6z3d9np5e6msmrspwpf6k0qggk"
-bootstrap_address = "tb1qyazxde6558qj6z3d9np5e6msmrspwpf6k0qggk"
+solo_address = "{addr}"
+bootstrap_address = "{addr}"
 zmqpubhashblock = "tcp://127.0.0.1:{zmq_port}"
-network = "signet"
+network = "{network}"
 version_mask = "1fffe000"
 difficulty_multiplier = 1.0
 pool_signature = "sv2-p2pool-testenv"
@@ -221,6 +238,8 @@ port = {api_port}
 "#,
             store_path = store_path.display(),
             stats_dir = stats_dir.display(),
+            network = network_name,
+            addr = addr,
         );
         std::fs::write(&config_path, toml.as_bytes())
             .map_err(|e| P2poolV2DError::WriteConfig(e.to_string()))?;
@@ -257,6 +276,17 @@ fn find_p2poolv2_on_path() -> Option<PathBuf> {
     CACHED.get_or_init(|| which_compat("p2poolv2")).clone()
 }
 
+/// Public re-export of the PATH lookup helper for sibling spawners.
+pub fn which_compat_pub(name: &str) -> Option<PathBuf> {
+    which_compat(name)
+}
+
+/// Public re-export of the bitcoind credentials helper for sibling
+/// spawners.
+pub fn bitcoind_credentials_pub(bitcoind: &BitcoinD) -> (String, String) {
+    bitcoind_credentials(bitcoind)
+}
+
 /// Minimal `which`-style PATH lookup (avoid taking a `which` dep). On
 /// Windows, also tries `.exe`.
 fn which_compat(name: &str) -> Option<PathBuf> {
@@ -288,6 +318,32 @@ fn allocate_free_port() -> Result<u16, P2poolV2DError> {
         .map_err(|e| P2poolV2DError::PortAllocation(e.to_string()))?
         .port();
     Ok(port)
+}
+
+/// Map a `bitcoin::Network` to the string p2poolv2's config expects.
+fn network_to_name(network: bitcoin::Network) -> &'static str {
+    match network {
+        bitcoin::Network::Bitcoin => "main",
+        bitcoin::Network::Testnet => "testnet",
+        bitcoin::Network::Testnet4 => "testnet4",
+        bitcoin::Network::Signet => "signet",
+        bitcoin::Network::Regtest => "regtest",
+    }
+}
+
+/// A bech32 address valid on the given network. p2poolv2 uses these
+/// for the solo + bootstrap address fields. The values here are dummy
+/// addresses (never receive real funds in tests); they just need to
+/// pass the network parser.
+fn address_for_network(network: bitcoin::Network) -> &'static str {
+    match network {
+        bitcoin::Network::Bitcoin => "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
+        // testnet, testnet4, signet share the bech32 "tb" HRP.
+        bitcoin::Network::Testnet | bitcoin::Network::Testnet4 | bitcoin::Network::Signet => {
+            "tb1qyazxde6558qj6z3d9np5e6msmrspwpf6k0qggk"
+        }
+        bitcoin::Network::Regtest => "bcrt1qx2nf3uvxq6h2vksjwgdvnwhvexmkqwqx0vexap",
+    }
 }
 
 /// Pull bitcoind RPC credentials from a `corepc_node::Node`.
