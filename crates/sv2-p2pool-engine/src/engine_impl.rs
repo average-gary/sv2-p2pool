@@ -44,7 +44,7 @@ use stratum_apps::{
 };
 use tracing::{debug, info, warn};
 
-use crate::{DeclaredJob, P2poolV2Engine, coinbase};
+use crate::{DeclaredJob, P2poolV2Engine, TipMetadata, coinbase};
 
 #[async_trait]
 impl JobValidationEngine for P2poolV2Engine {
@@ -166,18 +166,33 @@ impl JobValidationEngine for P2poolV2Engine {
                 Vec::new()
             };
 
-        // 7. Phase 1.2 stub: cache the declared-job snapshot as validated.
-        //    Phase 1.4 will wire this through to p2poolv2's share-chain
-        //    validator and (on failure) emit MissingTransactions or
-        //    STALE_CHAIN_TIP. For now, structural checks pass implies
-        //    the job is "validated" enough for downstream SetCustomMiningJob
-        //    to cross-check against.
+        // 7. Capture Bitcoin tip metadata from bitcoind's GBT (Phase 2.3).
+        //    When handles are present, this gives us real prev_hash + nbits
+        //    + min_ntime to cross-check in handle_set_custom_mining_job.
+        //    Without handles, we leave TipMetadata::default() (all-zeros)
+        //    and the structural-only mode tolerates the placeholders.
+        let tip = match self.handles() {
+            Some(h) => match capture_tip_metadata(h.bitcoind.as_ref(), self.network()).await {
+                Ok(tip) => tip,
+                Err(e) => {
+                    warn!(
+                        request_id,
+                        error = %e,
+                        "failed to capture Bitcoin tip metadata; falling back to defaults"
+                    );
+                    TipMetadata::default()
+                }
+            },
+            None => TipMetadata::default(),
+        };
+
         let snapshot = DeclaredJob {
             version: declare_mining_job.version,
             coinbase_tx_prefix,
             coinbase_tx_suffix,
             wtxid_list,
             txid_list: Some(missing_txs.iter().map(|tx| tx.compute_txid()).collect()),
+            tip,
             validated: true,
         };
         self.declared_jobs().insert(request_id, snapshot);
@@ -256,19 +271,10 @@ impl JobValidationEngine for P2poolV2Engine {
             );
         }
 
-        // 4. prev_hash. NOTE: this is the *Bitcoin* prev_hash. Phase 1.2
-        //    stub stores `BlockHash::all_zeros()` because we don't have a
-        //    share-chain validator wired in yet (we never asked p2poolv2
-        //    "what's the current Bitcoin tip?"). Until Phase 1.4 wires
-        //    `ChainStoreHandle` into the engine and we capture
-        //    `prev_hash` at declare-time, this check is effectively
-        //    permissive. We still do the comparison so the code path
-        //    is exercised.
-        //
-        //    TODO(Phase 1.4): when ChainStoreHandle lands, capture
-        //    `prev_hash` in DeclaredJob via
-        //    `chain.get_chain_tip().bitcoin_prev_hash()` (or analogous)
-        //    at the time of DeclareMiningJob success.
+        // 4. prev_hash cross-check (Phase 2.3: real values from GBT
+        //    when handles were present at declare time; otherwise
+        //    `TipMetadata::default()` = all-zeros, matching upstream
+        //    structural-only mode).
         let custom_prev_hash = {
             let bytes: [u8; 32] = set_custom_mining_job
                 .prev_hash
@@ -277,7 +283,7 @@ impl JobValidationEngine for P2poolV2Engine {
                 .expect("U256 is 32 bytes");
             BlockHash::from_byte_array(bytes)
         };
-        let declared_prev_hash = BlockHash::all_zeros();
+        let declared_prev_hash = declared.tip.prev_hash;
         if custom_prev_hash != declared_prev_hash {
             debug!(
                 ?custom_prev_hash,
@@ -289,8 +295,8 @@ impl JobValidationEngine for P2poolV2Engine {
             );
         }
 
-        // 5. nbits.
-        let declared_nbits: u32 = 0; // Phase 1.2 stub: see prev_hash TODO
+        // 5. nbits cross-check (Phase 2.3: real value from GBT).
+        let declared_nbits: u32 = declared.tip.nbits;
         if set_custom_mining_job.nbits != declared_nbits {
             debug!(
                 custom = set_custom_mining_job.nbits,
@@ -496,6 +502,52 @@ fn decode_token(declare_mining_job: &DeclareMiningJob<'_>) -> Result<JdToken, ()
         .try_into()
         .map_err(|_| ())?;
     Ok(u64::from_le_bytes(token_bytes))
+}
+
+/// Query bitcoind's `getblocktemplate` and parse the response into the
+/// fields we need for `TipMetadata`.
+///
+/// Used by `handle_declare_mining_job` to capture the current Bitcoin
+/// tip's `prev_hash` + `nbits` + `min_ntime` so subsequent
+/// `SetCustomMiningJob` cross-checks have real values to compare.
+///
+/// `BitcoindLike::getblocktemplate` returns the raw JSON template as a
+/// `String`; we deserialize into `p2poolv2_lib::stratum::work::block_template::BlockTemplate`
+/// (already defined upstream).
+async fn capture_tip_metadata(
+    bitcoind: &dyn bitcoindrpc::BitcoindLike,
+    network: bitcoin::Network,
+) -> Result<TipMetadata, anyhow::Error> {
+    use bitcoin::hashes::Hash as _;
+
+    let raw = bitcoind.getblocktemplate(network).await?;
+    let template: p2poolv2_lib::stratum::work::block_template::BlockTemplate<serde_json::Value> =
+        serde_json::from_str(&raw)?;
+
+    // previousblockhash is hex; parse to BlockHash.
+    let prev_hash_bytes = parse_hex_32(&template.previousblockhash)?;
+    let prev_hash = BlockHash::from_byte_array(prev_hash_bytes);
+
+    // bits is hex (e.g. "207fffff"); parse to u32.
+    let nbits = u32::from_str_radix(&template.bits, 16)?;
+
+    Ok(TipMetadata {
+        prev_hash,
+        nbits,
+        min_ntime: template.mintime,
+    })
+}
+
+/// Parse a 64-char hex string into `[u8; 32]`.
+fn parse_hex_32(s: &str) -> Result<[u8; 32], anyhow::Error> {
+    if s.len() != 64 {
+        anyhow::bail!("expected 64-char hex string, got {}", s.len());
+    }
+    let mut out = [0u8; 32];
+    for (i, byte_out) in out.iter_mut().enumerate() {
+        *byte_out = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)?;
+    }
+    Ok(out)
 }
 
 /// Suppress "Arc<P2poolV2Engine> trait coherence" lint by acknowledging
@@ -716,6 +768,7 @@ mod tests {
                 coinbase_tx_suffix: vec![],
                 wtxid_list: vec![],
                 txid_list: None,
+                tip: TipMetadata::default(),
                 validated: true,
             },
         );
@@ -727,6 +780,7 @@ mod tests {
                 coinbase_tx_suffix: vec![],
                 wtxid_list: vec![],
                 txid_list: None,
+                tip: TipMetadata::default(),
                 validated: true,
             },
         );
