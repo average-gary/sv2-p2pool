@@ -14,6 +14,7 @@
 pub mod args;
 pub mod builder;
 pub mod pool;
+pub mod share_chain;
 pub mod tdp_demux;
 
 pub use args::process_cli_args;

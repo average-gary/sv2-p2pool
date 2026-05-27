@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use jd_server_sv2::job_declarator::job_validation::JobValidationEngine;
 use pool_sv2::config::PoolConfig;
-use sv2_p2pool_engine::P2poolV2Engine;
+use sv2_p2pool_engine::{EngineHandles, P2poolV2Engine};
 
 use crate::Pool;
 
@@ -47,13 +47,17 @@ impl PoolBuilder {
         Self { network }
     }
 
-    /// Build a fresh [`P2poolV2Engine`].
-    ///
-    /// Phase 1.7+ will widen this to a full builder accepting
-    /// `ChainStoreHandle` / `Arc<dyn BitcoindLike>` / `Arc<dyn ShareValidator>`.
-    /// For now the engine constructs an empty in-memory state.
+    /// Build a fresh [`P2poolV2Engine`] without backend handles
+    /// (structural-only mode).
     pub fn build_engine(&self) -> P2poolV2Engine {
         P2poolV2Engine::new(self.network)
+    }
+
+    /// Build a [`P2poolV2Engine`] with real backend handles (chain +
+    /// validator + bitcoind). Phase 2.5b uses this when a p2poolv2
+    /// share-chain config is attached to the binary.
+    pub fn build_engine_with_handles(&self, handles: EngineHandles) -> P2poolV2Engine {
+        P2poolV2Engine::with_handles(self.network, handles)
     }
 
     /// Build the engine wrapped in `Arc<dyn JobValidationEngine>` so it
@@ -66,6 +70,17 @@ impl PoolBuilder {
     /// started until [`Pool::start`] is called.
     pub fn build_pool(self, config: PoolConfig) -> Pool {
         Pool::new(config)
+    }
+
+    /// Build a [`Pool`] with both the sv2-apps [`PoolConfig`] and the
+    /// p2poolv2 share-chain config attached. `Pool::start` will then
+    /// bootstrap real `EngineHandles`.
+    pub fn build_pool_with_p2pool_config(
+        self,
+        config: PoolConfig,
+        p2pool_config: p2poolv2_lib::config::Config,
+    ) -> Pool {
+        Pool::new(config).with_p2pool_config(p2pool_config)
     }
 }
 

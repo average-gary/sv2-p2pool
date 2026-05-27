@@ -1,12 +1,9 @@
 //! sv2-p2pool — SV2 mining pool binary using p2poolv2 as share-chain backend.
 //!
-//! Phase 1.7 entry point. Loads `PoolConfig` from a TOML file, builds a
-//! [`Pool`] via [`PoolBuilder`], and runs it until `Ctrl+C` or external
+//! Phase 2.5b entry point. Loads both the sv2-apps `PoolConfig` and the
+//! p2poolv2 share-chain `Config` from TOML files, builds a [`Pool`]
+//! with both attached, and runs it until `Ctrl+C` or external
 //! cancellation.
-//!
-//! See [the Phase 1 wiring plan][1] for the full execution roadmap.
-//!
-//! [1]: ~/wiki/topics/sv2-p2pool-integration/output/plan-phase-1-wiring-2026-05-26.md
 
 use sv2_p2pool::{PoolBuilder, process_cli_args};
 
@@ -16,19 +13,20 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    tracing::info!("sv2-p2pool: Phase 1 boot");
+    tracing::info!("sv2-p2pool: boot");
 
-    let config = process_cli_args()?;
+    let configs = process_cli_args()?;
     tracing::info!(
-        listen = %config.listen_address(),
-        signature = %config.pool_signature(),
-        "loaded config"
+        listen = %configs.pool.listen_address(),
+        signature = %configs.pool.pool_signature(),
+        store_path = %configs.p2pool.store.path,
+        bitcoinrpc_url = %configs.p2pool.bitcoinrpc.url,
+        network = %configs.p2pool.stratum.network,
+        "loaded configs"
     );
 
-    // Phase 1.7: full binary entry. Engine network is derived from the
-    // template_provider_type inside Pool::start.
     let builder = PoolBuilder::new(bitcoin::Network::Regtest);
-    let pool = builder.build_pool(config);
+    let pool = builder.build_pool_with_p2pool_config(configs.pool, configs.p2pool);
 
     pool.start()
         .await
