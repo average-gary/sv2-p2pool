@@ -29,6 +29,7 @@ use std::thread::JoinHandle as ThreadJoinHandle;
 use async_channel::unbounded;
 use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
 use jd_server_sv2::job_declarator::{JobDeclarator, job_validation::JobValidationEngine};
+use p2poolv2_lib::config::Config as P2poolConfig;
 use pool_sv2::{
     channel_manager::ChannelManager,
     config::PoolConfig,
@@ -46,7 +47,7 @@ use sv2_p2pool_engine::TdpHandle;
 use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 
-use crate::{PoolBuilder, tdp_demux};
+use crate::{PoolBuilder, share_chain, tdp_demux};
 
 /// Top-level pool runtime.
 ///
@@ -54,6 +55,12 @@ use crate::{PoolBuilder, tdp_demux};
 #[derive(Debug, Clone)]
 pub struct Pool {
     config: PoolConfig,
+    /// Phase 2.5b: optional p2poolv2 share-chain config. When present,
+    /// [`Pool::start`] bootstraps real `EngineHandles` (chain +
+    /// validator + bitcoind) and constructs the engine via
+    /// `with_handles`. When absent, the engine runs in TDP-only mode
+    /// (Phase 2.5a behaviour preserved for tests).
+    p2pool_config: Option<P2poolConfig>,
     cancellation_token: CancellationToken,
     shutdown_notify: Arc<Notify>,
     is_alive: Arc<AtomicBool>,
@@ -63,10 +70,18 @@ impl Pool {
     pub(crate) fn new(config: PoolConfig) -> Self {
         Self {
             config,
+            p2pool_config: None,
             cancellation_token: CancellationToken::new(),
             shutdown_notify: Arc::new(Notify::new()),
             is_alive: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// Attach a p2poolv2 share-chain config, enabling real
+    /// `EngineHandles` bootstrap on `Pool::start`.
+    pub fn with_p2pool_config(mut self, p2pool_config: P2poolConfig) -> Self {
+        self.p2pool_config = Some(p2pool_config);
+        self
     }
 
     /// Run the pool until cancelled or `Ctrl+C`.
@@ -122,9 +137,28 @@ impl Pool {
 
         info!("building embedded JDS with P2poolV2Engine backend");
         let tdp = TdpHandle::new(engine_to_tp_sender);
-        let engine_concrete = PoolBuilder::new(self.config_network())
-            .build_engine()
-            .with_tdp(tdp.clone());
+
+        // Phase 2.5b: when a p2pool config is attached, bootstrap real
+        // EngineHandles (chain + validator + bitcoind) for full
+        // share-chain integration. The store + writer-thread join must
+        // outlive the engine, so we keep them on the stack here.
+        let mut share_chain_handles: Option<share_chain::ShareChainHandles> = None;
+        let engine_concrete = if let Some(p2pool_config) = self.p2pool_config.as_ref() {
+            let handles = share_chain::bootstrap_share_chain(p2pool_config)
+                .await
+                .map_err(|e| PoolErrorKind::Configuration(format!("share-chain bootstrap: {e}")))?;
+            info!("share-chain handles wired into engine");
+            let engine_handles = handles.engine_handles.clone();
+            share_chain_handles = Some(handles);
+            PoolBuilder::new(self.config_network())
+                .build_engine_with_handles(engine_handles)
+                .with_tdp(tdp.clone())
+        } else {
+            info!("no p2pool config attached; engine runs in TDP-only mode");
+            PoolBuilder::new(self.config_network())
+                .build_engine()
+                .with_tdp(tdp.clone())
+        };
         let engine: Arc<dyn JobValidationEngine> = Arc::new(engine_concrete);
 
         // 3b. Spawn the TDP demux tasks. These bridge the CM↔TP channel
@@ -312,6 +346,20 @@ impl Pool {
                 warn!("forced shutdown complete");
             }
         }
+        // Drop share-chain handles last: this closes the StoreWriter
+        // channel, which causes the writer thread to exit and rocksdb
+        // to flush. Explicit drop to make the lifecycle visible.
+        if let Some(handles) = share_chain_handles.take() {
+            drop(handles.engine_handles);
+            drop(handles.store);
+            // Await the writer thread; it should exit promptly once its
+            // channel sender is dropped.
+            match handles.store_writer_join.await {
+                Ok(()) => info!("StoreWriter task joined"),
+                Err(e) => warn!(?e, "StoreWriter task did not join cleanly"),
+            }
+        }
+
         self.shutdown_notify.notify_waiters();
         self.is_alive.store(false, Ordering::Relaxed);
         info!("pool shutdown complete");
