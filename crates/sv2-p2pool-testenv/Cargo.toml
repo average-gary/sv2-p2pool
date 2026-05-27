@@ -27,3 +27,6 @@ anyhow  = { workspace = true }
 tokio   = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+
+# Tempdir for spawner datadirs (Phase 2.6: p2poolv2_node spawner).
+tempfile = "3"
