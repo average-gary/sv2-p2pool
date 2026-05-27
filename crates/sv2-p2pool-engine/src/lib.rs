@@ -253,12 +253,6 @@ pub struct EngineHandles {
     /// abstraction (vendored fork `feat/bitcoind-trait`) lets us mock
     /// bitcoind in tests.
     pub bitcoind: Arc<dyn BitcoindLike>,
-    /// SV2 Template Distribution Protocol bridge. Provides:
-    /// - Snapshots of the latest `(NewTemplate, SetNewPrevHash)` for
-    ///   tip metadata at `DeclareMiningJob` time.
-    /// - `RequestTransactionData(template_id)` round-trips for full
-    ///   transaction bodies at `PushSolution` time.
-    pub tdp: tdp::TdpHandle,
 }
 
 impl std::fmt::Debug for EngineHandles {
@@ -267,7 +261,6 @@ impl std::fmt::Debug for EngineHandles {
             .field("chain", &"<ChainStoreHandle>")
             .field("validator", &"<dyn ShareValidator>")
             .field("bitcoind", &"<dyn BitcoindLike>")
-            .field("tdp", &"<TdpHandle>")
             .finish()
     }
 }
@@ -293,10 +286,16 @@ pub struct P2poolV2Engine {
     network: bitcoin::Network,
     /// Active watcher task; aborted on drop.
     reorg_watcher: Option<tokio::task::JoinHandle<()>>,
-    /// Backend handles. `None` for Phase-1-style structural-only mode
-    /// (existing tests); `Some` for Phase 2+ when the binary plumbs in
-    /// real share-chain + bitcoind handles.
+    /// Backend handles (chain + validator + bitcoind). `None` for
+    /// Phase-1-style structural-only mode; `Some` for Phase 2.5b+ when
+    /// the binary plumbs in p2poolv2 Node + bitcoind RPC.
     handles: Option<EngineHandles>,
+    /// SV2 Template Distribution Protocol bridge. Independent of
+    /// `handles` because Phase 2.5a wires the TDP demux ahead of the
+    /// full Node bring-up. When `Some`, the trait impl reads tip
+    /// metadata + fetches tx bodies via TDP. When `None`, falls back to
+    /// `TipMetadata::default()` + skips block submission.
+    tdp: Option<tdp::TdpHandle>,
 }
 
 /// Default TTL for the `RecentSolutions` buffer — long enough to cover
@@ -318,16 +317,27 @@ impl P2poolV2Engine {
             network,
             reorg_watcher: None,
             handles: None,
+            tdp: None,
         }
     }
 
     /// Construct an engine with real backend handles. The trait methods
-    /// will perform real share-chain validation (Phase 2.3+ wires this
+    /// will perform real share-chain validation (Phase 2.5b+ wires this
     /// through). Use [`P2poolV2Engine::new`] for structural-only tests.
     pub fn with_handles(network: bitcoin::Network, handles: EngineHandles) -> Self {
         let mut engine = Self::new(network);
         engine.handles = Some(handles);
         engine
+    }
+
+    /// Set the TDP bridge. Phase 2.5a wires this from `Pool::start` so
+    /// the engine receives `SetNewPrevHash`/`NewTemplate` snapshots
+    /// from the demux task and can issue `RequestTransactionData` on
+    /// the merged Pool→TP channel. Independent of `with_handles`
+    /// because the Node bring-up (Phase 2.5b) lands separately.
+    pub fn with_tdp(mut self, tdp: tdp::TdpHandle) -> Self {
+        self.tdp = Some(tdp);
+        self
     }
 
     /// Whether the engine has real backend handles wired in.
@@ -336,6 +346,18 @@ impl P2poolV2Engine {
     /// share-chain validation). `true` = Phase 2+ mode.
     pub fn has_handles(&self) -> bool {
         self.handles.is_some()
+    }
+
+    /// Whether a TDP handle is wired in. Independent of `has_handles`.
+    pub fn has_tdp(&self) -> bool {
+        self.tdp.is_some()
+    }
+
+    /// Borrow the TDP bridge if wired. Used by the binary's demux task
+    /// to push `SetNewPrevHash`/`NewTemplate` snapshots and deliver
+    /// `RequestTransactionData` responses.
+    pub fn tdp(&self) -> Option<&tdp::TdpHandle> {
+        self.tdp.as_ref()
     }
 
     /// Access the backend handles, if present.
@@ -587,10 +609,10 @@ mod tests {
             chain,
             validator,
             bitcoind,
-            tdp,
         };
-        let engine = P2poolV2Engine::with_handles(bitcoin::Network::Regtest, handles);
+        let engine = P2poolV2Engine::with_handles(bitcoin::Network::Regtest, handles).with_tdp(tdp);
         assert!(engine.has_handles());
+        assert!(engine.has_tdp());
         assert_eq!(engine.network(), bitcoin::Network::Regtest);
         // Cache + token map start empty even with handles.
         assert!(engine.declared_jobs().is_empty());
