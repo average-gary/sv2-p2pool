@@ -66,9 +66,26 @@ The shared-chain handles (`ChainStoreHandle`, `Arc<dyn BitcoindLike>`, `Arc<dyn 
   - 1.5 — `PoolBuilder` + lib/bin split (PR #26)
   - 1.6-1.7 — Pool runtime + binary entry point (PR #27)
   - 1.8 — `sv2-p2pool-testenv` skeleton + smoke test
-  - 1.9 — this doc update
-- **Phase 2**: wire `ChainStoreHandle` + `BitcoindLike` into the engine; capnp IPC PR to p2poolv2; switch binary to talk over UDS.
-- **Phase 3**: production hardening, observability, deployment recipes.
+- **Phase 2-A** (shipped): in-process share-chain integration + SV2-native tip + tx bodies + spawners.
+  - 2.1 — `EngineHandles` + `with_handles` constructor (PR #29)
+  - 2.2 — block reconstruction module (PR #30)
+  - 2.3 — real tip metadata via bitcoind GBT (PR #31, superseded by 2.4)
+  - 2.4 — `TdpHandle` for SV2-native tip + tx bodies; full `handle_push_solution` (PR #32)
+  - 2.5a — TDP demux + `TdpHandle` wiring in `Pool::start` (PR #33)
+  - 2.5b — minimum-slice `EngineHandles` bootstrap (rocksdb + ChainStoreHandle + DefaultShareValidator + BitcoindRpcClient) (PR #34)
+  - 2.6 — `P2poolV2D` testenv spawner with three-tier discovery (PR #35)
+  - 2.7 — Network parameterization (default Testnet4) + `Sv2P2poolD` testenv spawner (PR #36)
+  - 2.8 — docs refresh + `--ignored` E2E in CI nightly
+- **Phase 2-B**: capnp IPC PR to p2poolv2; switch binary to talk over UDS. The engine's IPC client crate (`crates/sv2-p2pool-ipc`) is scaffolded but not yet active.
+- **Phase 3**: production hardening, observability, deployment recipes, full driving E2E test (`JdClientD` spawner + integration-tests).
+
+## Phase 2-A status by component
+
+- ✅ Engine: full `JobValidationEngine` impl with real `handle_declare_mining_job` (TDP-snapshot tip + cached `template_id`) and `handle_push_solution` (lookup → `RequestTransactionData` → block reconstruction → `submit_block`).
+- ✅ Pool binary: loads both `--config` (sv2-apps PoolConfig) and `--p2pool-config` (p2poolv2 share-chain config). `Pool::start` spawns the TDP demux tasks and bootstraps EngineHandles when the second config is supplied.
+- ✅ Testenv: `P2poolV2D` and `Sv2P2poolD` spawners. Default network is Testnet4 (the live deployment target with a public dashboard).
+- ⏳ Full p2poolv2 `NodeHandle` (libp2p networking, ZMQ listener, GBT poller, Stratum server, metrics, monitoring) — deferred until share-chain validation moves into `handle_declare_mining_job`. None of these are consumed by the current engine code path.
+- ⏳ End-to-end driving test (`JdClientD` spawner + integration-tests crate) — deferred to Phase 3 alongside the production-hardening work.
 
 ## Local development
 
@@ -77,11 +94,19 @@ The shared-chain handles (`ChainStoreHandle`, `Arc<dyn BitcoindLike>`, `Arc<dyn 
 cargo check --workspace --locked
 cargo test --workspace
 
-# Run binary
-cargo run --bin sv2-p2pool -- --config ./config/pool.example.toml
+# Run binary (Phase 2-A: requires BOTH config files)
+cargo run --bin sv2-p2pool -- \
+    --config ./config/pool.example.toml \
+    --p2pool-config ./config/p2pool.example.toml
 
 # Regtest harness smoke (requires BITCOIND_EXE or auto-download)
 cargo test -p sv2-p2pool-testenv -- --ignored
+
+# Full ignored-test run (requires BITCOIND_EXE + P2POOLV2_EXE +
+# `cargo build --bin sv2-p2pool` for the workspace target lookup)
+cargo test --workspace -- --ignored
 ```
+
+See [docs/running.md](running.md) for an operator-oriented quickstart.
 
 For local CI iteration without burning GitHub-hosted runner minutes, see the `Local CI` section in the [README](../README.md) for `act` setup.
