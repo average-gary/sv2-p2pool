@@ -1,0 +1,86 @@
+name: Nightly
+
+on:
+  schedule:
+    # 04:00 UTC daily — early enough to give us a result before US working
+    # hours, late enough that GH-hosted runner load is low.
+    - cron: '0 4 * * *'
+  # Allow manual triggering from the Actions UI.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ignored-tests:
+    name: ignored tests (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.88"
+          components: rustfmt, clippy
+
+      - name: Install capnproto
+        run: sudo apt-get update && sudo apt-get install -y capnproto libcapnp-dev
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nightly-1.88
+
+      # Build our binary so the testenv's `target/debug/sv2-p2pool`
+      # discovery hits a real file. We build everything in --workspace
+      # mode here so cargo test's link step doesn't need to rebuild.
+      - name: cargo build --workspace --bins
+        run: cargo build --workspace --bins --locked
+
+      # Build p2poolv2 from the vendored submodule and expose it via
+      # P2POOLV2_EXE so the testenv spawner finds it. Tested binaries
+      # are always in sync with the submodule pin, no version drift.
+      - name: Build p2poolv2 from submodule
+        run: |
+          cd vendor/p2poolv2
+          cargo build --bin p2poolv2 --locked
+          cd ../..
+          echo "P2POOLV2_EXE=$PWD/vendor/p2poolv2/target/debug/p2poolv2" >> "$GITHUB_ENV"
+
+      # Phase 2.6's smoke test also needs BITCOIND_EXE; corepc-node will
+      # auto-download a binary the first time it's invoked. We pre-warm
+      # the cache here so the timing budget on the smoke tests stays
+      # tight.
+      - name: Pre-download bitcoind via corepc-node
+        run: |
+          # corepc-node cache lives in ~/.cargo/corepc-node by default.
+          # The smoke tests trigger the download on first invocation.
+          echo "(corepc-node will fetch the binary on first test run)"
+
+      - name: cargo test --workspace --locked -- --ignored
+        # `--include-ignored` runs both ignored AND non-ignored. We use
+        # `--ignored` (which runs ONLY the ignored ones) since the
+        # non-ignored set already runs in the regular CI workflow.
+        run: cargo test --workspace --locked -- --ignored
+
+      - name: Upload test artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-failure-logs
+          path: |
+            target/debug/test-output
+            /tmp/p2poolv2-*.log
+          if-no-files-found: ignore
+          retention-days: 7
