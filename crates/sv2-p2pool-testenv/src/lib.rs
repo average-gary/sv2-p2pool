@@ -28,6 +28,11 @@ pub use corepc_node::Node as BitcoinD;
 use thiserror::Error;
 use tracing::{debug, info};
 
+pub mod p2poolv2d;
+pub use p2poolv2d::{
+    DEFAULT_READY_TIMEOUT as P2POOLV2_READY_TIMEOUT, P2poolV2D, P2poolV2DBuilder, P2poolV2DError,
+};
+
 /// Regtest test harness — at Phase 1.8, just a thin wrapper over
 /// `corepc-node::Node` with a vocabulary mirroring `bdk_testenv`.
 ///
@@ -84,6 +89,17 @@ impl TestEnv {
     /// `TestEnvBuilder::default().build()`.
     pub fn new() -> Result<Self, TestEnvError> {
         TestEnvBuilder::default().build()
+    }
+
+    /// Spawn a `p2poolv2` child process against this `TestEnv`'s
+    /// bitcoind. Returns the spawner; hold it across the lifetime of
+    /// the test (Drop kills the process).
+    ///
+    /// Requires `P2POOLV2_EXE` env var or `p2poolv2` on `$PATH`.
+    pub fn with_p2poolv2(&self) -> Result<P2poolV2D, TestEnvError> {
+        P2poolV2DBuilder::new(&self.bitcoind)
+            .build()
+            .map_err(|e| TestEnvError::P2poolV2(e.to_string()))
     }
 
     /// Mine `n` blocks to a freshly-generated regtest address.
@@ -175,6 +191,8 @@ pub enum TestEnvError {
     Rpc(String),
     #[error("timeout: {0}")]
     Timeout(String),
+    #[error("failed to spawn p2poolv2: {0}")]
+    P2poolV2(String),
 }
 
 #[cfg(test)]
