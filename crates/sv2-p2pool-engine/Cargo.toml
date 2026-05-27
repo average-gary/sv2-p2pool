@@ -26,7 +26,12 @@ stratum-apps  = { path = "../../vendor/sv2-apps/stratum-apps" }
 
 # p2poolv2 share-chain backend (Phase 1: in-process)
 p2poolv2_lib = { path = "../../vendor/p2poolv2/p2poolv2_lib" }
+# BitcoindLike trait + concrete client (added by feat/bitcoind-trait, PR #18)
+bitcoindrpc  = { path = "../../vendor/p2poolv2/bitcoindrpc" }
 
 [dev-dependencies]
 proptest = "1"
 tokio    = { workspace = true, features = ["full", "test-util"] }
+# Test fixtures: MockBitcoind + setup_test_chain_store_handle.
+bitcoindrpc  = { path = "../../vendor/p2poolv2/bitcoindrpc", features = ["test-utils"] }
+p2poolv2_lib = { path = "../../vendor/p2poolv2/p2poolv2_lib", features = ["test-utils"] }

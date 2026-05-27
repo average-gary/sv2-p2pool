@@ -22,7 +22,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bitcoin::{BlockHash, ScriptBuf, Txid};
+use bitcoindrpc::BitcoindLike;
 use dashmap::DashMap;
+use p2poolv2_lib::shares::{
+    chain::chain_store_handle::ChainStoreHandle, validation::ShareValidator,
+};
 use stratum_apps::utils::types::JdToken;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -143,6 +147,43 @@ pub type TokenPayoutMap = Arc<DashMap<JdToken, ScriptBuf>>;
 /// across the trait boundary, while this map is engine-internal state.
 pub type AllocatedTokenMap = Arc<DashMap<JdToken, RequestId>>;
 
+/// Backend handles for the engine.
+///
+/// When present, the trait methods perform real share-chain validation
+/// (Phase 2.3+ wires this through). When absent (Phase 1 default), the
+/// trait methods do structural validation only with stub-zero values for
+/// `prev_hash`/`nbits`.
+///
+/// All three handles are cloneable / `Arc`-shareable, matching how
+/// `p2poolv2_node` constructs them at startup
+/// (`vendor/p2poolv2/p2poolv2_node/src/main.rs`).
+#[derive(Clone)]
+pub struct EngineHandles {
+    /// Read access to the share chain. Used to look up the current
+    /// share-chain tip + validate share-block ancestry.
+    pub chain: ChainStoreHandle,
+    /// Production share validator. Constructed via
+    /// `p2poolv2_lib::shares::validation::DefaultShareValidator::new(...)`
+    /// in the binary; passed here as `Arc<dyn ShareValidator>` so tests
+    /// can substitute a mock.
+    pub validator: Arc<dyn ShareValidator + Send + Sync>,
+    /// Bitcoin RPC backend, used for `getblocktemplate` (capture
+    /// `prev_hash`/`nbits` for declared jobs) and `submit_block`
+    /// (forward found blocks). The trait abstraction (vendored fork
+    /// `feat/bitcoind-trait`) lets us mock bitcoind in tests.
+    pub bitcoind: Arc<dyn BitcoindLike>,
+}
+
+impl std::fmt::Debug for EngineHandles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineHandles")
+            .field("chain", &"<ChainStoreHandle>")
+            .field("validator", &"<dyn ShareValidator>")
+            .field("bitcoind", &"<dyn BitcoindLike>")
+            .finish()
+    }
+}
+
 /// Phase 1 engine surface.
 ///
 /// Holds:
@@ -164,6 +205,10 @@ pub struct P2poolV2Engine {
     network: bitcoin::Network,
     /// Active watcher task; aborted on drop.
     reorg_watcher: Option<tokio::task::JoinHandle<()>>,
+    /// Backend handles. `None` for Phase-1-style structural-only mode
+    /// (existing tests); `Some` for Phase 2+ when the binary plumbs in
+    /// real share-chain + bitcoind handles.
+    handles: Option<EngineHandles>,
 }
 
 /// Default TTL for the `RecentSolutions` buffer — long enough to cover
@@ -184,7 +229,34 @@ impl P2poolV2Engine {
             recent_solutions: Arc::new(RecentSolutions::new(DEFAULT_RECENT_SOLUTIONS_TTL)),
             network,
             reorg_watcher: None,
+            handles: None,
         }
+    }
+
+    /// Construct an engine with real backend handles. The trait methods
+    /// will perform real share-chain validation (Phase 2.3+ wires this
+    /// through). Use [`P2poolV2Engine::new`] for structural-only tests.
+    pub fn with_handles(network: bitcoin::Network, handles: EngineHandles) -> Self {
+        let mut engine = Self::new(network);
+        engine.handles = Some(handles);
+        engine
+    }
+
+    /// Whether the engine has real backend handles wired in.
+    ///
+    /// `false` = Phase-1-style structural-only mode (trait methods stub
+    /// share-chain validation). `true` = Phase 2+ mode.
+    pub fn has_handles(&self) -> bool {
+        self.handles.is_some()
+    }
+
+    /// Access the backend handles, if present.
+    ///
+    /// Phase 2.1 introduces this accessor; Phase 2.3+ trait methods
+    /// consume it to perform real share-chain validation.
+    #[allow(dead_code, reason = "consumer is Phase 2.3+ trait methods")]
+    pub(crate) fn handles(&self) -> Option<&EngineHandles> {
+        self.handles.as_ref()
     }
 
     /// Internal access to the allocated-tokens map for the trait impl.
@@ -396,6 +468,41 @@ mod tests {
         assert_eq!(engine.network(), bitcoin::Network::Regtest);
         assert!(engine.declared_jobs().is_empty());
         assert_eq!(engine.token_payout().len(), 0);
+        assert!(
+            !engine.has_handles(),
+            "::default() / ::new() construct without handles"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_with_handles_reports_handles_present() {
+        use bitcoin::CompactTarget;
+        use bitcoindrpc::mock::MockBitcoind;
+        use p2poolv2_lib::pool_difficulty::PoolDifficulty;
+        use p2poolv2_lib::shares::validation::DefaultShareValidator;
+        use p2poolv2_lib::test_utils::setup_test_chain_store_handle;
+
+        // Build the three production handles via test fixtures.
+        let (chain, _tmpdir) = setup_test_chain_store_handle(false).await;
+        // Anchor at regtest genesis difficulty (max-easy target ~ 1d00ffff
+        // works for regtest).
+        let pool_difficulty = PoolDifficulty::new(CompactTarget::from_consensus(0x207fffff), 0, 0);
+        let validator: Arc<dyn ShareValidator + Send + Sync> =
+            Arc::new(DefaultShareValidator::new(pool_difficulty, 1, Vec::new()));
+        let bitcoind: Arc<dyn BitcoindLike> = Arc::new(MockBitcoind::default());
+
+        let handles = EngineHandles {
+            chain,
+            validator,
+            bitcoind,
+        };
+        let engine = P2poolV2Engine::with_handles(bitcoin::Network::Regtest, handles);
+        assert!(engine.has_handles());
+        assert_eq!(engine.network(), bitcoin::Network::Regtest);
+        // Cache + token map start empty even with handles.
+        assert!(engine.declared_jobs().is_empty());
+        // The internal accessor returns Some.
+        assert!(engine.handles().is_some());
     }
 
     #[test]
