@@ -5111,6 +5111,7 @@ dependencies = [
  "jd_server_sv2",
  "p2poolv2_lib",
  "proptest",
+ "serde_json",
  "stratum-apps",
  "thiserror 2.0.18",
  "tokio",

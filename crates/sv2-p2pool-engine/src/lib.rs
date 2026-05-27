@@ -59,8 +59,6 @@ pub type RequestId = u32;
 /// Mirrors `BitcoinCoreIPCEngine`'s `DeclaredCustomJob` shape (see
 /// `vendor/sv2-apps/pool-apps/jd-server/src/lib/job_declarator/job_validation/bitcoin_core_ipc.rs:62-68`)
 /// without taking a hard dep on the upstream type.
-///
-/// Phase 1.1: shape is defined; field population happens in Phase 1.2.
 #[derive(Clone, Debug)]
 pub struct DeclaredJob {
     /// Block version from the original `DeclareMiningJob`.
@@ -74,9 +72,49 @@ pub struct DeclaredJob {
     /// Txid list, computed from full transaction bodies after `Success`.
     /// `None` while waiting for `ProvideMissingTransactions`.
     pub txid_list: Option<Vec<Txid>>,
+    /// Bitcoin tip metadata captured at declare time. Phase 2.3 populates
+    /// these from `bitcoind.getblocktemplate(...)` when handles are
+    /// present; without handles they remain at `Default` values
+    /// (all-zeros `prev_hash`, zero `nbits`/`min_ntime`) and the
+    /// trait's structural-only mode tolerates the placeholders.
+    pub tip: TipMetadata,
     /// Whether the job has been fully validated.
     /// Set to `true` once `handle_declare_mining_job` returns `Success`.
     pub validated: bool,
+}
+
+/// Bitcoin tip metadata captured at `DeclareMiningJob` time.
+///
+/// Used by `handle_set_custom_mining_job` to detect a stale chain tip:
+/// if the JDC's `SetCustomMiningJob.prev_hash` doesn't match what we
+/// captured from bitcoind's GBT response, the candidate is stale.
+///
+/// Mirrors the role of `BitcoinCoreIPCEngine`'s `ValidationContext`
+/// (`prev_hash`, `nbits`, `min_ntime`) at
+/// `vendor/sv2-apps/pool-apps/jd-server/src/lib/job_declarator/job_validation/bitcoin_core_ipc.rs:65`.
+#[derive(Clone, Copy, Debug)]
+pub struct TipMetadata {
+    /// Bitcoin tip's previous-block hash.
+    pub prev_hash: BlockHash,
+    /// nbits (compact difficulty target) of the tip.
+    pub nbits: u32,
+    /// Minimum acceptable `ntime` for blocks built on this tip
+    /// (typically the tip's median time + 1).
+    pub min_ntime: u32,
+}
+
+impl Default for TipMetadata {
+    /// All-zeros fallback used in structural-only mode (no handles).
+    /// `bitcoin::BlockHash` doesn't impl `Default`, so we provide one
+    /// with `from_byte_array([0; 32])`.
+    fn default() -> Self {
+        use bitcoin::hashes::Hash as _;
+        Self {
+            prev_hash: BlockHash::from_byte_array([0u8; 32]),
+            nbits: 0,
+            min_ntime: 0,
+        }
+    }
 }
 
 /// In-memory cache of declared jobs, keyed by `RequestId`.
@@ -445,6 +483,7 @@ mod tests {
             coinbase_tx_suffix: vec![],
             wtxid_list: vec![],
             txid_list: None,
+            tip: TipMetadata::default(),
             validated: false,
         }
     }
