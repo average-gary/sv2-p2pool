@@ -22,7 +22,7 @@
 //! this for the first time anywhere in the SV2 ecosystem.
 
 use bitcoin::{
-    BlockHash, CompactTarget, TxMerkleNode, Txid,
+    Block, BlockHash, CompactTarget, Transaction, TxMerkleNode, Txid,
     block::{Header, Version},
     consensus::Encodable,
     hashes::Hash,
@@ -87,6 +87,81 @@ pub fn reconstruct_header(
     })
 }
 
+/// Reconstruct the full candidate `bitcoin::Block` from a `PushSolution`,
+/// the cached `DeclaredJob`, and the non-coinbase transaction bodies
+/// fetched via `RequestTransactionData(template_id)` from the Template
+/// Provider.
+///
+/// Returns a fully-formed `bitcoin::Block` ready to hand to
+/// `BitcoindLike::submit_block`.
+///
+/// Cross-check: the txids of `tx_bodies` MUST match (in order) the cached
+/// `DeclaredJob.txid_list`. If they don't, the TP gave us a transaction
+/// list inconsistent with the declared job and we refuse to assemble a
+/// block.
+pub fn reconstruct_block(
+    declared_job: &DeclaredJob,
+    push_solution: &PushSolution<'_>,
+    tx_bodies: Vec<Transaction>,
+) -> Result<Block, BlockReconstructError> {
+    let txid_list = declared_job
+        .txid_list
+        .as_ref()
+        .ok_or(BlockReconstructError::DeclaredJobNotValidated)?;
+
+    if tx_bodies.len() != txid_list.len() {
+        return Err(BlockReconstructError::TxBodyCountMismatch {
+            expected: txid_list.len(),
+            got: tx_bodies.len(),
+        });
+    }
+    for (idx, (body, expected_txid)) in tx_bodies.iter().zip(txid_list.iter()).enumerate() {
+        let computed = body.compute_txid();
+        if computed != *expected_txid {
+            return Err(BlockReconstructError::TxBodyTxidMismatch {
+                index: idx,
+                expected: *expected_txid,
+                got: computed,
+            });
+        }
+    }
+
+    let extranonce_bytes = push_solution.extranonce.inner_as_ref();
+    let coinbase_tx = coinbase::reconstruct_coinbase_with_extranonce(
+        &declared_job.coinbase_tx_prefix,
+        extranonce_bytes,
+        &declared_job.coinbase_tx_suffix,
+    )
+    .map_err(BlockReconstructError::Coinbase)?;
+    let coinbase_txid = coinbase_tx.compute_txid();
+
+    let merkle_root = compute_merkle_root_from_txids(coinbase_txid, txid_list);
+
+    let prev_blockhash: BlockHash = {
+        let bytes: [u8; 32] = push_solution
+            .prev_hash
+            .to_vec()
+            .try_into()
+            .map_err(|_| BlockReconstructError::BadPrevHash)?;
+        BlockHash::from_byte_array(bytes)
+    };
+
+    let header = Header {
+        version: Version::from_consensus(push_solution.version as i32),
+        prev_blockhash,
+        merkle_root,
+        time: push_solution.ntime,
+        bits: CompactTarget::from_consensus(push_solution.nbits),
+        nonce: push_solution.nonce,
+    };
+
+    let mut txdata = Vec::with_capacity(1 + tx_bodies.len());
+    txdata.push(coinbase_tx);
+    txdata.extend(tx_bodies);
+
+    Ok(Block { header, txdata })
+}
+
 /// Compute the Bitcoin merkle root from `[coinbase_txid, ...txid_list]`.
 ///
 /// Bitcoin's merkle tree algorithm: at each level, hash adjacent pairs;
@@ -137,6 +212,14 @@ pub enum BlockReconstructError {
     Coinbase(#[from] coinbase::CoinbaseReconstructError),
     #[error("PushSolution.prev_hash was not 32 bytes")]
     BadPrevHash,
+    #[error("tx_bodies count mismatch: expected {expected}, got {got}")]
+    TxBodyCountMismatch { expected: usize, got: usize },
+    #[error("tx_bodies[{index}] txid mismatch: expected {expected}, got {got}")]
+    TxBodyTxidMismatch {
+        index: usize,
+        expected: Txid,
+        got: Txid,
+    },
 }
 
 #[cfg(test)]

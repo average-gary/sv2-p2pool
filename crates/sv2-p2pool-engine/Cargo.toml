@@ -9,12 +9,13 @@ publish.workspace = true
 description = "JobValidationEngine implementation backed by p2poolv2's share chain"
 
 [dependencies]
-async-trait = { workspace = true }
-dashmap     = { workspace = true }
-tokio       = { workspace = true }
-tracing     = { workspace = true }
-anyhow      = { workspace = true }
-thiserror   = { workspace = true }
+async-trait   = { workspace = true }
+async-channel = "1.5"
+dashmap       = { workspace = true }
+tokio         = { workspace = true }
+tracing       = { workspace = true }
+anyhow        = { workspace = true }
+thiserror     = { workspace = true }
 
 # Bitcoin types — pinned to the same version p2poolv2_lib pulls in (0.32.x) so
 # `BlockHash` is the same type across the engine boundary.
@@ -28,9 +29,6 @@ stratum-apps  = { path = "../../vendor/sv2-apps/stratum-apps" }
 p2poolv2_lib = { path = "../../vendor/p2poolv2/p2poolv2_lib" }
 # BitcoindLike trait + concrete client (added by feat/bitcoind-trait, PR #18)
 bitcoindrpc  = { path = "../../vendor/p2poolv2/bitcoindrpc" }
-
-# JSON parsing for the getblocktemplate response (Phase 2.3).
-serde_json   = "1"
 
 [dev-dependencies]
 proptest = "1"
