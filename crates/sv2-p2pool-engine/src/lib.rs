@@ -31,12 +31,17 @@ use stratum_apps::utils::types::JdToken;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
+pub mod block;
 pub mod coinbase;
 mod engine_impl;
 pub mod recent_solutions;
 pub mod reorg_detector;
 
-pub use coinbase::{CoinbaseReconstructError, merkle_path, reconstruct_coinbase};
+pub use block::{BlockReconstructError, reconstruct_header};
+pub use coinbase::{
+    CoinbaseReconstructError, merkle_path, reconstruct_coinbase,
+    reconstruct_coinbase_with_extranonce,
+};
 pub use recent_solutions::RecentSolutions;
 pub use reorg_detector::{DEFAULT_POLL_PERIOD, ReorgDetector};
 

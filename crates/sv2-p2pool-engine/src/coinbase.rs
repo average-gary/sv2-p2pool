@@ -27,9 +27,13 @@ const COINBASE_PREFIX_LEN: usize = 43;
 /// Reconstruct the declared coinbase transaction by concatenating
 /// `prefix + zero-padded extranonce + suffix`.
 ///
-/// The extranonce size is implied: it's the difference between the
-/// `scriptSig` length encoded in the prefix's `VarInt` and the bytes of
-/// `scriptSig` already present in the prefix.
+/// Used at `DeclareMiningJob` time when the actual extranonce hasn't
+/// been chosen yet. The extranonce size is implied: it's the difference
+/// between the `scriptSig` length encoded in the prefix's `VarInt` and
+/// the bytes of `scriptSig` already present in the prefix.
+///
+/// For `PushSolution` reconstruction (where the actual extranonce is
+/// known), use [`reconstruct_coinbase_with_extranonce`] instead.
 ///
 /// Returns `Err(CoinbaseReconstructError::*)` on malformed input — caller
 /// maps to `INVALID_COINBASE_TX`.
@@ -69,6 +73,59 @@ pub fn reconstruct_coinbase(
         .map_err(|_| CoinbaseReconstructError::Decode)
 }
 
+/// Reconstruct the declared coinbase transaction with a known extranonce.
+///
+/// Used at `PushSolution` time when the JDC has chosen its actual
+/// extranonce bytes (which determine the coinbase txid). Same byte
+/// layout as [`reconstruct_coinbase`] but with `extranonce` filling
+/// the scriptSig hole instead of zeros.
+///
+/// `extranonce.len()` MUST equal the implied extranonce size derived
+/// from the prefix's scriptSig VarInt. Otherwise returns
+/// [`CoinbaseReconstructError::ExtranonceSizeMismatch`].
+pub fn reconstruct_coinbase_with_extranonce(
+    coinbase_tx_prefix: &[u8],
+    extranonce: &[u8],
+    coinbase_tx_suffix: &[u8],
+) -> Result<Transaction, CoinbaseReconstructError> {
+    if coinbase_tx_prefix.len() < COINBASE_PREFIX_LEN {
+        return Err(CoinbaseReconstructError::PrefixTooShort);
+    }
+
+    let script_sig_size: usize = {
+        let mut cursor = &coinbase_tx_prefix[COINBASE_PREFIX_LEN..];
+        bitcoin::VarInt::consensus_decode(&mut cursor)
+            .map_err(|_| CoinbaseReconstructError::BadScriptSigVarInt)?
+            .0 as usize
+    };
+
+    let varint_size = bitcoin::VarInt(script_sig_size as u64).size();
+    let script_sig_offset = COINBASE_PREFIX_LEN + varint_size;
+
+    if coinbase_tx_prefix.len() < script_sig_offset {
+        return Err(CoinbaseReconstructError::PrefixTooShort);
+    }
+
+    let script_sig_bytes_in_prefix = coinbase_tx_prefix.len() - script_sig_offset;
+    if script_sig_bytes_in_prefix > script_sig_size {
+        return Err(CoinbaseReconstructError::ScriptSigOverflow);
+    }
+    let expected_extranonce_size = script_sig_size - script_sig_bytes_in_prefix;
+    if extranonce.len() != expected_extranonce_size {
+        return Err(CoinbaseReconstructError::ExtranonceSizeMismatch {
+            expected: expected_extranonce_size,
+            got: extranonce.len(),
+        });
+    }
+
+    let mut declared_coinbase_tx = coinbase_tx_prefix.to_vec();
+    declared_coinbase_tx.extend_from_slice(extranonce);
+    declared_coinbase_tx.extend_from_slice(coinbase_tx_suffix);
+
+    Transaction::consensus_decode(&mut &declared_coinbase_tx[..])
+        .map_err(|_| CoinbaseReconstructError::Decode)
+}
+
 /// Errors from [`reconstruct_coinbase`].
 #[derive(Debug, thiserror::Error)]
 pub enum CoinbaseReconstructError {
@@ -78,6 +135,8 @@ pub enum CoinbaseReconstructError {
     BadScriptSigVarInt,
     #[error("scriptSig bytes in prefix exceed declared scriptSig size")]
     ScriptSigOverflow,
+    #[error("extranonce size mismatch: expected {expected} bytes, got {got}")]
+    ExtranonceSizeMismatch { expected: usize, got: usize },
     #[error("failed to decode reconstructed coinbase as a Transaction")]
     Decode,
 }
