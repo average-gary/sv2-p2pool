@@ -167,24 +167,24 @@ impl JobValidationEngine for P2poolV2Engine {
             };
 
         // 7. Capture Bitcoin tip metadata + template_id via the SV2
-        //    Template Distribution Protocol (Phase 2.4). When handles are
-        //    present, this gives us real prev_hash + nbits + min_ntime
-        //    (from `SetNewPrevHash`) and the matching template_id (from
-        //    `NewTemplate`) to cross-check in
+        //    Template Distribution Protocol (Phase 2.4). When the TDP
+        //    bridge is wired, this gives us real prev_hash + nbits +
+        //    min_ntime (from `SetNewPrevHash`) and the matching
+        //    template_id (from `NewTemplate`) to cross-check in
         //    `handle_set_custom_mining_job` and to fetch transaction
-        //    bodies in `handle_push_solution`. Without handles, we leave
-        //    TipMetadata::default() (all-zeros) and `template_id = None`;
-        //    structural-only mode tolerates the placeholders.
-        let (tip, template_id) = match self.handles() {
-            Some(h) => {
-                let tip = h.tdp.current_tip().unwrap_or_else(|| {
+        //    bodies in `handle_push_solution`. Without TDP, we leave
+        //    `TipMetadata::default()` (all-zeros) and `template_id =
+        //    None`; structural-only mode tolerates the placeholders.
+        let (tip, template_id) = match self.tdp() {
+            Some(tdp) => {
+                let tip = tdp.current_tip().unwrap_or_else(|| {
                     warn!(
                         request_id,
                         "TdpHandle has no SetNewPrevHash snapshot yet; using default tip"
                     );
                     TipMetadata::default()
                 });
-                let tid = h.tdp.current_template_id();
+                let tid = tdp.current_template_id();
                 if tid.is_none() {
                     warn!(
                         request_id,
@@ -472,14 +472,17 @@ impl JobValidationEngine for P2poolV2Engine {
             BlockHash::from_byte_array(*sha256d::Hash::hash(&bytes).as_byte_array())
         };
 
-        // Structural-only mode: no handles, record synthetic→synthetic.
-        let Some(handles) = self.handles() else {
+        // Structural-only mode: no TDP wired (= no way to fetch tx
+        // bodies), record synthetic→synthetic and bail. Bitcoind handles
+        // are checked separately below — without them we can still
+        // reconstruct the block but skip submit.
+        let Some(tdp) = self.tdp() else {
             self.recent_solutions
                 .record(synthetic_share_hash, synthetic_share_hash);
             info!(
                 share_hash = %synthetic_share_hash,
                 ntime = push_solution.ntime,
-                "PushSolution received (structural-only mode); recorded synthetic share hash"
+                "PushSolution received (no TDP wired); recorded synthetic share hash"
             );
             return;
         };
@@ -536,7 +539,7 @@ impl JobValidationEngine for P2poolV2Engine {
         };
 
         // 3. Fetch tx bodies from the Template Provider via TDP.
-        let tx_bodies = match handles.tdp.request_tx_bodies(template_id).await {
+        let tx_bodies = match tdp.request_tx_bodies(template_id).await {
             Ok(txs) => txs,
             Err(e) => {
                 warn!(
@@ -564,29 +567,43 @@ impl JobValidationEngine for P2poolV2Engine {
         };
         let block_hash = block.block_hash();
 
-        // 5. Submit the block to bitcoind (fire-and-forget; we don't
-        //    block the JDP handler waiting for it). Record block-finder
-        //    credit BEFORE submitting so a fast SubmitSharesExtended
-        //    can claim it even if submit_block hasn't returned.
+        // 5. Record block-finder credit BEFORE submitting so a fast
+        //    SubmitSharesExtended can claim it even if submit_block
+        //    hasn't returned.
         self.recent_solutions
             .record(synthetic_share_hash, block_hash);
-        info!(
-            request_id,
-            template_id,
-            %block_hash,
-            "PushSolution: reconstructed block; submitting to bitcoind"
-        );
-        let bitcoind = handles.bitcoind.clone();
-        tokio::spawn(async move {
-            match bitcoind.submit_block(&block).await {
-                Ok(reply) => {
-                    info!(%block_hash, %reply, "submit_block returned");
-                }
-                Err(e) => {
-                    warn!(%block_hash, error = %e, "submit_block failed");
-                }
+
+        // 6. Submit the block to bitcoind (fire-and-forget) when the
+        //    bitcoind backend is wired. Phase 2.5a runs the engine with
+        //    TDP but no bitcoind handles yet; in that mode we still
+        //    record the credit and reconstruct the block, but skip
+        //    submission. Phase 2.5b plumbs the full EngineHandles and
+        //    submission becomes active.
+        match self.handles() {
+            Some(handles) => {
+                info!(
+                    request_id,
+                    template_id,
+                    %block_hash,
+                    "PushSolution: reconstructed block; submitting to bitcoind"
+                );
+                let bitcoind = handles.bitcoind.clone();
+                tokio::spawn(async move {
+                    match bitcoind.submit_block(&block).await {
+                        Ok(reply) => info!(%block_hash, %reply, "submit_block returned"),
+                        Err(e) => warn!(%block_hash, error = %e, "submit_block failed"),
+                    }
+                });
             }
-        });
+            None => {
+                info!(
+                    request_id,
+                    template_id,
+                    %block_hash,
+                    "PushSolution: reconstructed block; no bitcoind handle wired — skipping submit_block"
+                );
+            }
+        }
     }
 
     /// Hook fired by the share-chain when a tip swap happens. Drops every
@@ -887,9 +904,9 @@ mod tests {
             chain,
             validator,
             bitcoind: bitcoind.clone(),
-            tdp: tdp.clone(),
         };
-        let engine = P2poolV2Engine::with_handles(bitcoin::Network::Regtest, handles);
+        let engine =
+            P2poolV2Engine::with_handles(bitcoin::Network::Regtest, handles).with_tdp(tdp.clone());
 
         // 3. Spawn a stub TP demux: when RequestTransactionData arrives,
         //    deliver an empty transaction_list (a coinbase-only block from

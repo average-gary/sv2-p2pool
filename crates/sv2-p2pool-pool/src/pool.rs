@@ -42,10 +42,11 @@ use stratum_apps::{
     stratum_core::bitcoin::consensus::Encodable, task_manager::TaskManager,
     tp_type::TemplateProviderType, utils::types::GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS,
 };
+use sv2_p2pool_engine::TdpHandle;
 use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 
-use crate::PoolBuilder;
+use crate::{PoolBuilder, tdp_demux};
 
 /// Top-level pool runtime.
 ///
@@ -85,19 +86,32 @@ impl Pool {
         let task_manager = Arc::new(TaskManager::new());
 
         // 2. Channel pairs.
+        //
+        // Phase 2.5a inserts the TDP demux between sv2-apps's CM and the
+        // configured TP:
+        //
+        //   TP → tp_to_demux_* → [tee task] → tp_to_cm_*       (CM input)
+        //                                  ↘ TdpHandle snapshots / pending one-shots
+        //
+        //   CM → cm_to_tp_*  ──┐
+        //                      ├─ [merge task] → merged_to_tp_*  (TP input)
+        //   engine → eng_to_tp ┘
+        //
+        // The CM still sees the full original message stream (tee is
+        // forward-preserving). The engine's RequestTransactionData
+        // requests get merged onto the same outbound stream.
         let (downstream_to_cm_sender, downstream_to_cm_receiver) = unbounded();
+
         let (cm_to_tp_sender, cm_to_tp_receiver) = unbounded();
+        let (engine_to_tp_sender, engine_to_tp_receiver) = unbounded();
+        let (merged_to_tp_sender, merged_to_tp_receiver) = unbounded();
+
+        let (tp_to_demux_sender, tp_to_demux_receiver) = unbounded();
         let (tp_to_cm_sender, tp_to_cm_receiver) = unbounded();
         debug!("channels initialized");
 
-        // 3. Build embedded JDS using OUR engine.
-        //
-        // This is the core difference from upstream PoolSv2. Where the
-        // upstream picks `BitcoinCoreIPCEngine` based on
-        // template_provider_type, we hand in our `P2poolV2Engine`
-        // unconditionally. JDS is required (no `if jds_config { ... }`
-        // gate) because without share-chain validation our pool has
-        // nothing to do.
+        // 3. Build the engine + the TDP bridge first so we can pass the
+        //    engine into JDS construction with the bridge already wired.
         let jds_config = self.config.build_jds_config()?.ok_or_else(|| {
             PoolErrorKind::Configuration(
                 "[jds] config is required for sv2-p2pool — without it, the engine cannot \
@@ -107,8 +121,25 @@ impl Pool {
         })?;
 
         info!("building embedded JDS with P2poolV2Engine backend");
-        let engine: Arc<dyn JobValidationEngine> =
-            PoolBuilder::new(self.config_network()).build_engine_arc();
+        let tdp = TdpHandle::new(engine_to_tp_sender);
+        let engine_concrete = PoolBuilder::new(self.config_network())
+            .build_engine()
+            .with_tdp(tdp.clone());
+        let engine: Arc<dyn JobValidationEngine> = Arc::new(engine_concrete);
+
+        // 3b. Spawn the TDP demux tasks. These bridge the CM↔TP channel
+        //    pair to the engine's TdpHandle.
+        let _tee_handle = tdp_demux::spawn_tp_to_cm_tee(
+            tp_to_demux_receiver,
+            tp_to_cm_sender.clone(),
+            tdp.clone(),
+        );
+        let _merge_handle = tdp_demux::spawn_cm_and_engine_to_tp_merge(
+            cm_to_tp_receiver.clone(),
+            engine_to_tp_receiver,
+            merged_to_tp_sender,
+        );
+        info!("TDP demux tasks spawned");
         let jd = JobDeclarator::new(
             engine,
             cancellation_token.clone(),
@@ -159,7 +190,9 @@ impl Pool {
         let mut bitcoin_core_cancellation_token: Option<CancellationToken> = None;
 
         // 5. Wire up the Template Provider (TP) — either upstream SV2
-        //    TP or local bitcoind IPC.
+        //    TP or local bitcoind IPC. The TP's inbound stream is the
+        //    merged (CM + engine) outbound; its outbound stream feeds
+        //    the demux task (which tees to CM + engine).
         match self.config.template_provider_type().clone() {
             TemplateProviderType::Sv2Tp {
                 address,
@@ -168,8 +201,8 @@ impl Pool {
                 let sv2_tp = Sv2Tp::new(
                     address.clone(),
                     public_key,
-                    cm_to_tp_receiver,
-                    tp_to_cm_sender,
+                    merged_to_tp_receiver,
+                    tp_to_demux_sender,
                     cancellation_token.clone(),
                     task_manager.clone(),
                 )
@@ -204,8 +237,8 @@ impl Pool {
                     unix_socket_path,
                     fee_threshold,
                     min_interval,
-                    incoming_tdp_receiver: cm_to_tp_receiver.clone(),
-                    outgoing_tdp_sender: tp_to_cm_sender.clone(),
+                    incoming_tdp_receiver: merged_to_tp_receiver.clone(),
+                    outgoing_tdp_sender: tp_to_demux_sender.clone(),
                     cancellation_token: btc_token.clone(),
                 };
                 bitcoin_core_cancellation_token = Some(btc_token);
