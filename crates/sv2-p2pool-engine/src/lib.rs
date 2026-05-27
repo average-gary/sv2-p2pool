@@ -36,14 +36,16 @@ pub mod coinbase;
 mod engine_impl;
 pub mod recent_solutions;
 pub mod reorg_detector;
+pub mod tdp;
 
-pub use block::{BlockReconstructError, reconstruct_header};
+pub use block::{BlockReconstructError, reconstruct_block, reconstruct_header};
 pub use coinbase::{
     CoinbaseReconstructError, merkle_path, reconstruct_coinbase,
     reconstruct_coinbase_with_extranonce,
 };
 pub use recent_solutions::RecentSolutions;
 pub use reorg_detector::{DEFAULT_POLL_PERIOD, ReorgDetector};
+pub use tdp::{TdpError, TdpHandle, TxDataResult};
 
 /// Opaque request-id used to key declared-job cache entries. Mirrors
 /// `BitcoinCoreIPCEngine::declared_custom_jobs`'s
@@ -72,12 +74,18 @@ pub struct DeclaredJob {
     /// Txid list, computed from full transaction bodies after `Success`.
     /// `None` while waiting for `ProvideMissingTransactions`.
     pub txid_list: Option<Vec<Txid>>,
-    /// Bitcoin tip metadata captured at declare time. Phase 2.3 populates
-    /// these from `bitcoind.getblocktemplate(...)` when handles are
-    /// present; without handles they remain at `Default` values
-    /// (all-zeros `prev_hash`, zero `nbits`/`min_ntime`) and the
-    /// trait's structural-only mode tolerates the placeholders.
+    /// Bitcoin tip metadata captured at declare time. Phase 2.4 populates
+    /// these from the TDP `SetNewPrevHash` snapshot exposed by
+    /// [`TdpHandle::current_tip`]; without handles they remain at
+    /// `Default` values (all-zeros `prev_hash`, zero `nbits`/`min_ntime`)
+    /// and the trait's structural-only mode tolerates the placeholders.
     pub tip: TipMetadata,
+    /// TDP `template_id` captured from the most recent `NewTemplate` at
+    /// declare time. Phase 2.4 uses this to fetch the matching
+    /// transaction bodies via `RequestTransactionData(template_id)` when
+    /// `handle_push_solution` reconstructs the full block. `None` when
+    /// handles aren't wired (structural-only mode).
+    pub template_id: Option<u64>,
     /// Whether the job has been fully validated.
     /// Set to `true` once `handle_declare_mining_job` returns `Success`.
     pub validated: bool,
@@ -151,6 +159,35 @@ impl DeclaredJobCache {
         self.inner.is_empty()
     }
 
+    /// Find the request_id of the cached declared job whose
+    /// `(tip.prev_hash, tip.nbits, version)` matches the given triple.
+    /// Used by `handle_push_solution` to recover the cached job that
+    /// produced a given `PushSolution` (PushSolution itself doesn't
+    /// carry a token or request_id).
+    ///
+    /// Returns `None` if no cached job matches. If multiple jobs match
+    /// (rare; same template declared multiple times), returns the first
+    /// one encountered.
+    pub fn find_by_solution(
+        &self,
+        prev_hash: BlockHash,
+        nbits: u32,
+        version: u32,
+    ) -> Option<RequestId> {
+        for entry in self.inner.iter() {
+            let job = entry.value();
+            if job.tip.prev_hash == prev_hash && job.tip.nbits == nbits && job.version == version {
+                return Some(*entry.key());
+            }
+        }
+        None
+    }
+
+    /// Get a clone of the cached declared job for the given request_id.
+    pub fn get(&self, request_id: &RequestId) -> Option<DeclaredJob> {
+        self.inner.get(request_id).map(|e| e.value().clone())
+    }
+
     /// Phase 1 invalidation rule: drop every cached entry.
     ///
     /// "Dead ancestry" is hard to evaluate without a formal share-chain tip
@@ -210,11 +247,18 @@ pub struct EngineHandles {
     /// in the binary; passed here as `Arc<dyn ShareValidator>` so tests
     /// can substitute a mock.
     pub validator: Arc<dyn ShareValidator + Send + Sync>,
-    /// Bitcoin RPC backend, used for `getblocktemplate` (capture
-    /// `prev_hash`/`nbits` for declared jobs) and `submit_block`
-    /// (forward found blocks). The trait abstraction (vendored fork
-    /// `feat/bitcoind-trait`) lets us mock bitcoind in tests.
+    /// Bitcoin RPC backend. Phase 2.4 uses this only for `submit_block`
+    /// (forward found blocks); tip metadata + tx bodies come from the
+    /// SV2 Template Distribution Protocol via [`TdpHandle`]. The trait
+    /// abstraction (vendored fork `feat/bitcoind-trait`) lets us mock
+    /// bitcoind in tests.
     pub bitcoind: Arc<dyn BitcoindLike>,
+    /// SV2 Template Distribution Protocol bridge. Provides:
+    /// - Snapshots of the latest `(NewTemplate, SetNewPrevHash)` for
+    ///   tip metadata at `DeclareMiningJob` time.
+    /// - `RequestTransactionData(template_id)` round-trips for full
+    ///   transaction bodies at `PushSolution` time.
+    pub tdp: tdp::TdpHandle,
 }
 
 impl std::fmt::Debug for EngineHandles {
@@ -223,6 +267,7 @@ impl std::fmt::Debug for EngineHandles {
             .field("chain", &"<ChainStoreHandle>")
             .field("validator", &"<dyn ShareValidator>")
             .field("bitcoind", &"<dyn BitcoindLike>")
+            .field("tdp", &"<TdpHandle>")
             .finish()
     }
 }
@@ -484,6 +529,7 @@ mod tests {
             wtxid_list: vec![],
             txid_list: None,
             tip: TipMetadata::default(),
+            template_id: None,
             validated: false,
         }
     }
@@ -534,11 +580,14 @@ mod tests {
         let validator: Arc<dyn ShareValidator + Send + Sync> =
             Arc::new(DefaultShareValidator::new(pool_difficulty, 1, Vec::new()));
         let bitcoind: Arc<dyn BitcoindLike> = Arc::new(MockBitcoind::default());
+        let (tx_sender, _tx_receiver) = async_channel::unbounded();
+        let tdp = TdpHandle::new(tx_sender);
 
         let handles = EngineHandles {
             chain,
             validator,
             bitcoind,
+            tdp,
         };
         let engine = P2poolV2Engine::with_handles(bitcoin::Network::Regtest, handles);
         assert!(engine.has_handles());

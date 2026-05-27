@@ -166,24 +166,34 @@ impl JobValidationEngine for P2poolV2Engine {
                 Vec::new()
             };
 
-        // 7. Capture Bitcoin tip metadata from bitcoind's GBT (Phase 2.3).
-        //    When handles are present, this gives us real prev_hash + nbits
-        //    + min_ntime to cross-check in handle_set_custom_mining_job.
-        //    Without handles, we leave TipMetadata::default() (all-zeros)
-        //    and the structural-only mode tolerates the placeholders.
-        let tip = match self.handles() {
-            Some(h) => match capture_tip_metadata(h.bitcoind.as_ref(), self.network()).await {
-                Ok(tip) => tip,
-                Err(e) => {
+        // 7. Capture Bitcoin tip metadata + template_id via the SV2
+        //    Template Distribution Protocol (Phase 2.4). When handles are
+        //    present, this gives us real prev_hash + nbits + min_ntime
+        //    (from `SetNewPrevHash`) and the matching template_id (from
+        //    `NewTemplate`) to cross-check in
+        //    `handle_set_custom_mining_job` and to fetch transaction
+        //    bodies in `handle_push_solution`. Without handles, we leave
+        //    TipMetadata::default() (all-zeros) and `template_id = None`;
+        //    structural-only mode tolerates the placeholders.
+        let (tip, template_id) = match self.handles() {
+            Some(h) => {
+                let tip = h.tdp.current_tip().unwrap_or_else(|| {
                     warn!(
                         request_id,
-                        error = %e,
-                        "failed to capture Bitcoin tip metadata; falling back to defaults"
+                        "TdpHandle has no SetNewPrevHash snapshot yet; using default tip"
                     );
                     TipMetadata::default()
+                });
+                let tid = h.tdp.current_template_id();
+                if tid.is_none() {
+                    warn!(
+                        request_id,
+                        "TdpHandle has no NewTemplate snapshot yet; PushSolution will not be able to fetch tx bodies for this job"
+                    );
                 }
-            },
-            None => TipMetadata::default(),
+                (tip, tid)
+            }
+            None => (TipMetadata::default(), None),
         };
 
         let snapshot = DeclaredJob {
@@ -193,6 +203,7 @@ impl JobValidationEngine for P2poolV2Engine {
             wtxid_list,
             txid_list: Some(missing_txs.iter().map(|tx| tx.compute_txid()).collect()),
             tip,
+            template_id,
             validated: true,
         };
         self.declared_jobs().insert(request_id, snapshot);
@@ -426,26 +437,31 @@ impl JobValidationEngine for P2poolV2Engine {
 
     /// Submit a found Bitcoin block solution to bitcoind and record the
     /// block-finder credit in [`RecentSolutions`] so the matching
-    /// `SubmitSharesExtended` (handled by ChannelManager in Phase 1.6) can
-    /// claim the bonus.
+    /// `SubmitSharesExtended` (handled by ChannelManager) can claim the
+    /// bonus.
     ///
-    /// **Phase 1.4 scope**: structurally records the solution in
-    /// `RecentSolutions` keyed by a synthetic share-hash derived from
-    /// the solution's identifying fields (prev_hash + nonce + ntime +
-    /// version). True share-hash matching against a candidate
-    /// `bitcoin::Block` requires the full coinbase + tx list lookup
-    /// from the matching declared job, plus a `BitcoindLike` handle —
-    /// both lands in Phase 1.6 when ChannelManager wiring exposes the
-    /// job-resolution path.
+    /// Phase 2.4 path (handles wired):
+    /// 1. Look up the cached `DeclaredJob` by `(prev_hash, nbits, version)`.
+    /// 2. Fetch full transaction bodies via
+    ///    `TdpHandle::request_tx_bodies(template_id)`.
+    /// 3. Reconstruct the full `bitcoin::Block` (coinbase + tx_bodies).
+    /// 4. Call `BitcoindLike::submit_block(&block)` — fire-and-forget.
+    /// 5. Record `(synthetic_share_hash → real_block_hash)` in
+    ///    `RecentSolutions` so the share-submission path can claim
+    ///    block-finder credit.
+    ///
+    /// Phase-1 fallback (no handles): record `(synthetic → synthetic)`
+    /// and skip block submission. Preserved so the engine remains usable
+    /// in structural-only test mode.
     ///
     /// The fire-and-forget pattern matches upstream
     /// `bitcoin_core_ipc.rs:639-653`. We never block the JDP message
     /// handler on Bitcoin Core or the share-chain.
     async fn handle_push_solution(&self, push_solution: PushSolution<'_>) {
-        // Synthetic share-hash for Phase 1.4: SHA256d of the solution's
-        // identifying fields. Phase 1.6 will replace this with the real
-        // bitcoin::BlockHash computed from the reconstructed candidate
-        // block, which is what ChannelManager looks up against.
+        // Synthetic share-hash: SHA256d of the solution's identifying
+        // fields. Used as the share-side key in RecentSolutions; the
+        // share-submission path computes the same value when looking up
+        // block-finder credit.
         let synthetic_share_hash = {
             use bitcoin::hashes::{Hash as _, sha256d};
             let mut bytes = Vec::with_capacity(32 + 4 + 4 + 4);
@@ -456,26 +472,121 @@ impl JobValidationEngine for P2poolV2Engine {
             BlockHash::from_byte_array(*sha256d::Hash::hash(&bytes).as_byte_array())
         };
 
-        // For Phase 1.4 we record (synthetic_share_hash → synthetic_share_hash)
-        // because the real Bitcoin block hash isn't computable until we
-        // reconstruct the full block. Phase 1.6 will record
-        // (real_share_hash → real_block_hash) once ChannelManager has the
-        // share-block reconstruction path.
+        // Structural-only mode: no handles, record synthetic→synthetic.
+        let Some(handles) = self.handles() else {
+            self.recent_solutions
+                .record(synthetic_share_hash, synthetic_share_hash);
+            info!(
+                share_hash = %synthetic_share_hash,
+                ntime = push_solution.ntime,
+                "PushSolution received (structural-only mode); recorded synthetic share hash"
+            );
+            return;
+        };
+
+        // 1. Decode prev_hash and look up the matching DeclaredJob.
+        let push_prev_hash: BlockHash = {
+            let bytes: [u8; 32] = match push_solution.prev_hash.to_vec().try_into() {
+                Ok(b) => b,
+                Err(_) => {
+                    warn!("PushSolution.prev_hash was not 32 bytes; ignoring");
+                    return;
+                }
+            };
+            BlockHash::from_byte_array(bytes)
+        };
+        let request_id = match self.declared_jobs().find_by_solution(
+            push_prev_hash,
+            push_solution.nbits,
+            push_solution.version,
+        ) {
+            Some(rid) => rid,
+            None => {
+                warn!(
+                    %push_prev_hash,
+                    nbits = push_solution.nbits,
+                    version = push_solution.version,
+                    "PushSolution: no cached DeclaredJob matches (prev_hash, nbits, version); ignoring"
+                );
+                return;
+            }
+        };
+        let declared = match self.declared_jobs().get(&request_id) {
+            Some(job) => job,
+            None => {
+                warn!(
+                    request_id,
+                    "PushSolution: cached job vanished between find_by_solution and get; ignoring"
+                );
+                return;
+            }
+        };
+
+        // 2. We need a template_id to fetch tx bodies. Without it (e.g.
+        //    declare happened before TDP populated the snapshot), we
+        //    can't submit; record synthetic credit and bail.
+        let Some(template_id) = declared.template_id else {
+            warn!(
+                request_id,
+                "PushSolution: cached DeclaredJob has no template_id; cannot fetch tx bodies — recording synthetic credit only"
+            );
+            self.recent_solutions
+                .record(synthetic_share_hash, synthetic_share_hash);
+            return;
+        };
+
+        // 3. Fetch tx bodies from the Template Provider via TDP.
+        let tx_bodies = match handles.tdp.request_tx_bodies(template_id).await {
+            Ok(txs) => txs,
+            Err(e) => {
+                warn!(
+                    request_id,
+                    template_id,
+                    error = %e,
+                    "PushSolution: RequestTransactionData failed; cannot reconstruct block"
+                );
+                return;
+            }
+        };
+
+        // 4. Reconstruct the full block.
+        let block = match crate::block::reconstruct_block(&declared, &push_solution, tx_bodies) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    request_id,
+                    template_id,
+                    error = %e,
+                    "PushSolution: block reconstruction failed"
+                );
+                return;
+            }
+        };
+        let block_hash = block.block_hash();
+
+        // 5. Submit the block to bitcoind (fire-and-forget; we don't
+        //    block the JDP handler waiting for it). Record block-finder
+        //    credit BEFORE submitting so a fast SubmitSharesExtended
+        //    can claim it even if submit_block hasn't returned.
         self.recent_solutions
-            .record(synthetic_share_hash, synthetic_share_hash);
-
+            .record(synthetic_share_hash, block_hash);
         info!(
-            share_hash = %synthetic_share_hash,
-            ntime = push_solution.ntime,
-            "PushSolution received; recorded for block-finder credit (Phase 1.4 synthetic-hash mode)"
+            request_id,
+            template_id,
+            %block_hash,
+            "PushSolution: reconstructed block; submitting to bitcoind"
         );
-
-        // TODO(Phase 1.6): once ChannelManager exposes a job-resolution
-        // path, look up the matching DeclaredJob via
-        // (prev_hash, nbits, version) and the in-flight allocated_tokens
-        // map, reconstruct the full bitcoin::Block, and call
-        // self.bitcoind.submit_block(&block).await — fire-and-forget per
-        // upstream pattern.
+        let bitcoind = handles.bitcoind.clone();
+        tokio::spawn(async move {
+            match bitcoind.submit_block(&block).await {
+                Ok(reply) => {
+                    info!(%block_hash, %reply, "submit_block returned");
+                }
+                Err(e) => {
+                    warn!(%block_hash, error = %e, "submit_block failed");
+                }
+            }
+        });
     }
 
     /// Hook fired by the share-chain when a tip swap happens. Drops every
@@ -502,52 +613,6 @@ fn decode_token(declare_mining_job: &DeclareMiningJob<'_>) -> Result<JdToken, ()
         .try_into()
         .map_err(|_| ())?;
     Ok(u64::from_le_bytes(token_bytes))
-}
-
-/// Query bitcoind's `getblocktemplate` and parse the response into the
-/// fields we need for `TipMetadata`.
-///
-/// Used by `handle_declare_mining_job` to capture the current Bitcoin
-/// tip's `prev_hash` + `nbits` + `min_ntime` so subsequent
-/// `SetCustomMiningJob` cross-checks have real values to compare.
-///
-/// `BitcoindLike::getblocktemplate` returns the raw JSON template as a
-/// `String`; we deserialize into `p2poolv2_lib::stratum::work::block_template::BlockTemplate`
-/// (already defined upstream).
-async fn capture_tip_metadata(
-    bitcoind: &dyn bitcoindrpc::BitcoindLike,
-    network: bitcoin::Network,
-) -> Result<TipMetadata, anyhow::Error> {
-    use bitcoin::hashes::Hash as _;
-
-    let raw = bitcoind.getblocktemplate(network).await?;
-    let template: p2poolv2_lib::stratum::work::block_template::BlockTemplate<serde_json::Value> =
-        serde_json::from_str(&raw)?;
-
-    // previousblockhash is hex; parse to BlockHash.
-    let prev_hash_bytes = parse_hex_32(&template.previousblockhash)?;
-    let prev_hash = BlockHash::from_byte_array(prev_hash_bytes);
-
-    // bits is hex (e.g. "207fffff"); parse to u32.
-    let nbits = u32::from_str_radix(&template.bits, 16)?;
-
-    Ok(TipMetadata {
-        prev_hash,
-        nbits,
-        min_ntime: template.mintime,
-    })
-}
-
-/// Parse a 64-char hex string into `[u8; 32]`.
-fn parse_hex_32(s: &str) -> Result<[u8; 32], anyhow::Error> {
-    if s.len() != 64 {
-        anyhow::bail!("expected 64-char hex string, got {}", s.len());
-    }
-    let mut out = [0u8; 32];
-    for (i, byte_out) in out.iter_mut().enumerate() {
-        *byte_out = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)?;
-    }
-    Ok(out)
 }
 
 /// Suppress "Arc<P2poolV2Engine> trait coherence" lint by acknowledging
@@ -757,6 +822,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn push_solution_submits_block_via_tdp_and_bitcoind() {
+        use std::sync::Arc;
+
+        use bitcoin::{CompactTarget, hashes::Hash as _};
+        use bitcoindrpc::{BitcoindLike, mock::MockBitcoind};
+        use p2poolv2_lib::{
+            pool_difficulty::PoolDifficulty,
+            shares::validation::{DefaultShareValidator, ShareValidator},
+            test_utils::setup_test_chain_store_handle,
+        };
+        use stratum_apps::stratum_core::{
+            binary_sv2::{Seq064K, Seq0255},
+            parsers_sv2::TemplateDistribution,
+            template_distribution_sv2::{
+                NewTemplate, RequestTransactionDataSuccess, SetNewPrevHash,
+            },
+        };
+
+        use crate::{EngineHandles, TdpHandle, tdp::TxDataResult};
+
+        // 1. Build the engine with handles, including a TdpHandle.
+        let (chain, _tmpdir) = setup_test_chain_store_handle(false).await;
+        let pool_difficulty = PoolDifficulty::new(CompactTarget::from_consensus(0x207fffff), 0, 0);
+        let validator: Arc<dyn ShareValidator + Send + Sync> =
+            Arc::new(DefaultShareValidator::new(pool_difficulty, 1, Vec::new()));
+        let mock_bitcoind = Arc::new(MockBitcoind::default());
+        let bitcoind: Arc<dyn BitcoindLike> = mock_bitcoind.clone();
+        let (req_tx, req_rx) = async_channel::unbounded();
+        let tdp = TdpHandle::new(req_tx);
+
+        // 2. Pre-seed the TdpHandle's snapshots so handle_declare_mining_job
+        //    captures real tip + template_id, NOT defaults.
+        let tip_prev_hash_bytes = [9u8; 32];
+        let tip_nbits: u32 = 0x207fffff;
+        let tip_min_ntime: u32 = 1_700_000_000;
+        let template_id: u64 = 12345;
+
+        let snph = SetNewPrevHash {
+            template_id,
+            prev_hash: tip_prev_hash_bytes.to_vec().try_into().expect("32 bytes"),
+            header_timestamp: tip_min_ntime,
+            n_bits: tip_nbits,
+            target: [0u8; 32].to_vec().try_into().expect("32 bytes"),
+        };
+        tdp.record_set_new_prev_hash(snph);
+
+        let nt = NewTemplate {
+            template_id,
+            future_template: false,
+            version: 0x20000000,
+            coinbase_tx_version: 2,
+            coinbase_prefix: Vec::<u8>::new().try_into().expect("empty fits"),
+            coinbase_tx_input_sequence: 0xffff_ffff,
+            coinbase_tx_value_remaining: 50_0000_0000,
+            coinbase_tx_outputs_count: 0,
+            coinbase_tx_outputs: Vec::<u8>::new().try_into().expect("empty fits"),
+            coinbase_tx_locktime: 0,
+            merkle_path: Seq0255::new(Vec::new()).expect("empty fits"),
+        };
+        tdp.record_new_template(nt);
+
+        let handles = EngineHandles {
+            chain,
+            validator,
+            bitcoind: bitcoind.clone(),
+            tdp: tdp.clone(),
+        };
+        let engine = P2poolV2Engine::with_handles(bitcoin::Network::Regtest, handles);
+
+        // 3. Spawn a stub TP demux: when RequestTransactionData arrives,
+        //    deliver an empty transaction_list (a coinbase-only block from
+        //    bitcoin's perspective is still a valid Block — txdata = [coinbase]).
+        let demux_tdp = tdp.clone();
+        tokio::spawn(async move {
+            while let Ok(req) = req_rx.recv().await {
+                if let TemplateDistribution::RequestTransactionData(r) = req {
+                    let success = RequestTransactionDataSuccess {
+                        template_id: r.template_id,
+                        excess_data: Vec::<u8>::new().try_into().expect("empty fits"),
+                        transaction_list: Seq064K::new(Vec::new()).expect("empty fits"),
+                    };
+                    demux_tdp.deliver_response(r.template_id, TxDataResult::Success(success));
+                }
+            }
+        });
+
+        // 4. Declare a mining job. This caches a DeclaredJob with the
+        //    pre-seeded tip + template_id.
+        let cb = build_coinbase(vec![0; 16]);
+        let (prefix, suffix) = split_coinbase(&cb, 16);
+        let wtxid = [42u8; 32];
+        let declare = build_declare_mining_job(
+            7,
+            99,
+            0x20000000,
+            prefix.clone(),
+            suffix.clone(),
+            vec![wtxid],
+        );
+        let result = engine.handle_declare_mining_job(declare, None).await;
+        assert!(matches!(result, DeclareMiningJobResult::Success));
+
+        // Sanity: cached job has the captured template_id + tip.
+        let cached = engine.declared_jobs().get(&7).expect("declared job cached");
+        assert_eq!(cached.template_id, Some(template_id));
+        assert_eq!(cached.tip.nbits, tip_nbits);
+        assert_eq!(cached.tip.min_ntime, tip_min_ntime);
+        assert_eq!(cached.tip.prev_hash.as_byte_array(), &tip_prev_hash_bytes);
+
+        // 5. Build a PushSolution whose (prev_hash, nbits, version) match
+        //    the cached job, with the same extranonce size as declared.
+        let extranonce: Vec<u8> = vec![0xab; 16];
+        let push = PushSolution {
+            extranonce: extranonce.try_into().expect("fits"),
+            prev_hash: tip_prev_hash_bytes.to_vec().try_into().expect("32 bytes"),
+            ntime: tip_min_ntime,
+            nonce: 0xDEADBEEF,
+            nbits: tip_nbits,
+            version: 0x20000000,
+        };
+
+        // 6. Drive handle_push_solution.
+        engine.handle_push_solution(push).await;
+
+        // 7. Give the spawned submit_block task a chance to run.
+        for _ in 0..20 {
+            if !mock_bitcoind.submitted_blocks().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let submitted = mock_bitcoind.submitted_blocks();
+        assert_eq!(
+            submitted.len(),
+            1,
+            "expected exactly one block submitted to bitcoind"
+        );
+        let block = &submitted[0];
+        // Coinbase-only block (we returned an empty transaction_list).
+        assert_eq!(block.txdata.len(), 1);
+        // Header carries the PushSolution's nonce, ntime, version.
+        assert_eq!(block.header.nonce, 0xDEADBEEF);
+        assert_eq!(block.header.time, tip_min_ntime);
+        assert_eq!(block.header.bits.to_consensus(), tip_nbits);
+        assert_eq!(
+            block.header.prev_blockhash.as_byte_array(),
+            &tip_prev_hash_bytes
+        );
+
+        // RecentSolutions records the synthetic→real_block_hash edge.
+        assert!(!engine.recent_solutions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn push_solution_no_handles_records_synthetic_only() {
+        // Without handles wired, push_solution stays in structural-only mode:
+        // records synthetic→synthetic in RecentSolutions; never panics.
+        let engine = P2poolV2Engine::default();
+        let extranonce: Vec<u8> = vec![0; 16];
+        let push = PushSolution {
+            extranonce: extranonce.try_into().expect("fits"),
+            prev_hash: [1u8; 32].to_vec().try_into().expect("32 bytes"),
+            ntime: 0,
+            nonce: 0,
+            nbits: 0x207fffff,
+            version: 0x20000000,
+        };
+        let len_before = engine.recent_solutions().len();
+        engine.handle_push_solution(push).await;
+        assert_eq!(engine.recent_solutions().len(), len_before + 1);
+    }
+
+    #[tokio::test]
     async fn notify_share_chain_reorg_invalidates_cache() {
         let engine = P2poolV2Engine::default();
         // Insert a few cached jobs.
@@ -769,6 +1009,7 @@ mod tests {
                 wtxid_list: vec![],
                 txid_list: None,
                 tip: TipMetadata::default(),
+                template_id: None,
                 validated: true,
             },
         );
@@ -781,6 +1022,7 @@ mod tests {
                 wtxid_list: vec![],
                 txid_list: None,
                 tip: TipMetadata::default(),
+                template_id: None,
                 validated: true,
             },
         );
