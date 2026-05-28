@@ -214,6 +214,29 @@ impl DeclaredJobCache {
         self.inner.clear();
         dropped
     }
+
+    /// Selective invalidation: drop every cached entry where
+    /// `predicate(&job)` returns `false`. Returns the number of
+    /// entries dropped.
+    ///
+    /// Used by `notify_share_chain_reorg` (Phase 2-A) to keep jobs
+    /// whose captured `share_chain_tip` is still an ancestor of the
+    /// new tip. The predicate is invoked under the cache's internal
+    /// lock; keep it cheap.
+    pub fn retain<F>(&self, predicate: F) -> usize
+    where
+        F: Fn(&DeclaredJob) -> bool,
+    {
+        let mut dropped = 0;
+        self.inner.retain(|_request_id, job| {
+            let keep = predicate(job);
+            if !keep {
+                dropped += 1;
+            }
+            keep
+        });
+        dropped
+    }
 }
 
 /// Token-payout binding. Per ADR 0002 § Decision § 1.
