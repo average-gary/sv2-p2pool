@@ -299,39 +299,49 @@ impl JobValidationEngine for P2poolV2Engine {
             );
         }
 
-        // 4. prev_hash cross-check (Phase 2.3: real values from GBT
-        //    when handles were present at declare time; otherwise
-        //    `TipMetadata::default()` = all-zeros, matching upstream
-        //    structural-only mode).
-        let custom_prev_hash = {
-            let bytes: [u8; 32] = set_custom_mining_job
-                .prev_hash
-                .to_vec()
-                .try_into()
-                .expect("U256 is 32 bytes");
-            BlockHash::from_byte_array(bytes)
-        };
-        let declared_prev_hash = declared.tip.prev_hash;
-        if custom_prev_hash != declared_prev_hash {
-            debug!(
-                ?custom_prev_hash,
-                ?declared_prev_hash,
-                "SetCustomMiningJob: prev_hash mismatch (note: Phase 1.2 declared_prev_hash is all-zeros stub)"
-            );
-            return SetCustomMiningJobResult::Error(
-                ERROR_CODE_SET_CUSTOM_MINING_JOB_STALE_CHAIN_TIP,
-            );
-        }
+        // 4. prev_hash + nbits cross-checks. Phase 2.4 captures the
+        //    real tip via TDP at declare time. In structural-only
+        //    mode (no TDP wired) `tip` stays at default (all-zeros
+        //    prev_hash, zero nbits) — skip these cross-checks rather
+        //    than returning spurious mismatches.
+        let tip_was_captured =
+            declared.tip.prev_hash != BlockHash::all_zeros() || declared.tip.nbits != 0;
 
-        // 5. nbits cross-check (Phase 2.3: real value from GBT).
-        let declared_nbits: u32 = declared.tip.nbits;
-        if set_custom_mining_job.nbits != declared_nbits {
+        if tip_was_captured {
+            let custom_prev_hash = {
+                let bytes: [u8; 32] = set_custom_mining_job
+                    .prev_hash
+                    .to_vec()
+                    .try_into()
+                    .expect("U256 is 32 bytes");
+                BlockHash::from_byte_array(bytes)
+            };
+            if custom_prev_hash != declared.tip.prev_hash {
+                debug!(
+                    ?custom_prev_hash,
+                    declared_prev_hash = ?declared.tip.prev_hash,
+                    "SetCustomMiningJob: prev_hash mismatch"
+                );
+                return SetCustomMiningJobResult::Error(
+                    ERROR_CODE_SET_CUSTOM_MINING_JOB_STALE_CHAIN_TIP,
+                );
+            }
+
+            if set_custom_mining_job.nbits != declared.tip.nbits {
+                debug!(
+                    custom = set_custom_mining_job.nbits,
+                    declared = declared.tip.nbits,
+                    "SetCustomMiningJob: nbits mismatch"
+                );
+                return SetCustomMiningJobResult::Error(
+                    ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_NBITS,
+                );
+            }
+        } else {
             debug!(
-                custom = set_custom_mining_job.nbits,
-                declared = declared_nbits,
-                "SetCustomMiningJob: nbits mismatch"
+                request_id,
+                "SetCustomMiningJob: tip was not captured at declare time; skipping prev_hash + nbits cross-checks"
             );
-            return SetCustomMiningJobResult::Error(ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_NBITS);
         }
 
         // 6. version.
@@ -882,6 +892,104 @@ mod tests {
         assert_eq!(engine.declared_jobs().len(), 1);
         // Token mapping populated.
         assert!(engine.allocated_tokens().contains_key(&99));
+    }
+
+    /// Build a structurally-valid `SetCustomMiningJob` fixture that
+    /// matches the coinbase produced by `build_coinbase` /
+    /// `split_coinbase`. Used to exercise the cross-check path
+    /// without writing the per-field assertions ourselves in every
+    /// test.
+    fn build_set_custom_mining_job(
+        token: u64,
+        version: u32,
+        prev_hash_bytes: [u8; 32],
+        nbits: u32,
+        coinbase_tx_outputs_serialized: Vec<u8>,
+        merkle_path: Vec<[u8; 32]>,
+    ) -> stratum_apps::stratum_core::mining_sv2::SetCustomMiningJob<'static> {
+        use stratum_apps::stratum_core::{
+            binary_sv2::{B064K, Seq0255},
+            mining_sv2::SetCustomMiningJob,
+        };
+        let merkle: Vec<U256<'static>> = merkle_path
+            .into_iter()
+            .map(|b| b.to_vec().try_into().expect("32 bytes"))
+            .collect();
+        SetCustomMiningJob {
+            channel_id: 1,
+            request_id: 1,
+            token: token_b0255(token),
+            version,
+            prev_hash: prev_hash_bytes.to_vec().try_into().expect("32 bytes"),
+            min_ntime: 0,
+            nbits,
+            coinbase_tx_version: 2,
+            coinbase_prefix: Vec::<u8>::new().try_into().expect("empty fits"),
+            coinbase_tx_input_n_sequence: u32::MAX,
+            coinbase_tx_outputs: TryInto::<B064K<'static>>::try_into(
+                coinbase_tx_outputs_serialized,
+            )
+            .expect("outputs fit"),
+            coinbase_tx_locktime: 0,
+            merkle_path: Seq0255::new(merkle).expect("merkle fits"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_custom_mining_job_handles_less_skips_tip_checks() {
+        // Without handles wired, declared.tip is all-zeros default.
+        // SetCustomMiningJob with arbitrary non-zero prev_hash/nbits
+        // must not return STALE_CHAIN_TIP / INVALID_NBITS — instead
+        // the cross-checks are skipped and only the structural
+        // checks (version, coinbase, merkle path) apply.
+        let engine = P2poolV2Engine::default();
+        let cb = build_coinbase(vec![0; 16]);
+        let (prefix, suffix) = split_coinbase(&cb, 16);
+        let wtxid = [42u8; 32];
+        let declare = build_declare_mining_job(7, 99, 0x20000000, prefix, suffix, vec![wtxid]);
+        let result = engine.handle_declare_mining_job(declare, None).await;
+        assert!(matches!(result, DeclareMiningJobResult::Success));
+
+        // Compute the values the engine will derive when validating.
+        // Reconstruct the coinbase the same way handle_set_custom_mining_job
+        // will, so coinbase_tx_outputs + merkle_path align.
+        let cached = engine.declared_jobs().get(&7).expect("cached");
+        let reconstructed = crate::coinbase::reconstruct_coinbase(
+            &cached.coinbase_tx_prefix,
+            &cached.coinbase_tx_suffix,
+        )
+        .expect("reconstruct");
+        let outputs_serialized = bitcoin::consensus::serialize(&reconstructed.output);
+        let coinbase_txid = reconstructed.compute_txid();
+        // Single wtxid in declare → txid_list has one entry derived
+        // from the missing-tx parsing. With no PMTS, txid_list is
+        // empty (only the coinbase forms the merkle root).
+        let merkle = crate::coinbase::merkle_path(coinbase_txid, &[]);
+        let merkle_arr: Vec<[u8; 32]> = merkle
+            .iter()
+            .map(|m| {
+                use bitcoin::hashes::Hash as _;
+                m.as_byte_array().to_owned()
+            })
+            .collect();
+
+        let custom = build_set_custom_mining_job(
+            99,
+            0x20000000,
+            // Arbitrary non-zero prev_hash — would fail the STALE_CHAIN_TIP
+            // check if the engine didn't skip it.
+            [0xab; 32],
+            // Same for nbits.
+            0x12345678,
+            outputs_serialized,
+            merkle_arr,
+        );
+        let result = engine.handle_set_custom_mining_job(custom, 99).await;
+        let success = matches!(result, SetCustomMiningJobResult::Success);
+        assert!(
+            success,
+            "expected Success in handles-less mode (cross-checks skipped)"
+        );
     }
 
     #[tokio::test]
