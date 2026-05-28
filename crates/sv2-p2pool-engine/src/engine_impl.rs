@@ -152,7 +152,27 @@ impl JobValidationEngine for P2poolV2Engine {
             );
         }
 
-        // 6. Parse missing transactions if this is a retry.
+        // 6. First-pass declare with non-empty wtxid_list and no PMTS:
+        //    ask the JDC to send tx bodies. We don't yet have a
+        //    template-side store to look up which wtxids we already
+        //    know, so the conservative-correct response is to request
+        //    all of them. The JDC re-issues DeclareMiningJob with PMTS
+        //    on the second pass.
+        //
+        //    Without this, caching a job with `txid_list = Some(vec![])`
+        //    while the JDC's merkle path was computed over the full
+        //    wtxid set would cause a downstream
+        //    `SetCustomMiningJob.merkle_path` mismatch (INVALID_MERKLE_PATH).
+        if !wtxid_list.is_empty() && provide_missing_transactions_success.is_none() {
+            debug!(
+                request_id,
+                count = wtxid_list.len(),
+                "DeclareMiningJob: requesting missing transactions"
+            );
+            return DeclareMiningJobResult::MissingTransactions(wtxid_list);
+        }
+
+        // 7. Parse missing transactions from the PMTS retry.
         let missing_txs: Vec<bitcoin::Transaction> =
             if let Some(ref pmts) = provide_missing_transactions_success {
                 pmts.transaction_list
@@ -876,21 +896,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn declare_mining_job_caches_snapshot_on_success() {
+    async fn declare_mining_job_first_pass_returns_missing_transactions() {
+        // Valid coinbase + non-empty wtxid_list + no PMTS → engine asks
+        // the JDC for tx bodies via MissingTransactions(wtxid_list).
+        // The job is NOT cached on this pass (the JDC will re-issue
+        // DeclareMiningJob with the bodies).
         let engine = P2poolV2Engine::default();
-        // Valid coinbase + non-empty wtxid_list → Success and cache populated.
         let cb = build_coinbase(vec![0; 16]);
         let (prefix, suffix) = split_coinbase(&cb, 16);
         let wtxid = [42u8; 32];
         let msg = build_declare_mining_job(7, 99, 0x20000000, prefix, suffix, vec![wtxid]);
         let result = engine.handle_declare_mining_job(msg, None).await;
-        assert!(
-            matches!(result, DeclareMiningJobResult::Success),
-            "expected Success, got error"
-        );
-        // Cache populated.
+        match result {
+            DeclareMiningJobResult::MissingTransactions(missing) => {
+                assert_eq!(missing.len(), 1);
+                assert_eq!(missing[0].as_byte_array(), &wtxid);
+            }
+            other => panic!(
+                "expected MissingTransactions, got {:?}",
+                match other {
+                    DeclareMiningJobResult::Success => "Success",
+                    DeclareMiningJobResult::Error(_) => "Error",
+                    DeclareMiningJobResult::MissingTransactions(_) => unreachable!(),
+                }
+            ),
+        }
+        // Cache + token map remain empty until the PMTS retry succeeds.
+        assert!(engine.declared_jobs().is_empty());
+        assert!(!engine.allocated_tokens().contains_key(&99));
+    }
+
+    #[tokio::test]
+    async fn declare_mining_job_with_pmts_caches_snapshot() {
+        // The PMTS-retry path: same DeclareMiningJob plus
+        // ProvideMissingTransactionsSuccess carrying the actual
+        // transaction bodies. Engine validates and caches.
+        use stratum_apps::stratum_core::{
+            binary_sv2::B016M, job_declaration_sv2::ProvideMissingTransactionsSuccess,
+        };
+
+        let engine = P2poolV2Engine::default();
+        let cb = build_coinbase(vec![0; 16]);
+        let (prefix, suffix) = split_coinbase(&cb, 16);
+
+        // Build a fake non-coinbase tx and use its real wtxid, so the
+        // engine's check against PMTS bodies passes.
+        let fake_tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from_bytes(vec![1, 2, 3, 4]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::ZERO,
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let wtxid_bytes: [u8; 32] = *fake_tx.compute_wtxid().as_byte_array();
+
+        let msg = build_declare_mining_job(7, 99, 0x20000000, prefix, suffix, vec![wtxid_bytes]);
+        let serialized_tx = bitcoin::consensus::serialize(&fake_tx);
+        let tx_bytes: B016M<'static> = serialized_tx.try_into().expect("fits");
+        let pmts = ProvideMissingTransactionsSuccess {
+            request_id: 7,
+            transaction_list: Seq064K::new(vec![tx_bytes]).expect("fits"),
+        };
+
+        let result = engine.handle_declare_mining_job(msg, Some(pmts)).await;
+        assert!(matches!(result, DeclareMiningJobResult::Success));
         assert_eq!(engine.declared_jobs().len(), 1);
-        // Token mapping populated.
         assert!(engine.allocated_tokens().contains_key(&99));
     }
 
@@ -942,17 +1019,44 @@ mod tests {
         // must not return STALE_CHAIN_TIP / INVALID_NBITS — instead
         // the cross-checks are skipped and only the structural
         // checks (version, coinbase, merkle path) apply.
+        use stratum_apps::stratum_core::{
+            binary_sv2::B016M, job_declaration_sv2::ProvideMissingTransactionsSuccess,
+        };
+
         let engine = P2poolV2Engine::default();
         let cb = build_coinbase(vec![0; 16]);
         let (prefix, suffix) = split_coinbase(&cb, 16);
-        let wtxid = [42u8; 32];
-        let declare = build_declare_mining_job(7, 99, 0x20000000, prefix, suffix, vec![wtxid]);
-        let result = engine.handle_declare_mining_job(declare, None).await;
+
+        // Two-step declare: send wtxid_list, then re-issue with PMTS.
+        let fake_tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from_bytes(vec![1, 2, 3, 4]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::ZERO,
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let wtxid_bytes: [u8; 32] = *fake_tx.compute_wtxid().as_byte_array();
+        let serialized_tx = bitcoin::consensus::serialize(&fake_tx);
+        let tx_bytes: B016M<'static> = serialized_tx.try_into().expect("fits");
+        let pmts = ProvideMissingTransactionsSuccess {
+            request_id: 7,
+            transaction_list: Seq064K::new(vec![tx_bytes]).expect("fits"),
+        };
+        let declare =
+            build_declare_mining_job(7, 99, 0x20000000, prefix, suffix, vec![wtxid_bytes]);
+        let result = engine.handle_declare_mining_job(declare, Some(pmts)).await;
         assert!(matches!(result, DeclareMiningJobResult::Success));
 
         // Compute the values the engine will derive when validating.
-        // Reconstruct the coinbase the same way handle_set_custom_mining_job
-        // will, so coinbase_tx_outputs + merkle_path align.
+        // The cached txid_list has the fake tx's txid (computed in
+        // the engine from the PMTS bodies).
         let cached = engine.declared_jobs().get(&7).expect("cached");
         let reconstructed = crate::coinbase::reconstruct_coinbase(
             &cached.coinbase_tx_prefix,
@@ -961,10 +1065,8 @@ mod tests {
         .expect("reconstruct");
         let outputs_serialized = bitcoin::consensus::serialize(&reconstructed.output);
         let coinbase_txid = reconstructed.compute_txid();
-        // Single wtxid in declare → txid_list has one entry derived
-        // from the missing-tx parsing. With no PMTS, txid_list is
-        // empty (only the coinbase forms the merkle root).
-        let merkle = crate::coinbase::merkle_path(coinbase_txid, &[]);
+        let txid_list = cached.txid_list.as_ref().expect("txid_list").clone();
+        let merkle = crate::coinbase::merkle_path(coinbase_txid, &txid_list);
         let merkle_arr: Vec<[u8; 32]> = merkle
             .iter()
             .map(|m| {
@@ -1102,37 +1204,67 @@ mod tests {
         let engine =
             P2poolV2Engine::with_handles(bitcoin::Network::Regtest, handles).with_tdp(tdp.clone());
 
-        // 3. Spawn a stub TP demux: when RequestTransactionData arrives,
-        //    deliver an empty transaction_list (a coinbase-only block from
-        //    bitcoin's perspective is still a valid Block — txdata = [coinbase]).
+        // 3. Build fake_tx fixtures used both as the JDC's PMTS body
+        //    (declare-time) and as the stub TP's RequestTransactionData
+        //    response (push_solution-time). They MUST be the same body
+        //    so the cached txid_list lines up with the bytes the
+        //    engine will receive when reconstructing the block.
+        use stratum_apps::stratum_core::{
+            binary_sv2::B016M, job_declaration_sv2::ProvideMissingTransactionsSuccess,
+        };
+        let cb = build_coinbase(vec![0; 16]);
+        let (prefix, suffix) = split_coinbase(&cb, 16);
+        let fake_tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from_bytes(vec![1, 2, 3, 4]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::ZERO,
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let wtxid_bytes: [u8; 32] = *fake_tx.compute_wtxid().as_byte_array();
+        let serialized_tx = bitcoin::consensus::serialize(&fake_tx);
+        let tx_bytes_for_pmts: B016M<'static> = serialized_tx.clone().try_into().expect("fits");
+        let pmts = ProvideMissingTransactionsSuccess {
+            request_id: 7,
+            transaction_list: Seq064K::new(vec![tx_bytes_for_pmts]).expect("fits"),
+        };
+
+        // 3b. Spawn a stub TP demux: when RequestTransactionData
+        //     arrives, deliver the SAME fake_tx body so block
+        //     reconstruction sees txdata = [coinbase, fake_tx].
         let demux_tdp = tdp.clone();
+        let stub_tx_body = serialized_tx.clone();
         tokio::spawn(async move {
             while let Ok(req) = req_rx.recv().await {
                 if let TemplateDistribution::RequestTransactionData(r) = req {
+                    let body: B016M<'static> = stub_tx_body.clone().try_into().expect("fits");
                     let success = RequestTransactionDataSuccess {
                         template_id: r.template_id,
                         excess_data: Vec::<u8>::new().try_into().expect("empty fits"),
-                        transaction_list: Seq064K::new(Vec::new()).expect("empty fits"),
+                        transaction_list: Seq064K::new(vec![body]).expect("fits"),
                     };
                     demux_tdp.deliver_response(r.template_id, TxDataResult::Success(success));
                 }
             }
         });
 
-        // 4. Declare a mining job. This caches a DeclaredJob with the
-        //    pre-seeded tip + template_id.
-        let cb = build_coinbase(vec![0; 16]);
-        let (prefix, suffix) = split_coinbase(&cb, 16);
-        let wtxid = [42u8; 32];
+        // 4. Declare a mining job (PMTS attached, single-pass success).
         let declare = build_declare_mining_job(
             7,
             99,
             0x20000000,
             prefix.clone(),
             suffix.clone(),
-            vec![wtxid],
+            vec![wtxid_bytes],
         );
-        let result = engine.handle_declare_mining_job(declare, None).await;
+        let result = engine.handle_declare_mining_job(declare, Some(pmts)).await;
         assert!(matches!(result, DeclareMiningJobResult::Success));
 
         // Sanity: cached job has the captured template_id + tip.
@@ -1180,8 +1312,9 @@ mod tests {
             "expected exactly one block submitted to bitcoind"
         );
         let block = &submitted[0];
-        // Coinbase-only block (we returned an empty transaction_list).
-        assert_eq!(block.txdata.len(), 1);
+        // Block carries [coinbase, fake_tx] — the stub TP returned the
+        // fake_tx body in response to RequestTransactionData.
+        assert_eq!(block.txdata.len(), 2);
         // Header carries the PushSolution's nonce, ntime, version.
         assert_eq!(block.header.nonce, 0xDEADBEEF);
         assert_eq!(block.header.time, tip_min_ntime);
