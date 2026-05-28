@@ -143,7 +143,7 @@ impl Pool {
         // share-chain integration. The store + writer-thread join must
         // outlive the engine, so we keep them on the stack here.
         let mut share_chain_handles: Option<share_chain::ShareChainHandles> = None;
-        let engine_concrete = if let Some(p2pool_config) = self.p2pool_config.as_ref() {
+        let mut engine_concrete = if let Some(p2pool_config) = self.p2pool_config.as_ref() {
             let handles = share_chain::bootstrap_share_chain(p2pool_config)
                 .await
                 .map_err(|e| PoolErrorKind::Configuration(format!("share-chain bootstrap: {e}")))?;
@@ -159,6 +159,21 @@ impl Pool {
                 .build_engine()
                 .with_tdp(tdp.clone())
         };
+
+        // Spawn the share-chain reorg watcher when a chain handle is
+        // available. Polls `chain.get_chain_tip()` at
+        // `DEFAULT_POLL_PERIOD` and invalidates the engine's
+        // declared_jobs cache on every detected tip swap. ADR 0001
+        // applies — uncle admissions are not tip changes; only an
+        // actual tip swap reaches the invalidator.
+        if let Some(handles) = share_chain_handles.as_ref() {
+            let chain = handles.engine_handles.chain.clone();
+            engine_concrete.start_reorg_watcher(
+                move || chain.get_chain_tip().ok(),
+                sv2_p2pool_engine::DEFAULT_POLL_PERIOD,
+            );
+            info!("share-chain reorg watcher started");
+        }
         let engine: Arc<dyn JobValidationEngine> = Arc::new(engine_concrete);
 
         // 3b. Spawn the TDP demux tasks. These bridge the CM↔TP channel
