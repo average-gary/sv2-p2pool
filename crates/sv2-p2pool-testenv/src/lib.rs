@@ -46,6 +46,28 @@ pub use sv2_p2pool_d::{
 pub struct TestEnv {
     /// The bitcoind regtest node. Drop = process kill + tempdir cleanup.
     pub bitcoind: BitcoinD,
+    /// Optional Bitcoin Core IPC socket path. Set when the builder was
+    /// configured via [`TestEnvBuilder::with_ipcbind`]; the spawner has
+    /// already passed `-ipcbind=unix:<this>` to bitcoind so sv2-apps's
+    /// `BitcoinCoreIpc` template provider can connect.
+    ///
+    /// `None` means bitcoind was not configured for IPC and any pool
+    /// configured for `BitcoinCoreIpc` will fail at connect time.
+    pub ipc_socket_path: Option<std::path::PathBuf>,
+    /// Persistent staticdir backing `bitcoind.workdir()`. Tempfile drop
+    /// is suppressed via `into_path()`; we manually clean up on Drop
+    /// of [`TestEnv`].
+    _staticdir: Option<std::path::PathBuf>,
+}
+
+impl Drop for TestEnv {
+    fn drop(&mut self) {
+        // The bitcoind child is killed by corepc_node::Node's Drop. We
+        // only need to clean up the staticdir we allocated ourselves.
+        if let Some(dir) = self._staticdir.take() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 }
 
 /// Builder for [`TestEnv`].
@@ -53,6 +75,13 @@ pub struct TestEnvBuilder {
     /// Override for the bitcoind binary path. Falls back to `BITCOIND_EXE`
     /// env var or auto-download.
     bitcoind_exe: Option<String>,
+    /// When true, configure bitcoind to expose a Bitcoin Core IPC
+    /// socket via `-ipcbind=unix:<workdir>/regtest/node.sock`. This
+    /// matches the path sv2-apps's
+    /// `stratum_apps::tp_type::resolve_ipc_socket_path` will look up
+    /// when configured for `BitcoinCoreIpc { network = "regtest",
+    /// data_dir = <workdir> }`.
+    enable_ipcbind: bool,
 }
 
 impl Default for TestEnvBuilder {
@@ -63,13 +92,28 @@ impl Default for TestEnvBuilder {
 
 impl TestEnvBuilder {
     pub fn new() -> Self {
-        Self { bitcoind_exe: None }
+        Self {
+            bitcoind_exe: None,
+            enable_ipcbind: false,
+        }
     }
 
     /// Override the bitcoind binary path. If unset, `corepc-node` uses
     /// `BITCOIND_EXE` env var; if that's unset, it auto-downloads.
     pub fn with_bitcoind_exe(mut self, path: impl Into<String>) -> Self {
         self.bitcoind_exe = Some(path.into());
+        self
+    }
+
+    /// Configure bitcoind to expose `-ipcbind=unix:<workdir>/regtest/node.sock`
+    /// so sv2-apps's `BitcoinCoreIpc` template provider can connect.
+    ///
+    /// Requires bitcoind built with multiprocess support (Bitcoin Core
+    /// 28.0+ with `--enable-multiprocess`). The builder allocates a
+    /// staticdir tempdir for the bitcoind workdir so the socket path
+    /// is known before the process spawns.
+    pub fn with_ipcbind(mut self) -> Self {
+        self.enable_ipcbind = true;
         self
     }
 
@@ -83,10 +127,47 @@ impl TestEnvBuilder {
             }
         };
         info!(exe = %exe, "starting bitcoind regtest");
-        let bitcoind =
-            BitcoinD::new(&exe).map_err(|e| TestEnvError::BitcoindStart(e.to_string()))?;
+
+        let mut conf = corepc_node::Conf::default();
+        // Hold staticdir + computed paths so they outlive Conf.
+        let mut owned_staticdir: Option<std::path::PathBuf> = None;
+        let mut ipc_socket_path: Option<std::path::PathBuf> = None;
+        // `Conf::args` borrows; the formatted ipcbind string must live
+        // at least as long as `conf` does. A bare String at this scope
+        // satisfies the borrow checker.
+        let ipcbind_arg: String = if self.enable_ipcbind {
+            // Allocate a stable workdir; corepc-node won't manage its
+            // tempdir for us in this case. We register the path on the
+            // returned TestEnv so it's cleaned up on Drop.
+            let dir = tempfile::tempdir()
+                .map_err(|e| TestEnvError::BitcoindStart(format!("staticdir: {e}")))?
+                .keep();
+            // Bitcoin Core needs the regtest subdir to exist for the
+            // socket path. Create it ahead of bind.
+            let regtest_subdir = dir.join("regtest");
+            std::fs::create_dir_all(&regtest_subdir)
+                .map_err(|e| TestEnvError::BitcoindStart(format!("regtest subdir: {e}")))?;
+            let socket = regtest_subdir.join("node.sock");
+            let arg = format!("-ipcbind=unix:{}", socket.display());
+            conf.staticdir = Some(dir.clone());
+            ipc_socket_path = Some(socket);
+            owned_staticdir = Some(dir);
+            arg
+        } else {
+            String::new()
+        };
+        if self.enable_ipcbind {
+            conf.args.push(&ipcbind_arg);
+        }
+
+        let bitcoind = BitcoinD::with_conf(&exe, &conf)
+            .map_err(|e| TestEnvError::BitcoindStart(e.to_string()))?;
         debug!(rpc_url = %bitcoind.rpc_url(), "bitcoind regtest ready");
-        Ok(TestEnv { bitcoind })
+        Ok(TestEnv {
+            bitcoind,
+            ipc_socket_path,
+            _staticdir: owned_staticdir,
+        })
     }
 }
 
