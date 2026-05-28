@@ -335,6 +335,86 @@ port = 0
     }
 
     #[tokio::test]
+    async fn notify_share_chain_reorg_selective_invalidation() {
+        use bitcoin::hashes::Hash as _;
+        use jd_server_sv2::job_declarator::job_validation::JobValidationEngine;
+        use sv2_p2pool_engine::{DeclaredJob, P2poolV2Engine, TipMetadata};
+
+        let (config, _dir) = make_test_config();
+        let handles = bootstrap_share_chain(&config)
+            .await
+            .expect("bootstrap succeeds");
+        let chain = handles.engine_handles.chain.clone();
+        let genesis_tip = chain.get_chain_tip().expect("tip readable");
+
+        let engine =
+            P2poolV2Engine::with_handles(bitcoin::Network::Signet, handles.engine_handles.clone());
+
+        // Job A: captured tip == current tip → kept on reorg notification.
+        engine.declared_jobs().insert(
+            1,
+            DeclaredJob {
+                version: 1,
+                coinbase_tx_prefix: vec![],
+                coinbase_tx_suffix: vec![],
+                wtxid_list: vec![],
+                txid_list: None,
+                tip: TipMetadata::default(),
+                template_id: None,
+                share_chain_tip: Some(genesis_tip),
+                validated: true,
+            },
+        );
+        // Job B: captured tip is unknown to the chain → dropped.
+        engine.declared_jobs().insert(
+            2,
+            DeclaredJob {
+                version: 1,
+                coinbase_tx_prefix: vec![],
+                coinbase_tx_suffix: vec![],
+                wtxid_list: vec![],
+                txid_list: None,
+                tip: TipMetadata::default(),
+                template_id: None,
+                share_chain_tip: Some(bitcoin::BlockHash::from_byte_array([99u8; 32])),
+                validated: true,
+            },
+        );
+        // Job C: no captured tip → dropped (conservative).
+        engine.declared_jobs().insert(
+            3,
+            DeclaredJob {
+                version: 1,
+                coinbase_tx_prefix: vec![],
+                coinbase_tx_suffix: vec![],
+                wtxid_list: vec![],
+                txid_list: None,
+                tip: TipMetadata::default(),
+                template_id: None,
+                share_chain_tip: None,
+                validated: true,
+            },
+        );
+        assert_eq!(engine.declared_jobs().len(), 3);
+
+        engine.notify_share_chain_reorg(genesis_tip).await;
+
+        assert_eq!(
+            engine.declared_jobs().len(),
+            1,
+            "only the job whose captured tip matches the new tip survives"
+        );
+        assert!(engine.declared_jobs().get(&1).is_some());
+        assert!(engine.declared_jobs().get(&2).is_none());
+        assert!(engine.declared_jobs().get(&3).is_none());
+
+        drop(engine);
+        drop(handles.store);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handles.store_writer_join)
+            .await;
+    }
+
+    #[tokio::test]
     async fn engine_reorg_watcher_polls_chain_handle() {
         use std::time::Duration;
 

@@ -623,18 +623,87 @@ impl JobValidationEngine for P2poolV2Engine {
         }
     }
 
-    /// Hook fired by the share-chain when a tip swap happens. Drops every
-    /// cached declared-job. See ADR 0001 (uncle admissions are not tip
-    /// changes; only an actual tip swap reaches this method).
+    /// Hook fired by the share-chain when a tip swap happens.
+    ///
+    /// **With chain handle wired** (Phase 2-A): selective invalidation.
+    /// Walks back from `new_tip` through `prev_share_blockhash`
+    /// pointers up to [`REORG_ANCESTRY_DEPTH`] hops. Cached
+    /// `DeclaredJob`s whose captured `share_chain_tip` is found on
+    /// that ancestry path are kept; the rest are dropped. Jobs with
+    /// `share_chain_tip == None` (declared before chain wiring or
+    /// while the chain was unreadable) are conservatively dropped.
+    ///
+    /// **Without chain handle**: falls back to flushing the whole
+    /// cache (the original Phase 1 rule).
+    ///
+    /// See ADR 0001 (α=1, uncles aren't stale): uncle admissions
+    /// don't reach this method; only an actual tip swap does.
     async fn notify_share_chain_reorg(&self, new_tip: BlockHash) {
-        let dropped = self.declared_jobs().invalidate_all();
+        let Some(handles) = self.handles() else {
+            let dropped = self.declared_jobs().invalidate_all();
+            info!(
+                new_tip = %new_tip,
+                dropped,
+                "notify_share_chain_reorg: no chain handle — flushed declared-jobs cache"
+            );
+            return;
+        };
+
+        // Walk new_tip's ancestry up to REORG_ANCESTRY_DEPTH hops and
+        // collect block hashes seen along the way. A cached job's
+        // captured tip is "still on chain" iff it appears in this
+        // set OR equals new_tip itself.
+        let mut ancestors: std::collections::HashSet<BlockHash> = std::collections::HashSet::new();
+        ancestors.insert(new_tip);
+        let mut cursor = new_tip;
+        for _ in 0..REORG_ANCESTRY_DEPTH {
+            match handles.chain.get_share_header(&cursor) {
+                Ok(header) => {
+                    let prev = header.prev_share_blockhash;
+                    if prev == bitcoin::BlockHash::all_zeros() {
+                        break; // reached genesis
+                    }
+                    ancestors.insert(prev);
+                    cursor = prev;
+                }
+                Err(e) => {
+                    warn!(
+                        cursor = %cursor,
+                        error = %e,
+                        "notify_share_chain_reorg: ancestor walk truncated; falling back to invalidate_all"
+                    );
+                    let dropped = self.declared_jobs().invalidate_all();
+                    info!(
+                        new_tip = %new_tip,
+                        dropped,
+                        "notify_share_chain_reorg: flushed declared-jobs cache (ancestor walk failed)"
+                    );
+                    return;
+                }
+            }
+        }
+
+        let dropped = self
+            .declared_jobs()
+            .retain(|job| match job.share_chain_tip {
+                Some(tip) => ancestors.contains(&tip),
+                None => false, // conservatively drop jobs without captured tip
+            });
         info!(
             new_tip = %new_tip,
             dropped,
-            "notify_share_chain_reorg: invalidated declared-jobs cache"
+            ancestors_walked = ancestors.len(),
+            "notify_share_chain_reorg: selective invalidation complete"
         );
     }
 }
+
+/// Maximum number of `prev_share_blockhash` hops to walk back from a
+/// new tip when deciding which cached `DeclaredJob`s survive a reorg.
+/// 100 hops is enough for any reasonable share-chain reorg depth in
+/// practice; jobs that captured a tip beyond that horizon get dropped
+/// (the operator was likely offline, the cache is stale anyway).
+const REORG_ANCESTRY_DEPTH: usize = 100;
 
 /// Decode the JDP `mining_job_token` from message bytes into a `u64`.
 ///
