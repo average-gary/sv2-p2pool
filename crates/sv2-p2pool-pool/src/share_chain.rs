@@ -245,8 +245,8 @@ port = 0
             DeclareMiningJobResult, JobValidationEngine,
         };
         use stratum_apps::stratum_core::{
-            binary_sv2::{B064K, B0255, Seq064K, U256},
-            job_declaration_sv2::DeclareMiningJob,
+            binary_sv2::{B016M, B064K, B0255, Seq064K, U256},
+            job_declaration_sv2::{DeclareMiningJob, ProvideMissingTransactionsSuccess},
         };
         use sv2_p2pool_engine::P2poolV2Engine;
 
@@ -297,11 +297,30 @@ port = 0
         let prefix_bytes = serialized[..split_at].to_vec();
         let suffix_bytes = serialized[split_at + extranonce_bytes..].to_vec();
 
+        // Build a real fake_tx so the wtxid_list + PMTS body line up.
+        use bitcoin::hashes::Hash as _;
+        let fake_tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from_bytes(vec![1, 2, 3, 4]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::ZERO,
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let wtxid_arr: [u8; 32] = *fake_tx.compute_wtxid().as_byte_array();
+        let serialized_tx = bitcoin::consensus::serialize(&fake_tx);
+
         let token: u64 = 99;
         let token_b0255: B0255<'static> = token.to_le_bytes().to_vec().try_into().unwrap();
         let prefix_b: B064K<'static> = prefix_bytes.try_into().unwrap();
         let suffix_b: B064K<'static> = suffix_bytes.try_into().unwrap();
-        let wtxid: U256<'static> = [42u8; 32].to_vec().try_into().unwrap();
+        let wtxid: U256<'static> = wtxid_arr.to_vec().try_into().unwrap();
         let wtxid_seq: Seq064K<'static, U256<'static>> = vec![wtxid].into();
         let excess: B064K<'static> = Vec::new().try_into().unwrap();
 
@@ -314,7 +333,12 @@ port = 0
             wtxid_list: wtxid_seq,
             excess_data: excess,
         };
-        let result = engine.handle_declare_mining_job(msg, None).await;
+        let tx_bytes: B016M<'static> = serialized_tx.try_into().expect("fits");
+        let pmts = ProvideMissingTransactionsSuccess {
+            request_id: 1,
+            transaction_list: Seq064K::new(vec![tx_bytes]).expect("fits"),
+        };
+        let result = engine.handle_declare_mining_job(msg, Some(pmts)).await;
         assert!(
             matches!(result, DeclareMiningJobResult::Success),
             "declare must succeed against initialised signet chain"
