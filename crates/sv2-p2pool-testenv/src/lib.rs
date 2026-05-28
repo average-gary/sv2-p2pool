@@ -28,8 +28,10 @@ pub use corepc_node::Node as BitcoinD;
 use thiserror::Error;
 use tracing::{debug, info};
 
+pub mod jdcd;
 pub mod p2poolv2d;
 pub mod sv2_p2pool_d;
+pub use jdcd::{DEFAULT_JD_CLIENT_READY_TIMEOUT, JdClientD, JdClientDBuilder, JdClientDError};
 pub use p2poolv2d::{
     DEFAULT_READY_TIMEOUT as P2POOLV2_READY_TIMEOUT, P2poolV2D, P2poolV2DBuilder, P2poolV2DError,
 };
