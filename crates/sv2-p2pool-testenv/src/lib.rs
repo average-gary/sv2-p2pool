@@ -76,12 +76,17 @@ pub struct TestEnvBuilder {
     /// env var or auto-download.
     bitcoind_exe: Option<String>,
     /// When true, configure bitcoind to expose a Bitcoin Core IPC
-    /// socket via `-ipcbind=unix:<workdir>/regtest/node.sock`. This
+    /// socket via `-ipcbind=unix:<workdir>/<subdir>/node.sock`. This
     /// matches the path sv2-apps's
     /// `stratum_apps::tp_type::resolve_ipc_socket_path` will look up
-    /// when configured for `BitcoinCoreIpc { network = "regtest",
-    /// data_dir = <workdir> }`.
+    /// when configured for `BitcoinCoreIpc { network, data_dir =
+    /// <workdir> }`.
     enable_ipcbind: bool,
+    /// Bitcoin network for bitcoind. Defaults to `Regtest` for the
+    /// existing `mine_blocks` / `invalidate_block` API. Switch to
+    /// `Testnet4` for E2E tests that need p2poolv2's testnet4 genesis
+    /// — but `mine_blocks` won't work there (real PoW).
+    network: bitcoin::Network,
 }
 
 impl Default for TestEnvBuilder {
@@ -95,6 +100,7 @@ impl TestEnvBuilder {
         Self {
             bitcoind_exe: None,
             enable_ipcbind: false,
+            network: bitcoin::Network::Regtest,
         }
     }
 
@@ -105,7 +111,7 @@ impl TestEnvBuilder {
         self
     }
 
-    /// Configure bitcoind to expose `-ipcbind=unix:<workdir>/regtest/node.sock`
+    /// Configure bitcoind to expose `-ipcbind=unix:<workdir>/<subdir>/node.sock`
     /// so sv2-apps's `BitcoinCoreIpc` template provider can connect.
     ///
     /// Requires bitcoind built with multiprocess support (Bitcoin Core
@@ -117,8 +123,18 @@ impl TestEnvBuilder {
         self
     }
 
-    /// Build and start the harness. Bitcoind regtest is up by the time
-    /// this returns; cold-start is typically 500ms-1.5s.
+    /// Override the bitcoind network (default `Regtest`).
+    ///
+    /// `Testnet4` matches p2poolv2's supported genesis target — pick
+    /// it for E2E tests that boot the share-chain stack. Note: the
+    /// `mine_blocks` and `invalidate_block` APIs only work on Regtest.
+    pub fn with_network(mut self, network: bitcoin::Network) -> Self {
+        self.network = network;
+        self
+    }
+
+    /// Build and start the harness. Bitcoind is up by the time this
+    /// returns; cold-start is typically 500ms-1.5s.
     pub fn build(self) -> Result<TestEnv, TestEnvError> {
         let exe = match self.bitcoind_exe {
             Some(path) => path,
@@ -126,9 +142,20 @@ impl TestEnvBuilder {
                 corepc_node::exe_path().map_err(|e| TestEnvError::BitcoindStart(e.to_string()))?
             }
         };
-        info!(exe = %exe, "starting bitcoind regtest");
+        let network_subdir = bitcoind_network_subdir(self.network);
+        let network_arg = bitcoind_network_arg(self.network);
+        info!(exe = %exe, network = %self.network, "starting bitcoind");
 
+        // Build a Conf from scratch (don't use Default — it hardcodes
+        // `-regtest` + `-fallbackfee`, which conflict with Testnet4).
         let mut conf = corepc_node::Conf::default();
+        conf.args.clear();
+        conf.args.push(network_arg);
+        conf.args.push("-fallbackfee=0.0001");
+        // `Conf::network` controls cookie-file location lookup; it
+        // must match the network arg.
+        conf.network = network_subdir;
+
         // Hold staticdir + computed paths so they outlive Conf.
         let mut owned_staticdir: Option<std::path::PathBuf> = None;
         let mut ipc_socket_path: Option<std::path::PathBuf> = None;
@@ -136,18 +163,15 @@ impl TestEnvBuilder {
         // at least as long as `conf` does. A bare String at this scope
         // satisfies the borrow checker.
         let ipcbind_arg: String = if self.enable_ipcbind {
-            // Allocate a stable workdir; corepc-node won't manage its
-            // tempdir for us in this case. We register the path on the
-            // returned TestEnv so it's cleaned up on Drop.
             let dir = tempfile::tempdir()
                 .map_err(|e| TestEnvError::BitcoindStart(format!("staticdir: {e}")))?
                 .keep();
-            // Bitcoin Core needs the regtest subdir to exist for the
+            // Bitcoin Core needs the network subdir to exist for the
             // socket path. Create it ahead of bind.
-            let regtest_subdir = dir.join("regtest");
-            std::fs::create_dir_all(&regtest_subdir)
-                .map_err(|e| TestEnvError::BitcoindStart(format!("regtest subdir: {e}")))?;
-            let socket = regtest_subdir.join("node.sock");
+            let netsubdir = dir.join(network_subdir);
+            std::fs::create_dir_all(&netsubdir)
+                .map_err(|e| TestEnvError::BitcoindStart(format!("network subdir: {e}")))?;
+            let socket = netsubdir.join("node.sock");
             let arg = format!("-ipcbind=unix:{}", socket.display());
             conf.staticdir = Some(dir.clone());
             ipc_socket_path = Some(socket);
@@ -162,12 +186,36 @@ impl TestEnvBuilder {
 
         let bitcoind = BitcoinD::with_conf(&exe, &conf)
             .map_err(|e| TestEnvError::BitcoindStart(e.to_string()))?;
-        debug!(rpc_url = %bitcoind.rpc_url(), "bitcoind regtest ready");
+        debug!(rpc_url = %bitcoind.rpc_url(), "bitcoind ready");
         Ok(TestEnv {
             bitcoind,
             ipc_socket_path,
             _staticdir: owned_staticdir,
         })
+    }
+}
+
+/// Map a `bitcoin::Network` to bitcoind's CLI flag (`-regtest`,
+/// `-testnet4`, etc.).
+fn bitcoind_network_arg(network: bitcoin::Network) -> &'static str {
+    match network {
+        bitcoin::Network::Bitcoin => "-chain=main",
+        bitcoin::Network::Testnet => "-testnet",
+        bitcoin::Network::Testnet4 => "-testnet4",
+        bitcoin::Network::Signet => "-signet",
+        bitcoin::Network::Regtest => "-regtest",
+    }
+}
+
+/// Map a `bitcoin::Network` to its bitcoind data-dir subdirectory
+/// name (where the cookie file + `node.sock` live).
+fn bitcoind_network_subdir(network: bitcoin::Network) -> &'static str {
+    match network {
+        bitcoin::Network::Bitcoin => "",
+        bitcoin::Network::Testnet => "testnet3",
+        bitcoin::Network::Testnet4 => "testnet4",
+        bitcoin::Network::Signet => "signet",
+        bitcoin::Network::Regtest => "regtest",
     }
 }
 
@@ -192,7 +240,9 @@ impl TestEnv {
     /// Mine `n` blocks to a freshly-generated regtest address.
     ///
     /// Returns the block hashes mined (parsed from corepc's `Vec<String>`
-    /// hex output into typed `BlockHash`).
+    /// hex output into typed `BlockHash`). Only valid on `Regtest`;
+    /// `Testnet4` rejects `generatetoaddress` because real PoW is
+    /// required.
     pub fn mine_blocks(&self, n: usize) -> Result<Vec<BlockHash>, TestEnvError> {
         let addr = self
             .bitcoind
