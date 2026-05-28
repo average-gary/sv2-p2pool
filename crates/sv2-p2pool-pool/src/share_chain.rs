@@ -240,6 +240,43 @@ port = 0
     }
 
     #[tokio::test]
+    async fn engine_reorg_watcher_polls_chain_handle() {
+        use std::time::Duration;
+
+        use sv2_p2pool_engine::P2poolV2Engine;
+
+        let (config, _dir) = make_test_config();
+        let handles = bootstrap_share_chain(&config)
+            .await
+            .expect("bootstrap succeeds");
+
+        let chain = handles.engine_handles.chain.clone();
+        let mut engine =
+            P2poolV2Engine::with_handles(bitcoin::Network::Signet, handles.engine_handles.clone());
+
+        // The watcher polls `chain.get_chain_tip()` on the configured
+        // schedule. With a live chain initialised at genesis,
+        // get_chain_tip should always succeed and return the same
+        // value — exercising the closure shape we use in Pool::start
+        // without needing to drive a synthetic tip swap.
+        let _observer = engine.start_reorg_watcher(
+            move || chain.get_chain_tip().ok(),
+            Duration::from_millis(20),
+        );
+
+        // Let the watcher tick a few times under real time. The
+        // cache must remain empty (the tip never changes) and the
+        // watcher must not panic in the closure.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(engine.declared_jobs().is_empty());
+
+        engine.stop_reorg_watcher();
+        drop(engine);
+        drop(handles.store);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handles.store_writer_join).await;
+    }
+
+    #[tokio::test]
     async fn bootstrap_share_chain_builds_engine_handles() {
         let (config, _dir) = make_test_config();
         let handles = bootstrap_share_chain(&config)
