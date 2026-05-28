@@ -196,6 +196,22 @@ impl JobValidationEngine for P2poolV2Engine {
             None => (TipMetadata::default(), None),
         };
 
+        // Capture the share-chain tip when handles are wired so
+        // future selective-invalidation logic has the data. Reading
+        // the tip is best-effort: a transient store error must not
+        // block job acceptance.
+        let share_chain_tip = self.handles().and_then(|h| match h.chain.get_chain_tip() {
+            Ok(tip) => Some(tip),
+            Err(e) => {
+                warn!(
+                    request_id,
+                    error = %e,
+                    "share-chain tip read failed at declare time; continuing without capture"
+                );
+                None
+            }
+        });
+
         let snapshot = DeclaredJob {
             version: declare_mining_job.version,
             coinbase_tx_prefix,
@@ -204,6 +220,7 @@ impl JobValidationEngine for P2poolV2Engine {
             txid_list: Some(missing_txs.iter().map(|tx| tx.compute_txid()).collect()),
             tip,
             template_id,
+            share_chain_tip,
             validated: true,
         };
         self.declared_jobs().insert(request_id, snapshot);
@@ -947,6 +964,13 @@ mod tests {
         assert_eq!(cached.tip.nbits, tip_nbits);
         assert_eq!(cached.tip.min_ntime, tip_min_ntime);
         assert_eq!(cached.tip.prev_hash.as_byte_array(), &tip_prev_hash_bytes);
+        // share_chain_tip is best-effort: the test fixture's
+        // ChainStoreHandle is uninitialised (no genesis), so reading
+        // the tip errors out and the engine logs a warn + stores
+        // None. The capture path is exercised in pool's
+        // share_chain::tests::engine_reorg_watcher_polls_chain_handle
+        // where genesis is initialised.
+        let _ = cached.share_chain_tip;
 
         // 5. Build a PushSolution whose (prev_hash, nbits, version) match
         //    the cached job, with the same extranonce size as declared.
@@ -1027,6 +1051,7 @@ mod tests {
                 txid_list: None,
                 tip: TipMetadata::default(),
                 template_id: None,
+                share_chain_tip: None,
                 validated: true,
             },
         );
@@ -1040,6 +1065,7 @@ mod tests {
                 txid_list: None,
                 tip: TipMetadata::default(),
                 template_id: None,
+                share_chain_tip: None,
                 validated: true,
             },
         );

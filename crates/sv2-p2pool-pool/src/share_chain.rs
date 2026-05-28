@@ -240,6 +240,101 @@ port = 0
     }
 
     #[tokio::test]
+    async fn declare_mining_job_captures_share_chain_tip() {
+        use jd_server_sv2::job_declarator::job_validation::{
+            DeclareMiningJobResult, JobValidationEngine,
+        };
+        use stratum_apps::stratum_core::{
+            binary_sv2::{B064K, B0255, Seq064K, U256},
+            job_declaration_sv2::DeclareMiningJob,
+        };
+        use sv2_p2pool_engine::P2poolV2Engine;
+
+        let (config, _dir) = make_test_config();
+        let handles = bootstrap_share_chain(&config)
+            .await
+            .expect("bootstrap succeeds");
+        let chain_for_assert = handles.engine_handles.chain.clone();
+        let engine =
+            P2poolV2Engine::with_handles(bitcoin::Network::Signet, handles.engine_handles.clone());
+
+        // Build a structurally-valid DeclareMiningJob using fixtures
+        // mirroring engine_impl::tests::build_coinbase / split_coinbase.
+        // We re-create a minimal coinbase here rather than depending
+        // on the engine's pub(crate) test helpers.
+        let cb = {
+            use bitcoin::{
+                Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness, absolute::LockTime,
+                transaction,
+            };
+            let mut witness = Witness::new();
+            witness.push([0u8; 32]);
+            bitcoin::Transaction {
+                version: transaction::Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::from_bytes(vec![0u8; 16]),
+                    sequence: Sequence::MAX,
+                    witness,
+                }],
+                output: vec![TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: ScriptBuf::new(),
+                }],
+            }
+        };
+        let serialized = bitcoin::consensus::serialize(&cb);
+        // Layout matches the engine's test helpers: prefix ends right
+        // before the 16-byte extranonce reservation; suffix starts
+        // immediately after.
+        let extranonce_bytes = 16;
+        let script_sig_len = cb.input[0].script_sig.len();
+        let mut pos = 43; // COINBASE_PREFIX_LEN
+        pos += bitcoin::VarInt(script_sig_len as u64).size();
+        let bytes_in_prefix = script_sig_len.saturating_sub(extranonce_bytes);
+        let split_at = pos + bytes_in_prefix;
+        let prefix_bytes = serialized[..split_at].to_vec();
+        let suffix_bytes = serialized[split_at + extranonce_bytes..].to_vec();
+
+        let token: u64 = 99;
+        let token_b0255: B0255<'static> = token.to_le_bytes().to_vec().try_into().unwrap();
+        let prefix_b: B064K<'static> = prefix_bytes.try_into().unwrap();
+        let suffix_b: B064K<'static> = suffix_bytes.try_into().unwrap();
+        let wtxid: U256<'static> = [42u8; 32].to_vec().try_into().unwrap();
+        let wtxid_seq: Seq064K<'static, U256<'static>> = vec![wtxid].into();
+        let excess: B064K<'static> = Vec::new().try_into().unwrap();
+
+        let msg = DeclareMiningJob {
+            request_id: 1,
+            mining_job_token: token_b0255,
+            version: 0x20000000,
+            coinbase_tx_prefix: prefix_b,
+            coinbase_tx_suffix: suffix_b,
+            wtxid_list: wtxid_seq,
+            excess_data: excess,
+        };
+        let result = engine.handle_declare_mining_job(msg, None).await;
+        assert!(
+            matches!(result, DeclareMiningJobResult::Success),
+            "declare must succeed against initialised signet chain"
+        );
+
+        let cached = engine.declared_jobs().get(&1).expect("declared job cached");
+        let expected_tip = chain_for_assert.get_chain_tip().expect("tip readable");
+        assert_eq!(
+            cached.share_chain_tip,
+            Some(expected_tip),
+            "DeclareMiningJob captured the live share-chain tip"
+        );
+
+        drop(engine);
+        drop(handles.store);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handles.store_writer_join)
+            .await;
+    }
+
+    #[tokio::test]
     async fn engine_reorg_watcher_polls_chain_handle() {
         use std::time::Duration;
 

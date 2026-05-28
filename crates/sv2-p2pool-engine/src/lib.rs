@@ -86,6 +86,15 @@ pub struct DeclaredJob {
     /// `handle_push_solution` reconstructs the full block. `None` when
     /// handles aren't wired (structural-only mode).
     pub template_id: Option<u64>,
+    /// Share-chain tip blockhash at declare time. Populated from
+    /// `EngineHandles::chain.get_chain_tip()` when handles are wired;
+    /// `None` in structural-only mode.
+    ///
+    /// Stored so a future selective invalidation rule can drop just the
+    /// jobs whose ancestor is no longer on the share chain after a tip
+    /// swap. Until that lands, `notify_share_chain_reorg` still flushes
+    /// the whole cache (see ADR 0001 + `DeclaredJobCache::invalidate_all`).
+    pub share_chain_tip: Option<BlockHash>,
     /// Whether the job has been fully validated.
     /// Set to `true` once `handle_declare_mining_job` returns `Success`.
     pub validated: bool,
@@ -552,6 +561,7 @@ mod tests {
             txid_list: None,
             tip: TipMetadata::default(),
             template_id: None,
+            share_chain_tip: None,
             validated: false,
         }
     }
