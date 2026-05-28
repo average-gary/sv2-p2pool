@@ -58,6 +58,15 @@ jobs:
           cd ../..
           echo "P2POOLV2_EXE=$PWD/vendor/p2poolv2/target/debug/p2poolv2" >> "$GITHUB_ENV"
 
+      # Build jd_client_sv2 from the sv2-apps miner-apps subworkspace
+      # so the JdClientD spawner can find it via JD_CLIENT_EXE.
+      - name: Build jd_client_sv2 from submodule
+        run: |
+          cargo build --manifest-path vendor/sv2-apps/miner-apps/Cargo.toml \
+              --bin jd_client_sv2 --package jd_client_sv2
+          echo "JD_CLIENT_EXE=$PWD/vendor/sv2-apps/miner-apps/target/debug/jd_client_sv2" \
+              >> "$GITHUB_ENV"
+
       # Phase 2.6's smoke test also needs BITCOIND_EXE; corepc-node will
       # auto-download a binary the first time it's invoked. We pre-warm
       # the cache here so the timing budget on the smoke tests stays
