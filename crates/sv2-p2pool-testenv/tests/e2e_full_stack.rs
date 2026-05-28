@@ -31,24 +31,25 @@ use sv2_p2pool_testenv::{
 /// the listen port"; if any fails, the test errors out and Drop tears
 /// down the previously-started processes.
 ///
-/// Bitcoind is launched with `-ipcbind=unix:<workdir>/regtest/node.sock`
-/// (via [`TestEnvBuilder::with_ipcbind`]) so the pool's
-/// `BitcoinCoreIpc` template provider can connect. Both sv2-p2pool and
-/// jd_client_sv2 are configured with `network = "regtest"` to match.
+/// Bitcoind is launched in **testnet4** mode (with multiprocess
+/// support) so:
+/// - p2poolv2's testnet4 genesis applies (the only natively-supported
+///   network from `Bitcoin / Testnet4 / Signet`).
+/// - sv2-apps's `resolve_ipc_socket_path` for `network = "testnet4"`
+///   matches the `-ipcbind=unix:<workdir>/testnet4/node.sock` we pass
+///   to bitcoind.
 ///
-/// Note: the SV2 share-chain layer in our `Sv2P2poolD` runs at p2poolv2's
-/// supported `network = "regtest"` for the share-chain config too — but
-/// p2poolv2's genesis builder rejects regtest. So this test stops at the
-/// "sv2-p2pool boots" step today; full E2E driving needs either upstream
-/// regtest support in p2poolv2 or a switch to a network whose IPC socket
-/// can also be served by bitcoind regtest (unlikely).
+/// Tradeoff vs regtest: no `mine_blocks` / `invalidate_block`. We can
+/// still verify boot + handshake; mining-driven E2E (share submission)
+/// requires either a real testnet4 sync or a shim block source.
 #[test]
 #[ignore = "requires BITCOIND_EXE + P2POOLV2_EXE + SV2_P2POOL_EXE + JD_CLIENT_EXE + bitcoind built with multiprocess support"]
-fn full_stack_boots_against_regtest_bitcoind() {
+fn full_stack_boots_against_testnet4_bitcoind() {
     let env = TestEnvBuilder::new()
+        .with_network(bitcoin::Network::Testnet4)
         .with_ipcbind()
         .build()
-        .expect("bitcoind starts with ipcbind");
+        .expect("bitcoind testnet4 starts with ipcbind");
     let socket = env
         .ipc_socket_path
         .as_ref()
@@ -62,7 +63,7 @@ fn full_stack_boots_against_regtest_bitcoind() {
     );
 
     let sv2 = Sv2P2poolDBuilder::new(&env.bitcoind)
-        .with_network(bitcoin::Network::Regtest)
+        .with_network(bitcoin::Network::Testnet4)
         .with_bitcoin_data_dir(env.bitcoind.workdir())
         .with_ready_timeout(Duration::from_secs(15))
         .build()
@@ -73,7 +74,7 @@ fn full_stack_boots_against_regtest_bitcoind() {
     );
 
     let jdc = JdClientDBuilder::new(&env.bitcoind, &sv2)
-        .with_network(bitcoin::Network::Regtest)
+        .with_network(bitcoin::Network::Testnet4)
         .with_bitcoin_data_dir(env.bitcoind.workdir())
         .with_ready_timeout(Duration::from_secs(15))
         .build()
