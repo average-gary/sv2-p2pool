@@ -480,19 +480,25 @@ impl Pool {
         notified.await;
     }
 
-    /// Network derived from the configured TP type.
-    fn config_network(&self) -> bitcoin::Network {
+    /// Network derived from the configured TP type. When a p2poolv2
+    /// share-chain config is attached, prefer its
+    /// `stratum.network` since the share-chain side is the source of
+    /// truth for which network the pool is participating in.
+    pub(crate) fn config_network(&self) -> bitcoin::Network {
+        if let Some(p2pool) = self.p2pool_config.as_ref() {
+            return p2pool.stratum.network;
+        }
         match self.config.template_provider_type() {
             TemplateProviderType::BitcoinCoreIpc { network, .. } => match network {
                 stratum_apps::tp_type::BitcoinNetwork::Mainnet => bitcoin::Network::Bitcoin,
-                stratum_apps::tp_type::BitcoinNetwork::Testnet4 => bitcoin::Network::Testnet,
+                stratum_apps::tp_type::BitcoinNetwork::Testnet4 => bitcoin::Network::Testnet4,
                 stratum_apps::tp_type::BitcoinNetwork::Signet => bitcoin::Network::Signet,
                 stratum_apps::tp_type::BitcoinNetwork::Regtest => bitcoin::Network::Regtest,
             },
-            // Upstream SV2 TP: we don't know the network at this layer.
-            // Default to regtest since that's what Phase 1 targets;
-            // production will have BitcoinCoreIpc.
-            TemplateProviderType::Sv2Tp { .. } => bitcoin::Network::Regtest,
+            // Upstream SV2 TP without a p2pool config attached: we
+            // don't know the network at this layer. Default to
+            // testnet4 (the supported deployment target).
+            TemplateProviderType::Sv2Tp { .. } => bitcoin::Network::Testnet4,
         }
     }
 }
@@ -501,5 +507,63 @@ impl Drop for Pool {
     fn drop(&mut self) {
         debug!("Pool dropped");
         self.cancellation_token.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal PoolConfig configured for BitcoinCoreIpc on a
+    /// given network. Shares structure with the test helper in
+    /// builder::tests but that one is in a sibling test module so
+    /// we duplicate here rather than re-export through pub(crate).
+    fn pool_config_with_network(network: &str) -> PoolConfig {
+        let toml = format!(
+            r#"
+authority_public_key = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
+authority_secret_key = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n"
+cert_validity_sec = 3600
+listen_address = "127.0.0.1:0"
+coinbase_reward_script = "addr(tb1qa0sm0hxzj0x25rh8gw5xlzwlsfvvyz8u96w3p8)"
+server_id = 1
+pool_signature = "test"
+shares_per_minute = 6.0
+share_batch_size = 10
+supported_extensions = []
+required_extensions = []
+monitoring_address = "127.0.0.1:0"
+monitoring_cache_refresh_secs = 15
+
+[template_provider_type.BitcoinCoreIpc]
+network = "{network}"
+fee_threshold = 100
+min_interval = 5
+
+[jds]
+listen_address = "127.0.0.1:0"
+"#
+        );
+        toml::from_str(&toml).expect("PoolConfig deserialize")
+    }
+
+    #[test]
+    fn config_network_testnet4_does_not_collapse_to_legacy_testnet() {
+        // Regression: an earlier mapping returned Network::Testnet
+        // (legacy testnet3) when the operator configured testnet4.
+        let pool = Pool::new(pool_config_with_network("testnet4"));
+        assert_eq!(pool.config_network(), bitcoin::Network::Testnet4);
+    }
+
+    #[test]
+    fn config_network_signet_round_trips() {
+        let pool = Pool::new(pool_config_with_network("signet"));
+        assert_eq!(pool.config_network(), bitcoin::Network::Signet);
+    }
+
+    #[test]
+    fn config_network_regtest_round_trips() {
+        let pool = Pool::new(pool_config_with_network("regtest"));
+        assert_eq!(pool.config_network(), bitcoin::Network::Regtest);
     }
 }
