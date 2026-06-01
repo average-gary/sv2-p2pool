@@ -26,7 +26,11 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let builder = PoolBuilder::new(bitcoin::Network::Regtest);
-    let pool = builder.build_pool_with_p2pool_config(configs.pool, configs.p2pool);
+    let mut pool = builder.build_pool_with_p2pool_config(configs.pool, configs.p2pool);
+    if let Some(addr) = configs.metrics_addr {
+        pool = pool.with_metrics_addr(addr);
+        tracing::info!(metrics_addr = %addr, "metrics endpoint enabled");
+    }
 
     pool.start()
         .await

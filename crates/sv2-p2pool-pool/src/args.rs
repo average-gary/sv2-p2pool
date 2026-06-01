@@ -7,6 +7,7 @@
 //! stratum network/multiplier) — kept separate from `PoolConfig` so
 //! the upstream type stays unmodified.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -41,6 +42,14 @@ pub struct Args {
         help = "Path to the log file. If not set, logs go to stdout only."
     )]
     pub log_file: Option<PathBuf>,
+    /// Optional listen address for the built-in `/metrics` endpoint.
+    /// When set, the pool serves Prometheus metrics on this addr;
+    /// when unset, no metrics endpoint is started.
+    #[arg(
+        long = "metrics-addr",
+        help = "Listen address for /metrics (e.g. 127.0.0.1:9000). Omit to disable."
+    )]
+    pub metrics_addr: Option<SocketAddr>,
 }
 
 /// Loaded configs for the sv2-p2pool binary.
@@ -48,6 +57,7 @@ pub struct Args {
 pub struct LoadedConfigs {
     pub pool: PoolConfig,
     pub p2pool: P2poolConfig,
+    pub metrics_addr: Option<SocketAddr>,
 }
 
 /// Parse CLI arguments and load both TOML configs.
@@ -69,5 +79,9 @@ pub fn process_cli_args() -> anyhow::Result<LoadedConfigs> {
     let p2pool = P2poolConfig::load(p2pool_path)
         .map_err(|e| anyhow::anyhow!("failed to load p2poolv2 config from {p2pool_path}: {e}"))?;
 
-    Ok(LoadedConfigs { pool, p2pool })
+    Ok(LoadedConfigs {
+        pool,
+        p2pool,
+        metrics_addr: args.metrics_addr,
+    })
 }

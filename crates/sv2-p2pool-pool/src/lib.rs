@@ -13,6 +13,7 @@
 
 pub mod args;
 pub mod builder;
+pub mod metrics_endpoint;
 pub mod pool;
 pub mod share_chain;
 pub mod tdp_demux;
