@@ -28,7 +28,13 @@ async fn main() -> anyhow::Result<()> {
         "loaded configs"
     );
 
-    let builder = PoolBuilder::new(bitcoin::Network::Regtest);
+    // PoolBuilder::new takes the network for its build_engine* methods.
+    // build_pool_with_p2pool_config ignores it (Pool::start derives the
+    // network from the share-chain config inside config_network()), but
+    // we still pass the right value so any future PoolBuilder::build_engine
+    // call lands on the correct network.
+    let network = configs.p2pool.stratum.network;
+    let builder = PoolBuilder::new(network);
     let mut pool = builder.build_pool_with_p2pool_config(configs.pool, configs.p2pool);
     if let Some(addr) = configs.metrics_addr {
         pool = pool.with_metrics_addr(addr);
