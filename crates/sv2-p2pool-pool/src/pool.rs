@@ -174,6 +174,15 @@ impl Pool {
             );
             info!("share-chain reorg watcher started");
         }
+
+        // Spawn the RecentSolutions sweeper unconditionally — it
+        // bounds memory regardless of which other handles are wired,
+        // and dropping the engine aborts the task.
+        engine_concrete.start_recent_solutions_sweeper(
+            sv2_p2pool_engine::DEFAULT_RECENT_SOLUTIONS_SWEEP_INTERVAL,
+        );
+        info!("recent-solutions sweeper started");
+
         let engine: Arc<dyn JobValidationEngine> = Arc::new(engine_concrete);
 
         // 3b. Spawn the TDP demux tasks. These bridge the CM↔TP channel

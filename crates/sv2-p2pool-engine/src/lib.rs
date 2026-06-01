@@ -318,6 +318,12 @@ pub struct P2poolV2Engine {
     network: bitcoin::Network,
     /// Active watcher task; aborted on drop.
     reorg_watcher: Option<tokio::task::JoinHandle<()>>,
+    /// Periodic [`RecentSolutions::sweep`] task; aborted on drop.
+    /// Without this the buffer grows unbounded under sustained
+    /// PushSolution traffic — entries are only proactively evicted by
+    /// `take`, and shares for which a matching SubmitSharesExtended
+    /// never arrives would otherwise leak forever.
+    recent_solutions_sweeper: Option<tokio::task::JoinHandle<()>>,
     /// Backend handles (chain + validator + bitcoind). `None` for
     /// Phase-1-style structural-only mode; `Some` for Phase 2.5b+ when
     /// the binary plumbs in p2poolv2 Node + bitcoind RPC.
@@ -334,6 +340,12 @@ pub struct P2poolV2Engine {
 /// reasonable share-submission latency after a `PushSolution` arrives.
 pub const DEFAULT_RECENT_SOLUTIONS_TTL: Duration = Duration::from_secs(30);
 
+/// Default sweep interval for the [`RecentSolutions`] periodic
+/// housekeeping task. Half the TTL ensures every entry is observed at
+/// least once before its TTL elapses, bounding the worst-case memory
+/// envelope to ~1.5× the share-submission rate × TTL.
+pub const DEFAULT_RECENT_SOLUTIONS_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
+
 impl P2poolV2Engine {
     /// Construct an engine for the given network. The binary is responsible
     /// for wiring in the bitcoind backend and tip source via
@@ -348,6 +360,7 @@ impl P2poolV2Engine {
             recent_solutions: Arc::new(RecentSolutions::new(DEFAULT_RECENT_SOLUTIONS_TTL)),
             network,
             reorg_watcher: None,
+            recent_solutions_sweeper: None,
             handles: None,
             tdp: None,
         }
@@ -509,11 +522,44 @@ impl P2poolV2Engine {
             handle.abort();
         }
     }
+
+    /// Spawn the periodic [`RecentSolutions::sweep`] task at the given
+    /// `interval`. Use [`DEFAULT_RECENT_SOLUTIONS_SWEEP_INTERVAL`] in
+    /// production. Calling more than once aborts the previous sweeper
+    /// first.
+    ///
+    /// `RecentSolutions` evicts entries opportunistically inside
+    /// [`RecentSolutions::take`]; this background task bounds memory
+    /// for shares whose matching `SubmitSharesExtended` never arrives.
+    pub fn start_recent_solutions_sweeper(&mut self, interval: Duration) {
+        if let Some(prev) = self.recent_solutions_sweeper.take() {
+            prev.abort();
+        }
+        let buf = Arc::clone(&self.recent_solutions);
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // Skip the immediate fire — the buffer just initialised.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                buf.sweep();
+            }
+        });
+        self.recent_solutions_sweeper = Some(handle);
+    }
+
+    /// Stop the sweeper, if running.
+    pub fn stop_recent_solutions_sweeper(&mut self) {
+        if let Some(handle) = self.recent_solutions_sweeper.take() {
+            handle.abort();
+        }
+    }
 }
 
 impl Drop for P2poolV2Engine {
     fn drop(&mut self) {
         self.stop_reorg_watcher();
+        self.stop_recent_solutions_sweeper();
     }
 }
 
@@ -663,6 +709,35 @@ mod tests {
         map_a.insert(42, script.clone());
         assert_eq!(map_b.len(), 1);
         assert_eq!(map_b.get(&42).map(|r| r.value().clone()), Some(script));
+    }
+
+    #[tokio::test]
+    async fn engine_recent_solutions_sweeper_evicts_expired_entries() {
+        use bitcoin::hashes::Hash as _;
+        // RecentSolutions::sweep tests wall-clock `Instant::elapsed()`,
+        // so we use real time here rather than tokio's start_paused
+        // virtual clock (which only fast-forwards Sleep, not Instant).
+        let mut engine = P2poolV2Engine::new(bitcoin::Network::Regtest);
+        let buf = Arc::new(RecentSolutions::new(Duration::from_millis(50)));
+        engine.recent_solutions = buf.clone();
+
+        let share = BlockHash::from_byte_array([1u8; 32]);
+        let block = BlockHash::from_byte_array([2u8; 32]);
+        buf.record(share, block);
+        assert_eq!(buf.len(), 1);
+
+        engine.start_recent_solutions_sweeper(Duration::from_millis(20));
+        // Wait past the TTL plus a couple of sweep intervals so the
+        // sweeper definitely ticks after the entry expired.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        assert_eq!(
+            buf.len(),
+            0,
+            "sweeper should have evicted the expired entry"
+        );
+
+        engine.stop_recent_solutions_sweeper();
     }
 
     #[tokio::test(start_paused = true)]
