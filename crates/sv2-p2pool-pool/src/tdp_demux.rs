@@ -326,4 +326,42 @@ mod tests {
         }
         assert!(got_cm && got_eng, "both streams must reach TP");
     }
+
+    #[tokio::test]
+    async fn tee_handle_aborts_cleanly() {
+        // Verifies the JoinHandle returned by spawn_tp_to_cm_tee can
+        // be aborted: the task stops promptly and awaiting the handle
+        // returns. Pool::start relies on this for graceful shutdown.
+        let (_tp_in_tx, tp_in_rx) = unbounded::<TemplateDistribution<'static>>();
+        let (cm_out_tx, _cm_out_rx) = unbounded::<TemplateDistribution<'static>>();
+        let (req_tx, _req_rx) = unbounded();
+        let tdp = TdpHandle::new(req_tx);
+        let h = spawn_tp_to_cm_tee(tp_in_rx, cm_out_tx, tdp);
+
+        h.abort();
+        let result = tokio::time::timeout(Duration::from_secs(1), h).await;
+        assert!(result.is_ok(), "aborted handle joined within timeout");
+        let inner = result.unwrap();
+        assert!(
+            inner.is_err() && inner.unwrap_err().is_cancelled(),
+            "join error reflects abort"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_handle_aborts_cleanly() {
+        let (_cm_in_tx, cm_in_rx) = unbounded::<TemplateDistribution<'static>>();
+        let (_eng_in_tx, eng_in_rx) = unbounded::<TemplateDistribution<'static>>();
+        let (tp_out_tx, _tp_out_rx) = unbounded::<TemplateDistribution<'static>>();
+        let h = spawn_cm_and_engine_to_tp_merge(cm_in_rx, eng_in_rx, tp_out_tx);
+
+        h.abort();
+        let result = tokio::time::timeout(Duration::from_secs(1), h).await;
+        assert!(result.is_ok(), "aborted handle joined within timeout");
+        let inner = result.unwrap();
+        assert!(
+            inner.is_err() && inner.unwrap_err().is_cancelled(),
+            "join error reflects abort"
+        );
+    }
 }
