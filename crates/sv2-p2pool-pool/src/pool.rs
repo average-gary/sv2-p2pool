@@ -186,13 +186,16 @@ impl Pool {
         let engine: Arc<dyn JobValidationEngine> = Arc::new(engine_concrete);
 
         // 3b. Spawn the TDP demux tasks. These bridge the CM↔TP channel
-        //    pair to the engine's TdpHandle.
-        let _tee_handle = tdp_demux::spawn_tp_to_cm_tee(
+        //    pair to the engine's TdpHandle. JoinHandles are kept so
+        //    we can abort them in the graceful-shutdown phase below;
+        //    without that, a runtime-reuse path (hot reload, embedding
+        //    Pool in a longer-lived process) would leak the tasks.
+        let tee_handle = tdp_demux::spawn_tp_to_cm_tee(
             tp_to_demux_receiver,
             tp_to_cm_sender.clone(),
             tdp.clone(),
         );
-        let _merge_handle = tdp_demux::spawn_cm_and_engine_to_tp_merge(
+        let merge_handle = tdp_demux::spawn_cm_and_engine_to_tp_merge(
             cm_to_tp_receiver.clone(),
             engine_to_tp_receiver,
             merged_to_tp_sender,
@@ -354,6 +357,17 @@ impl Pool {
                 Err(e) => error!(?e, "BitcoinCoreSv2TDP thread error"),
             }
         }
+
+        // Abort the TDP demux tasks. They aren't tracked by
+        // task_manager (sv2-apps's TaskManager, not ours) so they
+        // need explicit cleanup. Aborting is safe — the tasks have
+        // no shared state that requires graceful drain; in-flight
+        // forwards are lost on shutdown either way.
+        tee_handle.abort();
+        merge_handle.abort();
+        let _ = tee_handle.await;
+        let _ = merge_handle.await;
+        info!("TDP demux tasks aborted");
 
         warn!("graceful shutdown: waiting {GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS}s for tasks");
         match tokio::time::timeout(
