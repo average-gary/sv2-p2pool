@@ -635,6 +635,91 @@ mod tests {
         }
     }
 
+    fn job_with_tip(version: u32, prev_hash: BlockHash, nbits: u32) -> DeclaredJob {
+        DeclaredJob {
+            version,
+            coinbase_tx_prefix: vec![],
+            coinbase_tx_suffix: vec![],
+            wtxid_list: vec![],
+            txid_list: None,
+            tip: TipMetadata {
+                prev_hash,
+                nbits,
+                min_ntime: 0,
+            },
+            template_id: None,
+            share_chain_tip: None,
+            validated: false,
+        }
+    }
+
+    #[test]
+    fn find_by_solution_empty_cache_returns_none() {
+        let cache = DeclaredJobCache::new();
+        assert_eq!(cache.find_by_solution(BlockHash::all_zeros(), 0, 0), None);
+    }
+
+    #[test]
+    fn find_by_solution_returns_request_id_on_match() {
+        let cache = DeclaredJobCache::new();
+        let prev_a = hash_from_u64(1);
+        let prev_b = hash_from_u64(2);
+        cache.insert(10, job_with_tip(1, prev_a, 0x100));
+        cache.insert(20, job_with_tip(2, prev_b, 0x200));
+
+        assert_eq!(cache.find_by_solution(prev_a, 0x100, 1), Some(10));
+        assert_eq!(cache.find_by_solution(prev_b, 0x200, 2), Some(20));
+    }
+
+    #[test]
+    fn find_by_solution_returns_none_when_no_field_matches() {
+        let cache = DeclaredJobCache::new();
+        let prev_a = hash_from_u64(1);
+        cache.insert(10, job_with_tip(1, prev_a, 0x100));
+
+        // version mismatch
+        assert_eq!(cache.find_by_solution(prev_a, 0x100, 999), None);
+        // nbits mismatch
+        assert_eq!(cache.find_by_solution(prev_a, 0x999, 1), None);
+        // prev_hash mismatch
+        assert_eq!(cache.find_by_solution(hash_from_u64(99), 0x100, 1), None);
+    }
+
+    #[test]
+    fn retain_keeps_matching_drops_others() {
+        let cache = DeclaredJobCache::new();
+        cache.insert(1, dummy_job(1));
+        cache.insert(2, dummy_job(2));
+        cache.insert(3, dummy_job(3));
+        // Drop everything with even version.
+        let dropped = cache.retain(|job| job.version % 2 == 1);
+        assert_eq!(dropped, 1);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&1).is_some());
+        assert!(cache.get(&2).is_none());
+        assert!(cache.get(&3).is_some());
+    }
+
+    #[test]
+    fn retain_drop_all_returns_full_count() {
+        let cache = DeclaredJobCache::new();
+        cache.insert(1, dummy_job(1));
+        cache.insert(2, dummy_job(2));
+        let dropped = cache.retain(|_| false);
+        assert_eq!(dropped, 2);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn retain_keep_all_returns_zero() {
+        let cache = DeclaredJobCache::new();
+        cache.insert(1, dummy_job(1));
+        cache.insert(2, dummy_job(2));
+        let dropped = cache.retain(|_| true);
+        assert_eq!(dropped, 0);
+        assert_eq!(cache.len(), 2);
+    }
+
     #[test]
     fn declared_job_cache_invalidate_all_drops_everything() {
         let cache = DeclaredJobCache::new();
