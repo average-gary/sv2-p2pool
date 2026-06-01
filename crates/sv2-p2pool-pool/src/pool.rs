@@ -48,7 +48,7 @@ use sv2_p2pool_engine::{EngineMetrics, TdpHandle};
 use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 
-use crate::{PoolBuilder, share_chain, tdp_demux};
+use crate::{PoolBuilder, metrics_endpoint, share_chain, tdp_demux};
 
 /// Top-level pool runtime.
 ///
@@ -67,6 +67,12 @@ pub struct Pool {
     /// HTTP `/metrics` endpoint can read it without taking the lock
     /// path through `Pool`.
     metrics_registry: Registry,
+    /// Optional listen address for the built-in `/metrics` HTTP
+    /// endpoint. When set, [`Pool::start`] spawns
+    /// [`metrics_endpoint::spawn_metrics_endpoint`] against the
+    /// pool's `metrics_registry`. Use `127.0.0.1:0` in tests for an
+    /// OS-assigned port.
+    metrics_addr: Option<std::net::SocketAddr>,
     cancellation_token: CancellationToken,
     shutdown_notify: Arc<Notify>,
     is_alive: Arc<AtomicBool>,
@@ -78,10 +84,17 @@ impl Pool {
             config,
             p2pool_config: None,
             metrics_registry: Registry::new(),
+            metrics_addr: None,
             cancellation_token: CancellationToken::new(),
             shutdown_notify: Arc::new(Notify::new()),
             is_alive: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// Enable the built-in `/metrics` endpoint at `addr`.
+    pub fn with_metrics_addr(mut self, addr: std::net::SocketAddr) -> Self {
+        self.metrics_addr = Some(addr);
+        self
     }
 
     /// Attach a p2poolv2 share-chain config, enabling real
@@ -185,6 +198,24 @@ impl Pool {
             }
             Err(e) => {
                 warn!(error = %e, "engine metrics registration failed — continuing without metrics");
+            }
+        }
+
+        // Spawn the /metrics HTTP endpoint when configured. Failure to
+        // bind logs + continues; the engine still ticks counters on
+        // the registry, just without a scrape target.
+        let mut metrics_endpoint_handle: Option<tokio::task::JoinHandle<()>> = None;
+        if let Some(addr) = self.metrics_addr {
+            match metrics_endpoint::spawn_metrics_endpoint(addr, self.metrics_registry.clone())
+                .await
+            {
+                Ok((bound, handle)) => {
+                    info!(addr = %bound, "metrics endpoint started");
+                    metrics_endpoint_handle = Some(handle);
+                }
+                Err(e) => {
+                    warn!(error = %e, "metrics endpoint failed to bind — continuing without HTTP scrape");
+                }
             }
         }
 
@@ -396,6 +427,13 @@ impl Pool {
         let _ = tee_handle.await;
         let _ = merge_handle.await;
         info!("TDP demux tasks aborted");
+
+        // Abort the /metrics endpoint if it was started.
+        if let Some(handle) = metrics_endpoint_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+            info!("metrics endpoint aborted");
+        }
 
         warn!("graceful shutdown: waiting {GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS}s for tasks");
         match tokio::time::timeout(
