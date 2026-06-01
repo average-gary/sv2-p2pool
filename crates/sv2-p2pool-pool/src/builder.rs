@@ -104,4 +104,48 @@ mod tests {
         let engine = PoolBuilder::new(bitcoin::Network::Regtest).build_engine_arc();
         engine.shutdown(); // no-op; just verifies dispatch works
     }
+
+    #[test]
+    fn pool_exposes_metrics_registry() {
+        // The registry is constructed empty; engine counters are
+        // registered inside Pool::start. The accessor is available
+        // pre-start so a binary can mount it on an HTTP endpoint
+        // before the engine is wired.
+        let pool = PoolBuilder::new(bitcoin::Network::Regtest).build_pool(make_test_pool_config());
+        let registry = pool.metrics_registry();
+        // No counters yet (Pool::start hasn't run).
+        assert_eq!(registry.gather().len(), 0);
+    }
+
+    /// Hand-rolled minimal `PoolConfig` for tests that need a `Pool`
+    /// without touching disk. Mirrors the upstream test fixtures' shape.
+    fn make_test_pool_config() -> pool_sv2::config::PoolConfig {
+        // Use upstream's serde-roundtrip — every public ctor needs more
+        // fields than we want to inline. Build the simplest TOML that
+        // PoolConfig::deserialize accepts.
+        let toml = r#"
+authority_public_key = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
+authority_secret_key = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n"
+cert_validity_sec = 3600
+listen_address = "127.0.0.1:0"
+coinbase_reward_script = "addr(tb1qa0sm0hxzj0x25rh8gw5xlzwlsfvvyz8u96w3p8)"
+server_id = 1
+pool_signature = "test"
+shares_per_minute = 6.0
+share_batch_size = 10
+supported_extensions = []
+required_extensions = []
+monitoring_address = "127.0.0.1:0"
+monitoring_cache_refresh_secs = 15
+
+[template_provider_type.BitcoinCoreIpc]
+network = "testnet4"
+fee_threshold = 100
+min_interval = 5
+
+[jds]
+listen_address = "127.0.0.1:0"
+"#;
+        toml::from_str(toml).expect("PoolConfig deserialize")
+    }
 }

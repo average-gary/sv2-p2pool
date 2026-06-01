@@ -5171,6 +5171,7 @@ dependencies = [
  "jd_server_sv2",
  "p2poolv2_lib",
  "pool_sv2",
+ "prometheus",
  "serde",
  "stratum-apps",
  "sv2-p2pool-engine",
