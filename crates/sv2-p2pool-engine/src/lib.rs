@@ -32,6 +32,7 @@ use tracing::{debug, info, warn};
 pub mod block;
 pub mod coinbase;
 mod engine_impl;
+pub mod metrics;
 pub mod recent_solutions;
 pub mod reorg_detector;
 pub mod tdp;
@@ -41,6 +42,7 @@ pub use coinbase::{
     CoinbaseReconstructError, merkle_path, reconstruct_coinbase,
     reconstruct_coinbase_with_extranonce,
 };
+pub use metrics::EngineMetrics;
 pub use recent_solutions::RecentSolutions;
 pub use reorg_detector::{DEFAULT_POLL_PERIOD, ReorgDetector};
 pub use tdp::{TdpError, TdpHandle, TxDataResult};
@@ -333,6 +335,10 @@ pub struct P2poolV2Engine {
     /// metadata + fetches tx bodies via TDP. When `None`, falls back to
     /// `TipMetadata::default()` + skips block submission.
     tdp: Option<tdp::TdpHandle>,
+    /// Prometheus counter set. `None` skips all metrics increments;
+    /// `Some` is wired by [`P2poolV2Engine::with_metrics`] from a
+    /// registry the binary owns.
+    metrics: Option<EngineMetrics>,
 }
 
 /// Default TTL for the `RecentSolutions` buffer — long enough to cover
@@ -362,6 +368,7 @@ impl P2poolV2Engine {
             recent_solutions_sweeper: None,
             handles: None,
             tdp: None,
+            metrics: None,
         }
     }
 
@@ -382,6 +389,21 @@ impl P2poolV2Engine {
     pub fn with_tdp(mut self, tdp: tdp::TdpHandle) -> Self {
         self.tdp = Some(tdp);
         self
+    }
+
+    /// Attach a Prometheus counter set. The binary registers the set
+    /// on its monitoring registry and threads it here. Without this,
+    /// every `metrics()`-gated increment is a no-op.
+    pub fn with_metrics(mut self, metrics: EngineMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Borrow the metrics counters if wired. Trait-impl event paths
+    /// use this to increment counters without needing to thread the
+    /// set through every helper.
+    pub fn metrics(&self) -> Option<&EngineMetrics> {
+        self.metrics.as_ref()
     }
 
     /// Whether the engine has real backend handles wired in.

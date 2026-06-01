@@ -5133,6 +5133,7 @@ dependencies = [
  "dashmap",
  "jd_server_sv2",
  "p2poolv2_lib",
+ "prometheus",
  "proptest",
  "stratum-apps",
  "thiserror 2.0.18",

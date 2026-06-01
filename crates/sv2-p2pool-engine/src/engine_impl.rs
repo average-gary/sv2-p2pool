@@ -71,13 +71,33 @@ impl JobValidationEngine for P2poolV2Engine {
         declare_mining_job: DeclareMiningJob<'_>,
         provide_missing_transactions_success: Option<ProvideMissingTransactionsSuccess<'_>>,
     ) -> DeclareMiningJobResult {
+        // Helper: tally the terminal result on the metrics counters,
+        // then return it. Keeps every error / success / missing-txns
+        // path consistent without threading a side channel.
+        let bump_and_return = |result: DeclareMiningJobResult| -> DeclareMiningJobResult {
+            if let Some(m) = self.metrics() {
+                match &result {
+                    DeclareMiningJobResult::Success => {
+                        m.declare_mining_job_accepted.inc();
+                    }
+                    DeclareMiningJobResult::Error(_) => {
+                        m.declare_mining_job_rejected.inc();
+                    }
+                    DeclareMiningJobResult::MissingTransactions(_) => {
+                        m.declare_mining_job_missing_txns.inc();
+                    }
+                }
+            }
+            result
+        };
+
         // 1. Decode token from message bytes (mirror bitcoin_core_ipc.rs:431-442).
         let allocated_token: JdToken = match decode_token(&declare_mining_job) {
             Ok(t) => t,
             Err(()) => {
-                return DeclareMiningJobResult::Error(
+                return bump_and_return(DeclareMiningJobResult::Error(
                     ERROR_CODE_DECLARE_MINING_JOB_INVALID_MINING_JOB_TOKEN,
-                );
+                ));
             }
         };
 
@@ -99,9 +119,9 @@ impl JobValidationEngine for P2poolV2Engine {
                         error = %e,
                         "coinbase reconstruction failed"
                     );
-                    return DeclareMiningJobResult::Error(
+                    return bump_and_return(DeclareMiningJobResult::Error(
                         ERROR_CODE_DECLARE_MINING_JOB_INVALID_COINBASE_TX,
-                    );
+                    ));
                 }
             };
 
@@ -112,9 +132,9 @@ impl JobValidationEngine for P2poolV2Engine {
                 input_count = declared_coinbase_tx.input.len(),
                 "coinbase has wrong input count"
             );
-            return DeclareMiningJobResult::Error(
+            return bump_and_return(DeclareMiningJobResult::Error(
                 ERROR_CODE_DECLARE_MINING_JOB_INVALID_COINBASE_TX_INPUT,
-            );
+            ));
         }
 
         // 4. Extract wtxid_list from message.
@@ -147,9 +167,9 @@ impl JobValidationEngine for P2poolV2Engine {
                 request_id,
                 "rejecting coinbase-only declaration per ADR 0004"
             );
-            return DeclareMiningJobResult::Error(
+            return bump_and_return(DeclareMiningJobResult::Error(
                 ERROR_CODE_DECLARE_MINING_JOB_INVALID_COINBASE_TX,
-            );
+            ));
         }
 
         // 6. First-pass declare with non-empty wtxid_list and no PMTS:
@@ -169,7 +189,7 @@ impl JobValidationEngine for P2poolV2Engine {
                 count = wtxid_list.len(),
                 "DeclareMiningJob: requesting missing transactions"
             );
-            return DeclareMiningJobResult::MissingTransactions(wtxid_list);
+            return bump_and_return(DeclareMiningJobResult::MissingTransactions(wtxid_list));
         }
 
         // 7. Parse missing transactions from the PMTS retry.
@@ -249,7 +269,7 @@ impl JobValidationEngine for P2poolV2Engine {
         self.allocated_tokens().insert(allocated_token, request_id);
 
         info!(request_id, allocated_token, "DeclareMiningJob accepted");
-        DeclareMiningJobResult::Success
+        bump_and_return(DeclareMiningJobResult::Success)
     }
 
     /// Validates a `SetCustomMiningJob` against the previously-declared
@@ -277,6 +297,20 @@ impl JobValidationEngine for P2poolV2Engine {
         set_custom_mining_job: SetCustomMiningJob<'_>,
         allocated_token: JdToken,
     ) -> SetCustomMiningJobResult {
+        let bump_and_return = |result: SetCustomMiningJobResult| -> SetCustomMiningJobResult {
+            if let Some(m) = self.metrics() {
+                match &result {
+                    SetCustomMiningJobResult::Success => {
+                        m.set_custom_mining_job_accepted.inc();
+                    }
+                    SetCustomMiningJobResult::Error(_) => {
+                        m.set_custom_mining_job_rejected.inc();
+                    }
+                }
+            }
+            result
+        };
+
         // 1. Token → request_id lookup.
         let request_id = match self.allocated_tokens().get(&allocated_token) {
             Some(entry) => *entry.value(),
@@ -285,9 +319,9 @@ impl JobValidationEngine for P2poolV2Engine {
                     allocated_token,
                     "SetCustomMiningJob: token not associated with any declared job"
                 );
-                return SetCustomMiningJobResult::Error(
+                return bump_and_return(SetCustomMiningJobResult::Error(
                     ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_MINING_JOB_TOKEN,
-                );
+                ));
             }
         };
 
@@ -302,9 +336,9 @@ impl JobValidationEngine for P2poolV2Engine {
                     request_id,
                     allocated_token, "SetCustomMiningJob: declared job not found"
                 );
-                return SetCustomMiningJobResult::Error(
+                return bump_and_return(SetCustomMiningJobResult::Error(
                     ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_MINING_JOB_TOKEN,
-                );
+                ));
             }
         };
 
@@ -314,9 +348,9 @@ impl JobValidationEngine for P2poolV2Engine {
                 request_id,
                 "SetCustomMiningJob: declared job not yet validated"
             );
-            return SetCustomMiningJobResult::Error(
+            return bump_and_return(SetCustomMiningJobResult::Error(
                 ERROR_CODE_SET_CUSTOM_MINING_JOB_JOB_NOT_YET_VALIDATED,
-            );
+            ));
         }
 
         // 4. prev_hash + nbits cross-checks. Phase 2.4 captures the
@@ -342,9 +376,9 @@ impl JobValidationEngine for P2poolV2Engine {
                     declared_prev_hash = ?declared.tip.prev_hash,
                     "SetCustomMiningJob: prev_hash mismatch"
                 );
-                return SetCustomMiningJobResult::Error(
+                return bump_and_return(SetCustomMiningJobResult::Error(
                     ERROR_CODE_SET_CUSTOM_MINING_JOB_STALE_CHAIN_TIP,
-                );
+                ));
             }
 
             if set_custom_mining_job.nbits != declared.tip.nbits {
@@ -353,9 +387,9 @@ impl JobValidationEngine for P2poolV2Engine {
                     declared = declared.tip.nbits,
                     "SetCustomMiningJob: nbits mismatch"
                 );
-                return SetCustomMiningJobResult::Error(
+                return bump_and_return(SetCustomMiningJobResult::Error(
                     ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_NBITS,
-                );
+                ));
             }
         } else {
             debug!(
@@ -371,9 +405,9 @@ impl JobValidationEngine for P2poolV2Engine {
                 declared = declared.version,
                 "SetCustomMiningJob: version mismatch"
             );
-            return SetCustomMiningJobResult::Error(
+            return bump_and_return(SetCustomMiningJobResult::Error(
                 ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_VERSION,
-            );
+            ));
         }
 
         // 7. Coinbase tx cross-checks.
@@ -383,9 +417,9 @@ impl JobValidationEngine for P2poolV2Engine {
         ) {
             Ok(tx) => tx,
             Err(_) => {
-                return SetCustomMiningJobResult::Error(
+                return bump_and_return(SetCustomMiningJobResult::Error(
                     ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_COINBASE_TX,
-                );
+                ));
             }
         };
 
@@ -395,18 +429,18 @@ impl JobValidationEngine for P2poolV2Engine {
                 declared = declared_coinbase_tx.version.0,
                 "SetCustomMiningJob: coinbase version mismatch"
             );
-            return SetCustomMiningJobResult::Error(
+            return bump_and_return(SetCustomMiningJobResult::Error(
                 ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_COINBASE_TX_VERSION,
-            );
+            ));
         }
 
         let script_sig = declared_coinbase_tx.input[0].script_sig.as_bytes();
         let coinbase_prefix = set_custom_mining_job.coinbase_prefix.to_vec();
         if !script_sig.starts_with(&coinbase_prefix) {
             debug!("SetCustomMiningJob: coinbase prefix mismatch");
-            return SetCustomMiningJobResult::Error(
+            return bump_and_return(SetCustomMiningJobResult::Error(
                 ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_COINBASE_PREFIX,
-            );
+            ));
         }
 
         if declared_coinbase_tx.input[0].sequence.0
@@ -417,17 +451,17 @@ impl JobValidationEngine for P2poolV2Engine {
                 declared = declared_coinbase_tx.input[0].sequence.0,
                 "SetCustomMiningJob: coinbase input sequence mismatch"
             );
-            return SetCustomMiningJobResult::Error(
+            return bump_and_return(SetCustomMiningJobResult::Error(
                 ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_COINBASE_TX_INPUT_N_SEQUENCE,
-            );
+            ));
         }
 
         let declared_outputs_bytes = bitcoin::consensus::serialize(&declared_coinbase_tx.output);
         if declared_outputs_bytes != set_custom_mining_job.coinbase_tx_outputs.to_vec() {
             debug!("SetCustomMiningJob: coinbase outputs mismatch");
-            return SetCustomMiningJobResult::Error(
+            return bump_and_return(SetCustomMiningJobResult::Error(
                 ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_COINBASE_TX_OUTPUTS,
-            );
+            ));
         }
 
         if declared_coinbase_tx.lock_time.to_consensus_u32()
@@ -438,9 +472,9 @@ impl JobValidationEngine for P2poolV2Engine {
                 declared = declared_coinbase_tx.lock_time.to_consensus_u32(),
                 "SetCustomMiningJob: coinbase locktime mismatch"
             );
-            return SetCustomMiningJobResult::Error(
+            return bump_and_return(SetCustomMiningJobResult::Error(
                 ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_COINBASE_TX_LOCKTIME,
-            );
+            ));
         }
 
         // 8. Merkle path.
@@ -449,9 +483,9 @@ impl JobValidationEngine for P2poolV2Engine {
             None => {
                 // Job marked validated but no txid_list — should not
                 // happen in normal flow but guard against it.
-                return SetCustomMiningJobResult::Error(
+                return bump_and_return(SetCustomMiningJobResult::Error(
                     ERROR_CODE_SET_CUSTOM_MINING_JOB_JOB_NOT_YET_VALIDATED,
-                );
+                ));
             }
         };
         let coinbase_txid = declared_coinbase_tx.compute_txid();
@@ -473,13 +507,13 @@ impl JobValidationEngine for P2poolV2Engine {
                 ?declared_merkle_path,
                 "SetCustomMiningJob: merkle path mismatch"
             );
-            return SetCustomMiningJobResult::Error(
+            return bump_and_return(SetCustomMiningJobResult::Error(
                 ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_MERKLE_PATH,
-            );
+            ));
         }
 
         info!(request_id, allocated_token, "SetCustomMiningJob accepted");
-        SetCustomMiningJobResult::Success
+        bump_and_return(SetCustomMiningJobResult::Success)
     }
 
     /// Submit a found Bitcoin block solution to bitcoind and record the
@@ -505,6 +539,10 @@ impl JobValidationEngine for P2poolV2Engine {
     /// `bitcoin_core_ipc.rs:639-653`. We never block the JDP message
     /// handler on Bitcoin Core or the share-chain.
     async fn handle_push_solution(&self, push_solution: PushSolution<'_>) {
+        if let Some(m) = self.metrics() {
+            m.push_solution_received.inc();
+        }
+
         // Synthetic share-hash: SHA256d of the solution's identifying
         // fields. Used as the share-side key in RecentSolutions; the
         // share-submission path computes the same value when looking up
@@ -634,6 +672,9 @@ impl JobValidationEngine for P2poolV2Engine {
                     %block_hash,
                     "PushSolution: reconstructed block; submitting to bitcoind"
                 );
+                if let Some(m) = self.metrics() {
+                    m.blocks_submitted.inc();
+                }
                 let bitcoind = handles.bitcoind.clone();
                 tokio::spawn(async move {
                     match bitcoind.submit_block(&block).await {
@@ -669,8 +710,18 @@ impl JobValidationEngine for P2poolV2Engine {
     /// See ADR 0001 (α=1, uncles aren't stale): uncle admissions
     /// don't reach this method; only an actual tip swap does.
     async fn notify_share_chain_reorg(&self, new_tip: BlockHash) {
+        if let Some(m) = self.metrics() {
+            m.reorg_notifications.inc();
+        }
+        let bump_dropped = |n: usize| {
+            if let Some(m) = self.metrics() {
+                m.jobs_invalidated_total.inc_by(n as u64);
+            }
+        };
+
         let Some(handles) = self.handles() else {
             let dropped = self.declared_jobs().invalidate_all();
+            bump_dropped(dropped);
             info!(
                 new_tip = %new_tip,
                 dropped,
@@ -703,6 +754,7 @@ impl JobValidationEngine for P2poolV2Engine {
                         "notify_share_chain_reorg: ancestor walk truncated; falling back to invalidate_all"
                     );
                     let dropped = self.declared_jobs().invalidate_all();
+                    bump_dropped(dropped);
                     info!(
                         new_tip = %new_tip,
                         dropped,
@@ -719,6 +771,7 @@ impl JobValidationEngine for P2poolV2Engine {
                 Some(tip) => ancestors.contains(&tip),
                 None => false, // conservatively drop jobs without captured tip
             });
+        bump_dropped(dropped);
         info!(
             new_tip = %new_tip,
             dropped,
@@ -924,6 +977,66 @@ mod tests {
         // Cache + token map remain empty until the PMTS retry succeeds.
         assert!(engine.declared_jobs().is_empty());
         assert!(!engine.allocated_tokens().contains_key(&99));
+    }
+
+    #[tokio::test]
+    async fn metrics_counters_increment_through_handlers() {
+        use prometheus::Registry;
+
+        use crate::EngineMetrics;
+
+        let registry = Registry::new();
+        let metrics = EngineMetrics::register(&registry).expect("register");
+        let engine = P2poolV2Engine::default().with_metrics(metrics.clone());
+
+        // Bad token → declare_mining_job_rejected.
+        let bad_token: B0255<'static> = vec![1, 2, 3].try_into().expect("3 bytes fits");
+        let cb = build_coinbase(vec![0; 16]);
+        let (prefix, suffix) = split_coinbase(&cb, 16);
+        let bad_msg = DeclareMiningJob {
+            request_id: 1,
+            mining_job_token: bad_token,
+            version: 1,
+            coinbase_tx_prefix: prefix.clone().try_into().expect("fits"),
+            coinbase_tx_suffix: suffix.clone().try_into().expect("fits"),
+            wtxid_list: Vec::<U256<'static>>::new().into(),
+            excess_data: Vec::new().try_into().expect("empty fits"),
+        };
+        engine.handle_declare_mining_job(bad_msg, None).await;
+        assert_eq!(metrics.declare_mining_job_rejected.get(), 1);
+        assert_eq!(metrics.declare_mining_job_accepted.get(), 0);
+        assert_eq!(metrics.declare_mining_job_missing_txns.get(), 0);
+
+        // Non-empty wtxid_list, no PMTS → MissingTransactions counter.
+        let wtxid = [42u8; 32];
+        let missing_msg = build_declare_mining_job(2, 99, 1, prefix, suffix, vec![wtxid]);
+        engine.handle_declare_mining_job(missing_msg, None).await;
+        assert_eq!(metrics.declare_mining_job_missing_txns.get(), 1);
+        assert_eq!(metrics.declare_mining_job_rejected.get(), 1);
+
+        // PushSolution increments push_solution_received (TDP-less path).
+        let extranonce: Vec<u8> = vec![0; 16];
+        let push = PushSolution {
+            extranonce: extranonce.try_into().expect("fits"),
+            prev_hash: [1u8; 32].to_vec().try_into().expect("32 bytes"),
+            ntime: 0,
+            nonce: 0,
+            nbits: 0x207fffff,
+            version: 0x20000000,
+        };
+        engine.handle_push_solution(push).await;
+        assert_eq!(metrics.push_solution_received.get(), 1);
+        assert_eq!(
+            metrics.blocks_submitted.get(),
+            0,
+            "no handles wired → no submit_block"
+        );
+
+        // notify_share_chain_reorg → reorg_notifications.
+        engine
+            .notify_share_chain_reorg(BlockHash::from_byte_array([7u8; 32]))
+            .await;
+        assert_eq!(metrics.reorg_notifications.get(), 1);
     }
 
     #[tokio::test]

@@ -30,6 +30,10 @@ p2poolv2_lib = { path = "../../vendor/p2poolv2/p2poolv2_lib" }
 # BitcoindLike trait + concrete client (added by feat/bitcoind-trait, PR #18)
 bitcoindrpc  = { path = "../../vendor/p2poolv2/bitcoindrpc" }
 
+# Prometheus metrics surface — same version pin as sv2-apps's monitoring
+# module so collectors registered by us and CM share the registry types.
+prometheus = "0.13"
+
 [dev-dependencies]
 proptest = "1"
 tokio    = { workspace = true, features = ["full", "test-util"] }
