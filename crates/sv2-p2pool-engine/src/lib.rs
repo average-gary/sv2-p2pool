@@ -24,9 +24,7 @@ use std::time::Duration;
 use bitcoin::{BlockHash, ScriptBuf, Txid};
 use bitcoindrpc::BitcoindLike;
 use dashmap::DashMap;
-use p2poolv2_lib::shares::{
-    chain::chain_store_handle::ChainStoreHandle, validation::ShareValidator,
-};
+use p2poolv2_lib::shares::chain::chain_store_handle::ChainStoreHandle;
 use stratum_apps::utils::types::JdToken;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -266,19 +264,21 @@ pub type AllocatedTokenMap = Arc<DashMap<JdToken, RequestId>>;
 /// trait methods do structural validation only with stub-zero values for
 /// `prev_hash`/`nbits`.
 ///
-/// All three handles are cloneable / `Arc`-shareable, matching how
+/// Both handles are cloneable / `Arc`-shareable, matching how
 /// `p2poolv2_node` constructs them at startup
 /// (`vendor/p2poolv2/p2poolv2_node/src/main.rs`).
+///
+/// **Note**: an earlier revision carried an `Arc<dyn ShareValidator>`
+/// here. The trait validates `ShareHeader` / `ShareBlock` — types the
+/// JDP-side engine never sees, since it works with bitcoin coinbase /
+/// `PushSolution` / reconstructed `bitcoin::Block`. The validator
+/// belongs on the share-chain node side, not in our engine. Removed
+/// in PR #50.
 #[derive(Clone)]
 pub struct EngineHandles {
     /// Read access to the share chain. Used to look up the current
-    /// share-chain tip + validate share-block ancestry.
+    /// share-chain tip + validate share-block ancestry on reorg.
     pub chain: ChainStoreHandle,
-    /// Production share validator. Constructed via
-    /// `p2poolv2_lib::shares::validation::DefaultShareValidator::new(...)`
-    /// in the binary; passed here as `Arc<dyn ShareValidator>` so tests
-    /// can substitute a mock.
-    pub validator: Arc<dyn ShareValidator + Send + Sync>,
     /// Bitcoin RPC backend. Phase 2.4 uses this only for `submit_block`
     /// (forward found blocks); tip metadata + tx bodies come from the
     /// SV2 Template Distribution Protocol via [`TdpHandle`]. The trait
@@ -291,7 +291,6 @@ impl std::fmt::Debug for EngineHandles {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EngineHandles")
             .field("chain", &"<ChainStoreHandle>")
-            .field("validator", &"<dyn ShareValidator>")
             .field("bitcoind", &"<dyn BitcoindLike>")
             .finish()
     }
@@ -752,28 +751,16 @@ mod tests {
 
     #[tokio::test]
     async fn engine_with_handles_reports_handles_present() {
-        use bitcoin::CompactTarget;
         use bitcoindrpc::mock::MockBitcoind;
-        use p2poolv2_lib::pool_difficulty::PoolDifficulty;
-        use p2poolv2_lib::shares::validation::DefaultShareValidator;
         use p2poolv2_lib::test_utils::setup_test_chain_store_handle;
 
-        // Build the three production handles via test fixtures.
+        // Build production handles via test fixtures.
         let (chain, _tmpdir) = setup_test_chain_store_handle(false).await;
-        // Anchor at regtest genesis difficulty (max-easy target ~ 1d00ffff
-        // works for regtest).
-        let pool_difficulty = PoolDifficulty::new(CompactTarget::from_consensus(0x207fffff), 0, 0);
-        let validator: Arc<dyn ShareValidator + Send + Sync> =
-            Arc::new(DefaultShareValidator::new(pool_difficulty, 1, Vec::new()));
         let bitcoind: Arc<dyn BitcoindLike> = Arc::new(MockBitcoind::default());
         let (tx_sender, _tx_receiver) = async_channel::unbounded();
         let tdp = TdpHandle::new(tx_sender);
 
-        let handles = EngineHandles {
-            chain,
-            validator,
-            bitcoind,
-        };
+        let handles = EngineHandles { chain, bitcoind };
         let engine = P2poolV2Engine::with_handles(bitcoin::Network::Regtest, handles).with_tdp(tdp);
         assert!(engine.has_handles());
         assert!(engine.has_tdp());

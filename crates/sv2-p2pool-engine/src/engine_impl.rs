@@ -1138,13 +1138,9 @@ mod tests {
     async fn push_solution_submits_block_via_tdp_and_bitcoind() {
         use std::sync::Arc;
 
-        use bitcoin::{CompactTarget, hashes::Hash as _};
+        use bitcoin::hashes::Hash as _;
         use bitcoindrpc::{BitcoindLike, mock::MockBitcoind};
-        use p2poolv2_lib::{
-            pool_difficulty::PoolDifficulty,
-            shares::validation::{DefaultShareValidator, ShareValidator},
-            test_utils::setup_test_chain_store_handle,
-        };
+        use p2poolv2_lib::test_utils::setup_test_chain_store_handle;
         use stratum_apps::stratum_core::{
             binary_sv2::{Seq064K, Seq0255},
             parsers_sv2::TemplateDistribution,
@@ -1157,9 +1153,6 @@ mod tests {
 
         // 1. Build the engine with handles, including a TdpHandle.
         let (chain, _tmpdir) = setup_test_chain_store_handle(false).await;
-        let pool_difficulty = PoolDifficulty::new(CompactTarget::from_consensus(0x207fffff), 0, 0);
-        let validator: Arc<dyn ShareValidator + Send + Sync> =
-            Arc::new(DefaultShareValidator::new(pool_difficulty, 1, Vec::new()));
         let mock_bitcoind = Arc::new(MockBitcoind::default());
         let bitcoind: Arc<dyn BitcoindLike> = mock_bitcoind.clone();
         let (req_tx, req_rx) = async_channel::unbounded();
@@ -1198,7 +1191,6 @@ mod tests {
 
         let handles = EngineHandles {
             chain,
-            validator,
             bitcoind: bitcoind.clone(),
         };
         let engine =
