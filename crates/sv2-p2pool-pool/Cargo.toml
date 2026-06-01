@@ -37,6 +37,9 @@ bitcoin            = "0.32"
 # Async-channel for sv2-apps's TP/CM channel pairs.
 async-channel      = "1.5"
 
+# Prometheus registry for the engine's metrics surface.
+prometheus         = "0.13"
+
 tokio              = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }

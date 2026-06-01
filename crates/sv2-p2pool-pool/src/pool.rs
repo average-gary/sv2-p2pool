@@ -39,11 +39,12 @@ use pool_sv2::{
         sv2_tp::Sv2Tp,
     },
 };
+use prometheus::Registry;
 use stratum_apps::{
     stratum_core::bitcoin::consensus::Encodable, task_manager::TaskManager,
     tp_type::TemplateProviderType, utils::types::GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS,
 };
-use sv2_p2pool_engine::TdpHandle;
+use sv2_p2pool_engine::{EngineMetrics, TdpHandle};
 use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 
@@ -61,6 +62,11 @@ pub struct Pool {
     /// `with_handles`. When absent, the engine runs in TDP-only mode
     /// (Phase 2.5a behaviour preserved for tests).
     p2pool_config: Option<P2poolConfig>,
+    /// Prometheus registry the engine's [`EngineMetrics`] are
+    /// registered on. Cloneable (internally `Arc`), so an external
+    /// HTTP `/metrics` endpoint can read it without taking the lock
+    /// path through `Pool`.
+    metrics_registry: Registry,
     cancellation_token: CancellationToken,
     shutdown_notify: Arc<Notify>,
     is_alive: Arc<AtomicBool>,
@@ -71,6 +77,7 @@ impl Pool {
         Self {
             config,
             p2pool_config: None,
+            metrics_registry: Registry::new(),
             cancellation_token: CancellationToken::new(),
             shutdown_notify: Arc::new(Notify::new()),
             is_alive: Arc::new(AtomicBool::new(true)),
@@ -82,6 +89,13 @@ impl Pool {
     pub fn with_p2pool_config(mut self, p2pool_config: P2poolConfig) -> Self {
         self.p2pool_config = Some(p2pool_config);
         self
+    }
+
+    /// Borrow the Prometheus registry the engine's counters are
+    /// registered on. The binary's monitoring server (or any external
+    /// `/metrics` mount) can `gather()` against this for export.
+    pub fn metrics_registry(&self) -> &Registry {
+        &self.metrics_registry
     }
 
     /// Run the pool until cancelled or `Ctrl+C`.
@@ -159,6 +173,20 @@ impl Pool {
                 .build_engine()
                 .with_tdp(tdp.clone())
         };
+
+        // Register engine counters on the pool's Prometheus registry.
+        // Pool::start can be called multiple times in tests; on a
+        // duplicate registration we log + skip (no metrics rather than
+        // a panic).
+        match EngineMetrics::register(&self.metrics_registry) {
+            Ok(metrics) => {
+                engine_concrete = engine_concrete.with_metrics(metrics);
+                info!("engine metrics registered on Pool::metrics_registry");
+            }
+            Err(e) => {
+                warn!(error = %e, "engine metrics registration failed — continuing without metrics");
+            }
+        }
 
         // Spawn the share-chain reorg watcher when a chain handle is
         // available. Polls `chain.get_chain_tip()` at
