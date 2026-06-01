@@ -1,9 +1,8 @@
 //! Phase 2.5b: minimum-slice share-chain backend bootstrap.
 //!
-//! Builds the three handles our engine consumes —
-//! [`ChainStoreHandle`] (read-only share-chain access),
-//! [`ShareValidator`] (share validation), and [`BitcoindLike`] (block
-//! submission + future GBT proposals) — without booting the full
+//! Builds the two handles our engine consumes —
+//! [`ChainStoreHandle`] (read-only share-chain access) and
+//! [`BitcoindLike`] (block submission) — without booting the full
 //! p2poolv2 [`NodeHandle`] (libp2p networking, ZMQ listener, GBT
 //! poller, Stratum server, metrics, monitoring).
 //!
@@ -28,12 +27,7 @@ use std::sync::Arc;
 use bitcoindrpc::{BitcoindLike, BitcoindRpcClient};
 use p2poolv2_lib::{
     config::Config as P2poolConfig,
-    pool_difficulty::PoolDifficulty,
-    shares::{
-        chain::chain_store_handle::ChainStoreHandle,
-        share_block::ShareBlock,
-        validation::{DefaultShareValidator, ShareValidator},
-    },
+    shares::{chain::chain_store_handle::ChainStoreHandle, share_block::ShareBlock},
     store::{
         Store,
         writer::{StoreHandle, StoreWriter, write_channel},
@@ -55,8 +49,6 @@ pub enum ShareChainBootstrapError {
     },
     #[error("failed to initialise share-chain genesis: {0}")]
     InitGenesis(String),
-    #[error("failed to build pool difficulty: {0}")]
-    PoolDifficulty(String),
     #[error("failed to construct bitcoind RPC client: {0:?}")]
     BitcoindClient(bitcoindrpc::BitcoindRpcError),
 }
@@ -74,7 +66,7 @@ pub struct ShareChainHandles {
 }
 
 /// Bootstrap the minimum slice: open the rocksdb store, init genesis,
-/// build a `DefaultShareValidator`, build a `BitcoindRpcClient`, and
+/// build a `BitcoindRpcClient`, and
 /// pack them into [`EngineHandles`].
 ///
 /// The `StoreWriter` is spawned via `tokio::task::spawn_blocking` (it
@@ -126,26 +118,7 @@ pub async fn bootstrap_share_chain(
         .await
         .map_err(|e| ShareChainBootstrapError::InitGenesis(e.to_string()))?;
 
-    // 4. Build the share validator. PoolDifficulty::build reads the
-    //    current chain tip; the multiplier + signature come from the
-    //    p2pool config.
-    let pool_difficulty = PoolDifficulty::build(&chain)
-        .map_err(|e| ShareChainBootstrapError::PoolDifficulty(e.to_string()))?;
-    let difficulty_multiplier = p2pool_config.stratum.difficulty_multiplier as u128;
-    let pool_signature = p2pool_config
-        .stratum
-        .pool_signature
-        .as_deref()
-        .unwrap_or("")
-        .as_bytes()
-        .to_vec();
-    let validator: Arc<dyn ShareValidator + Send + Sync> = Arc::new(DefaultShareValidator::new(
-        pool_difficulty,
-        difficulty_multiplier,
-        pool_signature,
-    ));
-
-    // 5. Build the bitcoind RPC client.
+    // 4. Build the bitcoind RPC client.
     let rpc = &p2pool_config.bitcoinrpc;
     let bitcoind_client = BitcoindRpcClient::new(&rpc.url, &rpc.username, &rpc.password)
         .map_err(ShareChainBootstrapError::BitcoindClient)?;
@@ -153,11 +126,7 @@ pub async fn bootstrap_share_chain(
 
     info!("share-chain bootstrap: handles ready");
     Ok(ShareChainHandles {
-        engine_handles: EngineHandles {
-            chain,
-            validator,
-            bitcoind,
-        },
+        engine_handles: EngineHandles { chain, bitcoind },
         store,
         store_writer_join,
     })
