@@ -9,5 +9,20 @@ publish.workspace = true
 description = "Cap'n Proto client for talking to a p2poolv2 IPC daemon (Phase 2)"
 
 [dependencies]
-# Phase 2 will add: capnp = { workspace = true }, capnp-rpc = { workspace = true }
-# Empty for now — depends on a p2poolv2 upstream PR that has not yet landed.
+capnp     = "0.25"
+capnp-rpc = "0.25"
+# Schema crate. Dual-licensed MIT OR Apache-2.0 so this AGPL-free client
+# can depend on it without inheriting the daemon's license; see ADR 0010.
+p2poolv2-capnp-types = { path = "../../vendor/p2poolv2/p2poolv2-capnp-types" }
+tokio = { workspace = true, features = ["net", "io-util", "rt", "macros"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+futures = "0.3"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tempfile = "3"
+# Server-side stub for round-trip integration tests. AGPL is OK in
+# dev-deps because the test binary isn't shipped.
+p2poolv2_ipc = { path = "../../vendor/p2poolv2/p2poolv2_ipc" }
