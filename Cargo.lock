@@ -3612,6 +3612,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "p2poolv2-capnp-types"
+version = "0.1.0"
+dependencies = [
+ "capnp",
+ "capnpc",
+]
+
+[[package]]
 name = "p2poolv2_config"
 version = "0.11.0"
 dependencies = [
@@ -3619,6 +3627,20 @@ dependencies = [
  "bitcoindrpc",
  "config 0.13.4",
  "serde",
+]
+
+[[package]]
+name = "p2poolv2_ipc"
+version = "0.11.0"
+dependencies = [
+ "capnp",
+ "capnp-rpc",
+ "futures",
+ "p2poolv2-capnp-types",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -5121,6 +5143,18 @@ dependencies = [
 [[package]]
 name = "sv2-p2pool-ipc"
 version = "0.0.1"
+dependencies = [
+ "capnp",
+ "capnp-rpc",
+ "futures",
+ "p2poolv2-capnp-types",
+ "p2poolv2_ipc",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
 
 [[package]]
 name = "sv2-p2pool-pool"
