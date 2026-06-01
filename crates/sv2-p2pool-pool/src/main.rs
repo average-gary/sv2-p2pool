@@ -5,17 +5,20 @@
 //! with both attached, and runs it until `Ctrl+C` or external
 //! cancellation.
 
+use stratum_apps::config_helpers::logging::init_logging;
 use sv2_p2pool::{PoolBuilder, process_cli_args};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    let configs = process_cli_args()?;
+    // Honour --log-file (or PoolConfig.log_dir() when set in TOML)
+    // via sv2-apps's init_logging, matching the upstream pool binary's
+    // behaviour. Falls back to RUST_LOG env-driven stdout when the
+    // path is None.
+    init_logging(configs.pool.log_dir());
 
     tracing::info!("sv2-p2pool: boot");
 
-    let configs = process_cli_args()?;
     tracing::info!(
         listen = %configs.pool.listen_address(),
         signature = %configs.pool.pool_signature(),
