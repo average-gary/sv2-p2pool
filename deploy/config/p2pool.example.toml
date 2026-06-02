@@ -1,0 +1,62 @@
+# p2poolv2 share-chain config — see docs/running.md for the full
+# reference. This example targets testnet4 to match pool.example.toml.
+
+# libp2p listen + peer-management settings.
+[network]
+listen_address = "/ip4/0.0.0.0/tcp/6884"
+# Add p2poolv2 peer multiaddrs here for share-chain participation.
+# Without dial_peers, the node is isolated and receives no shares
+# from the wider network.
+dial_peers = []
+max_pending_incoming = 10
+max_pending_outgoing = 10
+max_established_incoming = 50
+max_established_outgoing = 50
+max_established_per_peer = 1
+max_workbase_per_second = 10
+max_userworkbase_per_second = 10
+max_miningshare_per_second = 100
+max_inventory_per_second = 100
+max_transaction_per_second = 100
+max_requests_per_second = 100
+dial_timeout_secs = 30
+
+# rocksdb-backed share-chain store.
+[store]
+path = "/var/lib/sv2-p2pool/store.db"
+background_task_frequency_hours = 24
+pplns_ttl_days = 7
+
+# Stratum server configuration. The pool runs its own Stratum surface
+# in addition to the SV2 mining-protocol listener in pool.toml — this
+# is the legacy V1 path that p2poolv2 nodes use to interoperate.
+[stratum]
+hostname = "127.0.0.1"
+port = 3333
+start_difficulty = 10000
+minimum_difficulty = 100
+solo_address = "tb1qa0sm0hxzj0x25rh8gw5xlzwlsfvvyz8u96w3p8"
+bootstrap_address = "tb1qa0sm0hxzj0x25rh8gw5xlzwlsfvvyz8u96w3p8"
+zmqpubhashblock = "tcp://127.0.0.1:28332"
+network = "testnet4"
+version_mask = "1fffe000"
+difficulty_multiplier = 1.0
+pool_signature = "sv2-p2pool"
+
+# Bitcoin RPC credentials. The engine uses this for submit_block
+# (forward found blocks to bitcoind).
+[bitcoinrpc]
+url = "http://127.0.0.1:48332"
+username = "rpcuser"
+password = "rpcpass"
+
+# Logging — see also --log-file CLI flag.
+[logging]
+console = true
+level = "info"
+stats_dir = "/var/lib/sv2-p2pool/stats"
+
+# p2poolv2's own JSON API.
+[api]
+hostname = "127.0.0.1"
+port = 46884

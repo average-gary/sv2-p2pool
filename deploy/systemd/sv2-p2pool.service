@@ -1,0 +1,52 @@
+[Unit]
+Description=SV2 mining pool with p2poolv2 share-chain backend
+Documentation=https://github.com/average-gary/sv2-p2pool/blob/main/docs/running.md
+# Pool needs both bitcoind (IPC TP) and a reachable bitcoinrpc endpoint.
+# Order requirements only — leave hard dependencies to the operator;
+# in some setups bitcoind runs on a separate host.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sv2-p2pool
+Group=sv2-p2pool
+
+# Adjust the binary path to wherever you installed it. Common locations:
+#   /usr/local/bin/sv2-p2pool   — system-wide install
+#   /opt/sv2-p2pool/bin/sv2-p2pool — opt-style install
+ExecStart=/usr/local/bin/sv2-p2pool \
+    --config /etc/sv2-p2pool/pool.toml \
+    --p2pool-config /etc/sv2-p2pool/p2pool.toml \
+    --metrics-addr 127.0.0.1:9000 \
+    --log-file /var/log/sv2-p2pool/sv2-p2pool.log
+
+# Restart on any non-clean exit. The pool's own graceful shutdown
+# returns 0 on Ctrl-C / SIGTERM; only an actual crash triggers
+# Restart=on-failure.
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening — opinionated defaults; operators should
+# audit before enabling on a host with custom paths.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+# Read-write paths — extend if your config moves rocksdb/log files.
+ReadWritePaths=/var/lib/sv2-p2pool /var/log/sv2-p2pool
+
+# File-descriptor limit — rocksdb opens many small files at startup.
+LimitNOFILE=65536
+
+# Environment — RUST_LOG controls verbosity when --log-file is unset
+# (or supplements when set).
+Environment="RUST_LOG=info,sv2_p2pool=info,sv2_p2pool_engine=info"
+
+[Install]
+WantedBy=multi-user.target
