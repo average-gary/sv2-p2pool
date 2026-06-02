@@ -706,9 +706,16 @@ impl JobValidationEngine for P2poolV2Engine {
                             // anything that isn't the null sentinel as a
                             // failure.
                             if reply == "null" {
-                                info!(%block_hash, "submit_block accepted");
+                                info!(
+                                    request_id,
+                                    template_id,
+                                    %block_hash,
+                                    "submit_block accepted"
+                                );
                             } else {
                                 warn!(
+                                    request_id,
+                                    template_id,
                                     %block_hash,
                                     rejection = %reply,
                                     "submit_block rejected by bitcoind",
@@ -719,7 +726,13 @@ impl JobValidationEngine for P2poolV2Engine {
                             }
                         }
                         Err(e) => {
-                            warn!(%block_hash, error = %e, "submit_block failed");
+                            warn!(
+                                request_id,
+                                template_id,
+                                %block_hash,
+                                error = %e,
+                                "submit_block failed"
+                            );
                             if let Some(m) = metrics.as_ref() {
                                 m.blocks_submit_failed.inc();
                             }
