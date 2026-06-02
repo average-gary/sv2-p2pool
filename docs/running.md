@@ -109,14 +109,49 @@ port = 46884
 ```sh
 sv2-p2pool \
     --config /etc/sv2-p2pool/pool.toml \
-    --p2pool-config /etc/sv2-p2pool/p2pool.toml
+    --p2pool-config /etc/sv2-p2pool/p2pool.toml \
+    --metrics-addr 127.0.0.1:9000 \
+    --log-file /var/log/sv2-p2pool.log
 ```
 
-Defaults:
-- `--config` → `sv2-p2pool.toml` (in CWD)
-- `--p2pool-config` → `p2poolv2.toml` (in CWD)
+Flags:
 
-Logs go to stdout; configure verbosity via the standard `RUST_LOG` env var.
+| Flag | Default | Purpose |
+|---|---|---|
+| `-c`, `--config` | `sv2-p2pool.toml` | sv2-apps `PoolConfig` TOML (authority keys, JDS, TP). |
+| `--p2pool-config` | `p2poolv2.toml` | p2poolv2 share-chain config TOML (rocksdb, bitcoinrpc, network). |
+| `--metrics-addr` | (disabled) | Listen address for the built-in `/metrics` endpoint. Omit to disable. |
+| `-f`, `--log-file` | (stdout) | Path to a log file. When unset, logs go to stdout via `RUST_LOG`. |
+
+## Logging
+
+The binary uses sv2-apps's `init_logging`. With `--log-file` set, structured JSON logs are appended to that path. Without it, logs go to stdout and the `RUST_LOG` env var controls verbosity (e.g. `RUST_LOG=info,sv2_p2pool_engine=debug`).
+
+## Observability
+
+When `--metrics-addr` is set, the pool exposes a Prometheus scrape target at `GET /metrics`. The endpoint serves the engine's [`EngineMetrics`](../crates/sv2-p2pool-engine/src/metrics.rs) counters in the standard exposition format:
+
+| Counter | What it tracks |
+|---|---|
+| `sv2_p2pool_engine_declare_mining_job_accepted_total` | Successful `DeclareMiningJob` exchanges |
+| `sv2_p2pool_engine_declare_mining_job_rejected_total` | `DeclareMiningJob` calls returning an `Error` code |
+| `sv2_p2pool_engine_declare_mining_job_missing_txns_total` | `DeclareMiningJob` calls returning `MissingTransactions` |
+| `sv2_p2pool_engine_set_custom_mining_job_accepted_total` | Successful `SetCustomMiningJob` cross-checks |
+| `sv2_p2pool_engine_set_custom_mining_job_rejected_total` | `SetCustomMiningJob` calls returning an `Error` code |
+| `sv2_p2pool_engine_push_solution_received_total` | `PushSolution` messages handled |
+| `sv2_p2pool_engine_blocks_submitted_total` | Reconstructed blocks forwarded to `bitcoind.submit_block` |
+| `sv2_p2pool_engine_reorg_notifications_total` | `notify_share_chain_reorg` invocations |
+| `sv2_p2pool_engine_jobs_invalidated_total` | Cached `DeclaredJob`s dropped on share-chain reorg |
+
+The endpoint is HTTP/1.1 only (one request per connection) and has no authentication. Operators should put it behind a private network or reverse proxy, and configure their Prometheus scraper accordingly:
+
+```yaml
+scrape_configs:
+  - job_name: sv2-p2pool
+    static_configs:
+      - targets: ['10.0.0.1:9000']
+    scrape_interval: 15s
+```
 
 ## Bitcoin Core IPC
 

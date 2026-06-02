@@ -76,16 +76,27 @@ The shared-chain handles (`ChainStoreHandle`, `Arc<dyn BitcoindLike>`, `Arc<dyn 
   - 2.6 — `P2poolV2D` testenv spawner with three-tier discovery (PR #35)
   - 2.7 — Network parameterization (default Testnet4) + `Sv2P2poolD` testenv spawner (PR #36)
   - 2.8 — docs refresh + `--ignored` E2E in CI nightly
-- **Phase 2-B**: capnp IPC PR to p2poolv2; switch binary to talk over UDS. The engine's IPC client crate (`crates/sv2-p2pool-ipc`) is scaffolded but not yet active.
-- **Phase 3**: production hardening, observability, deployment recipes, full driving E2E test (`JdClientD` spawner + integration-tests).
+  - 2.9 — `JdClientD` spawner + ipcbind support in the testenv (PRs #38 / #39)
+  - 2.10 — testnet4 switch in testenv + reorg-watcher wiring (PRs #40 / #41)
+  - 2.11 — selective `DeclaredJob` invalidation on share-chain reorg (PRs #42 / #43)
+  - 2.12 — `MissingTransactions` flow + `SetCustomMiningJob` handles-less mode (PRs #44 / #45)
+  - 2.13 — `RecentSolutions` sweeper, demux abort on shutdown, validator-handle cleanup (PRs #46 / #48 / #50)
+  - 2.14 — IPC client skeleton against the upstream stub (PR #49)
+  - 2.15 — Engine Prometheus counters + `/metrics` endpoint + `--log-file` wiring (PRs #51 / #52 / #53 / #54)
+  - 2.16 — `config_network` testnet4 fix (PR #55)
+- **Phase 2-B**: capnp IPC integration on the engine side. The client crate is now functional against the upstream stub (PR #49); next step is replacing the in-process `EngineHandles.chain` with IPC calls to an out-of-process p2poolv2 daemon. Blocked on the daemon's stub returning real share-chain results.
+- **Phase 3**: full driving E2E test against testnet4 (drives `SubmitSharesExtended` end-to-end), the ADR 0002 token-payout interceptor (needs a JDC TLV extension or upstream sv2-apps trait change), deployment recipes (systemd, docker-compose).
 
-## Phase 2-A status by component
+## Status by component
 
-- ✅ Engine: full `JobValidationEngine` impl with real `handle_declare_mining_job` (TDP-snapshot tip + cached `template_id`) and `handle_push_solution` (lookup → `RequestTransactionData` → block reconstruction → `submit_block`).
-- ✅ Pool binary: loads both `--config` (sv2-apps PoolConfig) and `--p2pool-config` (p2poolv2 share-chain config). `Pool::start` spawns the TDP demux tasks and bootstraps EngineHandles when the second config is supplied.
-- ✅ Testenv: `P2poolV2D` and `Sv2P2poolD` spawners. Default network is Testnet4 (the live deployment target with a public dashboard).
-- ⏳ Full p2poolv2 `NodeHandle` (libp2p networking, ZMQ listener, GBT poller, Stratum server, metrics, monitoring) — deferred until share-chain validation moves into `handle_declare_mining_job`. None of these are consumed by the current engine code path.
-- ⏳ End-to-end driving test (`JdClientD` spawner + integration-tests crate) — deferred to Phase 3 alongside the production-hardening work.
+- ✅ **Engine**: full `JobValidationEngine` impl. `handle_declare_mining_job` returns `MissingTransactions` first-pass per spec, captures TDP tip + share-chain tip on success, caches a `DeclaredJob`. `handle_set_custom_mining_job` cross-checks every field (with handles-less fallback). `handle_push_solution` looks up the cached job, fetches tx bodies via TDP, reconstructs the block, submits to bitcoind. `notify_share_chain_reorg` walks ancestry to selectively invalidate.
+- ✅ **Pool runtime**: TDP demux + reorg watcher + RecentSolutions sweeper + bootstrapped `EngineHandles` (rocksdb chain + bitcoind RPC). Graceful shutdown aborts every spawned task.
+- ✅ **Observability**: Prometheus `IntCounter` set covering every material event, exposed via a built-in `/metrics` HTTP endpoint (`--metrics-addr`). `--log-file` honoured via `init_logging`.
+- ✅ **Testenv**: `BitcoinD` + `P2poolV2D` + `Sv2P2poolD` + `JdClientD` spawners. `with_ipcbind` for Bitcoin Core multiprocess; testnet4-default. Smoke tests exercise full-stack boot.
+- ✅ **IPC client crate**: connects to the upstream p2poolv2 IPC server stub, surfaces `validate_template` / `submit_solution` / `subscribe_chain_tip`.
+- ⏳ **Engine validation against upstream**: `validate_block_proposal` against bitcoind isn't called at declare time. Open question whether to lift it from in-process p2poolv2_lib via the IPC client or keep direct.
+- ⏳ **Full driving E2E**: needs bitcoind built with multiprocess support to run; currently the spawner-orchestration test demonstrates boot but stops short of share submission.
+- ⏳ **Per-miner payout binding** (ADR 0002): the engine's `lookup_payout_script` is wired but the JDC-side allocation interceptor needs an upstream sv2-apps TLV extension.
 
 ## Local development
 
