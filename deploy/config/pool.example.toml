@@ -1,0 +1,52 @@
+# sv2-apps PoolConfig — see docs/running.md for the full reference.
+# This example targets testnet4 (the supported deployment network).
+
+# Generate replacement keys with sv2-apps's authority-key utility.
+# These test keys are taken from the upstream config-examples and MUST
+# be replaced before exposing this pool publicly.
+authority_public_key = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
+authority_secret_key = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n"
+cert_validity_sec = 3600
+
+# Mining-protocol downstream listener.
+listen_address = "0.0.0.0:34254"
+
+# Operator's payout address. Replace with your own. Coinbase output
+# format is a Bitcoin descriptor: addr(<address>) for plain bitcoin
+# addresses; raw(<hex>) / pkh(<key>) for advanced setups.
+coinbase_reward_script = "addr(tb1qa0sm0hxzj0x25rh8gw5xlzwlsfvvyz8u96w3p8)"
+
+# Server identifier (any positive integer). Used by sv2-apps when a
+# JDS pool is part of a load-balanced cluster.
+server_id = 1
+
+# String embedded in the coinbase scriptSig.
+pool_signature = "sv2-p2pool"
+
+# Difficulty target tuning. shares_per_minute is the target rate the
+# pool tells each downstream miner to aim for.
+shares_per_minute = 6.0
+share_batch_size = 10
+
+# Protocol extension negotiation. Empty arrays = no extensions
+# required, no extensions advertised.
+supported_extensions = []
+required_extensions = []
+
+# sv2-apps's own monitoring HTTP server (separate from this binary's
+# /metrics endpoint controlled by --metrics-addr).
+monitoring_address = "127.0.0.1:9090"
+monitoring_cache_refresh_secs = 15
+
+# Bitcoin Core IPC template provider. Bitcoin Core 28.0+ with
+# multiprocess support required (-ipcbind=unix:...).
+[template_provider_type.BitcoinCoreIpc]
+network = "testnet4"
+# Override the default data_dir if your bitcoind uses a non-standard path.
+# data_dir = "/var/lib/bitcoin"
+fee_threshold = 100
+min_interval = 5
+
+# Embedded Job Declaration Server (JDS). Listens for JDC connections.
+[jds]
+listen_address = "0.0.0.0:34264"

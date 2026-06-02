@@ -2,6 +2,8 @@
 
 Operator-oriented quickstart for booting the pool against a Bitcoin Core node + p2poolv2 share-chain config.
 
+For a copy-pasteable systemd install (unit + sample configs + scrape config), see [deploy/](../deploy/README.md).
+
 ## Prerequisites
 
 - Rust toolchain matching `rust-toolchain.toml` (currently 1.88).
