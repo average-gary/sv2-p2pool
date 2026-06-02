@@ -67,6 +67,11 @@ pub struct EngineMetrics {
     /// Current size of the recent-solutions buffer. Same update path
     /// as `declared_jobs_cache_size`.
     pub recent_solutions_buffer_size: IntGauge,
+    /// Unix timestamp (seconds since epoch) of the most recent
+    /// recent-solutions sweeper tick. Stays at 0 until the first tick
+    /// runs. Operators detect a wedged sweeper task by alerting on
+    /// `(time() - sweeper_last_run_timestamp_seconds) > N * scrape_interval`.
+    pub sweeper_last_run_timestamp_seconds: IntGauge,
 }
 
 impl EngineMetrics {
@@ -122,6 +127,10 @@ impl EngineMetrics {
                 "sv2_p2pool_engine_recent_solutions_buffer_size",
                 "Current count of buffered share-finder credits",
             )?,
+            sweeper_last_run_timestamp_seconds: int_gauge(
+                "sv2_p2pool_engine_sweeper_last_run_timestamp_seconds",
+                "Unix epoch seconds of the most recent recent-solutions sweeper tick (0 = never)",
+            )?,
         };
 
         for c in metrics.all_counters() {
@@ -148,10 +157,11 @@ impl EngineMetrics {
         ]
     }
 
-    fn all_gauges(&self) -> [&IntGauge; 2] {
+    fn all_gauges(&self) -> [&IntGauge; 3] {
         [
             &self.declared_jobs_cache_size,
             &self.recent_solutions_buffer_size,
+            &self.sweeper_last_run_timestamp_seconds,
         ]
     }
 }
@@ -186,6 +196,9 @@ mod tests {
         assert!(names.contains(&"sv2_p2pool_engine_declared_jobs_cache_size".to_string()));
         assert!(names.contains(&"sv2_p2pool_engine_recent_solutions_buffer_size".to_string()));
         assert!(names.contains(&"sv2_p2pool_engine_blocks_submit_failed_total".to_string()));
+        assert!(
+            names.contains(&"sv2_p2pool_engine_sweeper_last_run_timestamp_seconds".to_string())
+        );
     }
 
     #[test]
