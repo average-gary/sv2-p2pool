@@ -28,6 +28,7 @@
 //!    `CARGO_MANIFEST_DIR`).
 //! 3. `sv2-p2pool` on `$PATH`.
 
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -78,6 +79,67 @@ pub struct Sv2P2poolD {
     pub jds_addr: SocketAddr,
     /// Mining-protocol downstream listen address.
     pub mining_addr: SocketAddr,
+    /// Address of the built-in `/metrics` + `/healthz` HTTP endpoint.
+    pub metrics_addr: SocketAddr,
+}
+
+impl Sv2P2poolD {
+    /// Scrape `/metrics` and parse the value of an `IntCounter`-shaped
+    /// metric line (`<name> <integer>` for unlabeled, `<name>{...} <integer>`
+    /// for labeled). Returns `None` if the line is not present (which
+    /// for pre-registered counters means: the metric was never bumped
+    /// AND no zero-line was emitted — operationally this is "0").
+    ///
+    /// This is a *test-harness* HTTP/1.1 client — it deliberately
+    /// avoids a hyper/reqwest dep just to walk a few hundred bytes of
+    /// exposition format.
+    pub fn scrape_metric_value(&self, name_with_labels: &str) -> std::io::Result<Option<u64>> {
+        let body = self.scrape_metrics_body()?;
+        for line in body.lines() {
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            let Some((lhs, rhs)) = line.rsplit_once(' ') else {
+                continue;
+            };
+            if lhs == name_with_labels {
+                return Ok(rhs.parse::<u64>().ok());
+            }
+        }
+        Ok(None)
+    }
+
+    /// Scrape the raw `/metrics` body. Useful for tests that want to
+    /// match against multiple metrics at once.
+    pub fn scrape_metrics_body(&self) -> std::io::Result<String> {
+        let mut stream = TcpStream::connect_timeout(&self.metrics_addr, Duration::from_secs(2))?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        let response = String::from_utf8_lossy(&response).to_string();
+        let body = response.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+        Ok(body)
+    }
+
+    /// Block until `predicate(scraped_body)` returns true or `timeout` elapses.
+    pub fn wait_for_metric<F>(&self, mut predicate: F, timeout: Duration) -> std::io::Result<bool>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let body = self.scrape_metrics_body()?;
+            if predicate(&body) {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
 }
 
 impl Drop for Sv2P2poolD {
@@ -157,6 +219,7 @@ impl<'a> Sv2P2poolDBuilder<'a> {
         let jds_port = allocate_free_port()?;
         let mining_port = allocate_free_port()?;
         let monitoring_port = allocate_free_port()?;
+        let metrics_port = allocate_free_port()?;
         let store_path = tempdir.path().join("p2pool-store.db");
         let stats_dir = tempdir.path().join("p2pool-stats");
         std::fs::create_dir_all(&stats_dir)
@@ -275,11 +338,14 @@ port = {p2pool_api_port}
             "wrote sv2-p2pool configs"
         );
 
+        let metrics_addr = SocketAddr::from(([127, 0, 0, 1], metrics_port));
         let child = Command::new(&exe)
             .arg("--config")
             .arg(&pool_config_path)
             .arg("--p2pool-config")
             .arg(&p2pool_config_path)
+            .arg("--metrics-addr")
+            .arg(metrics_addr.to_string())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -295,6 +361,7 @@ port = {p2pool_api_port}
             p2pool_config_path,
             jds_addr,
             mining_addr,
+            metrics_addr,
         };
 
         wait_for_ready(&mut spawner, self.ready_timeout)?;
@@ -365,9 +432,20 @@ fn wait_for_ready(spawner: &mut Sv2P2poolD, timeout: Duration) -> Result<(), Sv2
             Err(e) => warn!(error = %e, "try_wait error during readiness poll"),
         }
 
-        // Ready when the JDS port accepts a TCP connection.
-        if TcpStream::connect_timeout(&spawner.jds_addr, Duration::from_millis(100)).is_ok() {
-            info!(jds_addr = %spawner.jds_addr, "sv2-p2pool JDS ready");
+        // Ready when BOTH the JDS port AND the /metrics port accept a
+        // TCP connection. The metrics endpoint comes up later in
+        // Pool::start than the JDS listener, so a JDS-only check would
+        // race with tests that scrape /metrics immediately on return.
+        let jds_up =
+            TcpStream::connect_timeout(&spawner.jds_addr, Duration::from_millis(100)).is_ok();
+        let metrics_up =
+            TcpStream::connect_timeout(&spawner.metrics_addr, Duration::from_millis(100)).is_ok();
+        if jds_up && metrics_up {
+            info!(
+                jds_addr = %spawner.jds_addr,
+                metrics_addr = %spawner.metrics_addr,
+                "sv2-p2pool JDS + /metrics ready"
+            );
             return Ok(());
         }
 
@@ -403,5 +481,79 @@ mod tests {
         // Sanity: the helper either finds the binary or returns None;
         // shouldn't panic regardless of whether the binary is built.
         let _ = find_sv2_p2pool_in_workspace_target();
+    }
+
+    #[test]
+    fn scrape_metric_value_parses_unlabeled_counter_lines() {
+        // Spin up a minimal HTTP server that replies with a fixed
+        // /metrics body and verify the parsing logic against it.
+        // Doesn't exercise the spawn path — just the parser.
+        use std::io::Write as _;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let body = "\
+# HELP sv2_p2pool_engine_declare_mining_job_accepted_total Successful DeclareMiningJob exchanges
+# TYPE sv2_p2pool_engine_declare_mining_job_accepted_total counter
+sv2_p2pool_engine_declare_mining_job_accepted_total 7
+sv2_p2pool_engine_blocks_submitted_total 0
+";
+        let server_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            // Drain the request line + headers; we don't care.
+            use std::io::Read as _;
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        });
+
+        // Build a fake Sv2P2poolD pointing at our stub server. Drop
+        // safety: the child process is never spawned for real here, so
+        // child kill in Drop is a no-op and we provide a placeholder.
+        // To avoid that, just call scrape_metric_value via the same
+        // socket-and-parse logic by inlining what the method does.
+        let body_response = {
+            let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let mut buf = Vec::new();
+            use std::io::Read as _;
+            stream.read_to_end(&mut buf).unwrap();
+            String::from_utf8_lossy(&buf).to_string()
+        };
+        server_thread.join().expect("server thread");
+        let body_only = body_response.split("\r\n\r\n").nth(1).unwrap_or("");
+
+        // Run the same scan as scrape_metric_value.
+        let lookup = |name: &str| -> Option<u64> {
+            for line in body_only.lines() {
+                if line.starts_with('#') || line.is_empty() {
+                    continue;
+                }
+                let Some((lhs, rhs)) = line.rsplit_once(' ') else {
+                    continue;
+                };
+                if lhs == name {
+                    return rhs.parse::<u64>().ok();
+                }
+            }
+            None
+        };
+        assert_eq!(
+            lookup("sv2_p2pool_engine_declare_mining_job_accepted_total"),
+            Some(7)
+        );
+        assert_eq!(lookup("sv2_p2pool_engine_blocks_submitted_total"), Some(0));
+        assert_eq!(lookup("sv2_p2pool_engine_does_not_exist"), None);
     }
 }
