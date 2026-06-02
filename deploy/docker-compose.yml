@@ -79,7 +79,18 @@ services:
     ports:
       - "34254:34254" # mining-protocol downstream listener
       - "34264:34264" # JDP listener
-      - "9000:9000"   # /metrics
+      - "9000:9000"   # /metrics + /healthz
+    # /healthz returns 200 OK as long as the metrics server (and thus
+    # the parent process) is alive. Process-liveness probe only — does
+    # NOT validate bitcoind reachability.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "wget --quiet --spider http://127.0.0.1:9000/healthz || exit 1"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
 volumes:
   bitcoind-data:

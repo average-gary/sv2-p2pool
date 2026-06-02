@@ -150,6 +150,8 @@ When `--metrics-addr` is set, the pool exposes a Prometheus scrape target at `GE
 | `sv2_p2pool_engine_recent_solutions_buffer_size` | Current count of buffered share-finder credits (gauge) |
 | `sv2_p2pool_engine_sweeper_last_run_timestamp_seconds` | Unix epoch seconds of the most recent sweeper tick (gauge; 0 ⇒ never). Alert on `(time() - this) > N * scrape_interval` to detect a wedged sweeper. |
 
+A sibling `GET /healthz` returns `200 OK` with body `ok\n` while the process is alive. It is a **process-liveness probe** for orchestrators (k8s liveness, docker-compose `healthcheck`); it does not validate downstream connections like bitcoind. The bundled `deploy/docker-compose.yml` wires `wget --spider http://127.0.0.1:9000/healthz` against it.
+
 The endpoint is HTTP/1.1 only (one request per connection) and has no authentication. Operators should put it behind a private network or reverse proxy, and configure their Prometheus scraper accordingly:
 
 ```yaml
