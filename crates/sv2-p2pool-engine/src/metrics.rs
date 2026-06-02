@@ -44,7 +44,15 @@ pub struct EngineMetrics {
     pub push_solution_received: IntCounter,
     /// Blocks fully reconstructed and handed to `bitcoind.submit_block`.
     /// Excludes the structural-only / no-handles fallback path.
+    /// Includes both successful and failed submissions — see
+    /// `blocks_submit_failed` for the failure breakdown.
     pub blocks_submitted: IntCounter,
+    /// `submit_block` calls bitcoind did not accept. Increments on
+    /// transport errors (`Err(_)` from the RPC client) AND on consensus
+    /// rejections (bitcoind returns `Ok(<reason-string>)` for these —
+    /// e.g. `"high-hash"`, `"bad-prevblk"`). A non-zero value indicates
+    /// lost block credit and warrants an operator alert.
+    pub blocks_submit_failed: IntCounter,
     /// `notify_share_chain_reorg` invocations (any path: selective +
     /// fallback).
     pub reorg_notifications: IntCounter,
@@ -94,6 +102,10 @@ impl EngineMetrics {
                 "sv2_p2pool_engine_blocks_submitted_total",
                 "Blocks reconstructed and forwarded to bitcoind.submit_block",
             )?,
+            blocks_submit_failed: int_counter(
+                "sv2_p2pool_engine_blocks_submit_failed_total",
+                "submit_block calls bitcoind did not accept (transport error or consensus rejection)",
+            )?,
             reorg_notifications: int_counter(
                 "sv2_p2pool_engine_reorg_notifications_total",
                 "notify_share_chain_reorg invocations",
@@ -121,7 +133,7 @@ impl EngineMetrics {
         Ok(metrics)
     }
 
-    fn all_counters(&self) -> [&IntCounter; 9] {
+    fn all_counters(&self) -> [&IntCounter; 10] {
         [
             &self.declare_mining_job_accepted,
             &self.declare_mining_job_rejected,
@@ -130,6 +142,7 @@ impl EngineMetrics {
             &self.set_custom_mining_job_rejected,
             &self.push_solution_received,
             &self.blocks_submitted,
+            &self.blocks_submit_failed,
             &self.reorg_notifications,
             &self.jobs_invalidated_total,
         ]
@@ -172,6 +185,7 @@ mod tests {
             .collect();
         assert!(names.contains(&"sv2_p2pool_engine_declared_jobs_cache_size".to_string()));
         assert!(names.contains(&"sv2_p2pool_engine_recent_solutions_buffer_size".to_string()));
+        assert!(names.contains(&"sv2_p2pool_engine_blocks_submit_failed_total".to_string()));
     }
 
     #[test]

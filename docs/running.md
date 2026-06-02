@@ -141,7 +141,8 @@ When `--metrics-addr` is set, the pool exposes a Prometheus scrape target at `GE
 | `sv2_p2pool_engine_set_custom_mining_job_accepted_total` | Successful `SetCustomMiningJob` cross-checks |
 | `sv2_p2pool_engine_set_custom_mining_job_rejected_total` | `SetCustomMiningJob` calls returning an `Error` code |
 | `sv2_p2pool_engine_push_solution_received_total` | `PushSolution` messages handled |
-| `sv2_p2pool_engine_blocks_submitted_total` | Reconstructed blocks forwarded to `bitcoind.submit_block` |
+| `sv2_p2pool_engine_blocks_submitted_total` | Reconstructed blocks forwarded to `bitcoind.submit_block` (counts attempts; success and failure) |
+| `sv2_p2pool_engine_blocks_submit_failed_total` | `submit_block` calls bitcoind did not accept. Covers transport errors (`Err(_)` from the RPC client) and consensus rejections (bitcoind returns `Ok("high-hash"`, `"bad-prevblk"`, etc.). Non-zero ⇒ likely lost block — alert. |
 | `sv2_p2pool_engine_reorg_notifications_total` | `notify_share_chain_reorg` invocations |
 | `sv2_p2pool_engine_jobs_invalidated_total` | Cached `DeclaredJob`s dropped on share-chain reorg |
 | `sv2_p2pool_engine_declared_jobs_cache_size` | Current count of cached `DeclaredJob`s (gauge) |
