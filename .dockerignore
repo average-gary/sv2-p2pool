@@ -1,0 +1,9 @@
+# Keep the docker build context small.
+target/
+.git/
+.github/
+docs/
+deploy/
+*.md
+.gitignore
+.gitmodules.bak

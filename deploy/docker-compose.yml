@@ -1,0 +1,87 @@
+# docker-compose stack for sv2-p2pool — testnet4 by default.
+#
+# Brings up:
+#   - bitcoind (testnet4, multiprocess, ipcbind)
+#   - sv2-p2pool (mining-protocol :34254, JDS :34264, metrics :9000)
+#
+# Note: the bitcoin/bitcoin upstream image does NOT ship multiprocess
+# support out of the box. For a real deployment, either:
+#   - build bitcoind with `./configure --enable-multiprocess` and
+#     swap the image below, or
+#   - use one of the community images that bundle multiprocess
+#     (look for a `:multiprocess` tag), or
+#   - run bitcoind on the host and remove the bitcoind service here,
+#     setting `network_mode: host` on sv2-p2pool.
+#
+# Pre-flight:
+#   1. Edit ./config/pool.toml and ./config/p2pool.toml — at minimum
+#      replace the authority keys, payout addresses, and bitcoinrpc
+#      credentials.
+#   2. Ensure the bitcoind image you use exposes /var/lib/bitcoin
+#      as the data dir (default for the upstream image).
+#
+# Run:
+#   docker compose -f deploy/docker-compose.yml up -d
+#   docker compose logs -f sv2-p2pool
+#   curl http://127.0.0.1:9000/metrics
+
+version: "3.9"
+
+services:
+  bitcoind:
+    # Replace with a multiprocess-enabled image for production.
+    image: bitcoin/bitcoin:28.0
+    container_name: sv2-p2pool-bitcoind
+    restart: unless-stopped
+    command:
+      - -testnet4
+      - -server=1
+      - -txindex=1
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpcuser=rpcuser
+      - -rpcpassword=rpcpass
+      - -ipcbind=unix:/var/lib/bitcoin/testnet4/node.sock
+      - -fallbackfee=0.0001
+    volumes:
+      - bitcoind-data:/var/lib/bitcoin
+    expose:
+      - "48332" # rpc
+      - "28332" # zmq
+    # Health: rpcbind is up before sv2-p2pool tries to talk to it.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "bitcoin-cli -testnet4 -rpcuser=rpcuser -rpcpassword=rpcpass getblockchaininfo > /dev/null 2>&1"
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  sv2-p2pool:
+    # Build from the local Dockerfile. Operators consuming a published
+    # image can replace `build:` with `image: average-gary/sv2-p2pool:tag`.
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: sv2-p2pool
+    restart: on-failure
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    environment:
+      - RUST_LOG=info,sv2_p2pool=info,sv2_p2pool_engine=info
+    volumes:
+      - ./config:/etc/sv2-p2pool:ro
+      - bitcoind-data:/var/lib/bitcoin:ro # for IPC socket access
+      - sv2p2pool-data:/var/lib/sv2-p2pool
+      - sv2p2pool-logs:/var/log/sv2-p2pool
+    ports:
+      - "34254:34254" # mining-protocol downstream listener
+      - "34264:34264" # JDP listener
+      - "9000:9000"   # /metrics
+
+volumes:
+  bitcoind-data:
+  sv2p2pool-data:
+  sv2p2pool-logs:
