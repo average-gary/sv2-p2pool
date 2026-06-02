@@ -144,6 +144,8 @@ When `--metrics-addr` is set, the pool exposes a Prometheus scrape target at `GE
 | `sv2_p2pool_engine_blocks_submitted_total` | Reconstructed blocks forwarded to `bitcoind.submit_block` |
 | `sv2_p2pool_engine_reorg_notifications_total` | `notify_share_chain_reorg` invocations |
 | `sv2_p2pool_engine_jobs_invalidated_total` | Cached `DeclaredJob`s dropped on share-chain reorg |
+| `sv2_p2pool_engine_declared_jobs_cache_size` | Current count of cached `DeclaredJob`s (gauge) |
+| `sv2_p2pool_engine_recent_solutions_buffer_size` | Current count of buffered share-finder credits (gauge) |
 
 The endpoint is HTTP/1.1 only (one request per connection) and has no authentication. Operators should put it behind a private network or reverse proxy, and configure their Prometheus scraper accordingly:
 

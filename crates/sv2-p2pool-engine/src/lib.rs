@@ -552,11 +552,18 @@ impl P2poolV2Engine {
     /// `RecentSolutions` evicts entries opportunistically inside
     /// [`RecentSolutions::take`]; this background task bounds memory
     /// for shares whose matching `SubmitSharesExtended` never arrives.
+    /// When [`EngineMetrics`] is wired, the same task also updates the
+    /// `declared_jobs_cache_size` and `recent_solutions_buffer_size`
+    /// gauges on each tick — gauges and the sweep run on the same
+    /// cadence so dashboards see fresh state right after each sweep
+    /// evicts.
     pub fn start_recent_solutions_sweeper(&mut self, interval: Duration) {
         if let Some(prev) = self.recent_solutions_sweeper.take() {
             prev.abort();
         }
         let buf = Arc::clone(&self.recent_solutions);
+        let cache = self.declared_jobs.clone();
+        let metrics = self.metrics.clone();
         let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             // Skip the immediate fire — the buffer just initialised.
@@ -564,6 +571,10 @@ impl P2poolV2Engine {
             loop {
                 ticker.tick().await;
                 buf.sweep();
+                if let Some(m) = metrics.as_ref() {
+                    m.declared_jobs_cache_size.set(cache.len() as i64);
+                    m.recent_solutions_buffer_size.set(buf.len() as i64);
+                }
             }
         });
         self.recent_solutions_sweeper = Some(handle);
@@ -830,6 +841,38 @@ mod tests {
             0,
             "sweeper should have evicted the expired entry"
         );
+
+        engine.stop_recent_solutions_sweeper();
+    }
+
+    #[tokio::test]
+    async fn engine_sweeper_updates_cache_size_gauges() {
+        use bitcoin::hashes::Hash as _;
+        use prometheus::Registry;
+
+        let registry = Registry::new();
+        let metrics = EngineMetrics::register(&registry).expect("register");
+        let mut engine =
+            P2poolV2Engine::new(bitcoin::Network::Regtest).with_metrics(metrics.clone());
+        // Long TTL so the buffer entry doesn't expire mid-test.
+        let buf = Arc::new(RecentSolutions::new(Duration::from_secs(10)));
+        engine.recent_solutions = buf.clone();
+
+        // Pre-populate both caches BEFORE the sweeper starts so the
+        // first tick reports the populated state.
+        engine.declared_jobs().insert(1, dummy_job(1));
+        engine.declared_jobs().insert(2, dummy_job(2));
+        buf.record(
+            BlockHash::from_byte_array([1u8; 32]),
+            BlockHash::from_byte_array([2u8; 32]),
+        );
+
+        engine.start_recent_solutions_sweeper(Duration::from_millis(20));
+        // Let the sweeper tick at least once.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        assert_eq!(metrics.declared_jobs_cache_size.get(), 2);
+        assert_eq!(metrics.recent_solutions_buffer_size.get(), 1);
 
         engine.stop_recent_solutions_sweeper();
     }

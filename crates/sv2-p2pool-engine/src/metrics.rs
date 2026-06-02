@@ -21,7 +21,7 @@
 //! monitoring server when one is configured; otherwise the engine
 //! constructs without metrics and `record_*` calls are no-ops.
 
-use prometheus::{IntCounter, Registry};
+use prometheus::{IntCounter, IntGauge, Registry};
 
 /// Counter set tracked by the engine. All counters are monotonic.
 ///
@@ -51,6 +51,14 @@ pub struct EngineMetrics {
     /// `DeclaredJob`s dropped on share-chain reorg, summed across all
     /// `notify_share_chain_reorg` invocations.
     pub jobs_invalidated_total: IntCounter,
+
+    /// Current size of the declared-jobs cache. Updated periodically
+    /// by the engine's stats sweeper task (same cadence as
+    /// [`crate::DEFAULT_RECENT_SOLUTIONS_SWEEP_INTERVAL`]).
+    pub declared_jobs_cache_size: IntGauge,
+    /// Current size of the recent-solutions buffer. Same update path
+    /// as `declared_jobs_cache_size`.
+    pub recent_solutions_buffer_size: IntGauge,
 }
 
 impl EngineMetrics {
@@ -94,10 +102,21 @@ impl EngineMetrics {
                 "sv2_p2pool_engine_jobs_invalidated_total",
                 "DeclaredJobs dropped on share-chain reorg",
             )?,
+            declared_jobs_cache_size: int_gauge(
+                "sv2_p2pool_engine_declared_jobs_cache_size",
+                "Current count of cached DeclaredJobs",
+            )?,
+            recent_solutions_buffer_size: int_gauge(
+                "sv2_p2pool_engine_recent_solutions_buffer_size",
+                "Current count of buffered share-finder credits",
+            )?,
         };
 
         for c in metrics.all_counters() {
             registry.register(Box::new(c.clone()))?;
+        }
+        for g in metrics.all_gauges() {
+            registry.register(Box::new(g.clone()))?;
         }
         Ok(metrics)
     }
@@ -115,10 +134,21 @@ impl EngineMetrics {
             &self.jobs_invalidated_total,
         ]
     }
+
+    fn all_gauges(&self) -> [&IntGauge; 2] {
+        [
+            &self.declared_jobs_cache_size,
+            &self.recent_solutions_buffer_size,
+        ]
+    }
 }
 
 fn int_counter(name: &str, help: &str) -> Result<IntCounter, prometheus::Error> {
     IntCounter::new(name, help)
+}
+
+fn int_gauge(name: &str, help: &str) -> Result<IntGauge, prometheus::Error> {
+    IntGauge::new(name, help)
 }
 
 #[cfg(test)]
@@ -132,8 +162,11 @@ mod tests {
         for c in metrics.all_counters() {
             assert_eq!(c.get(), 0);
         }
-        // Registry should now expose 9 collectors.
-        assert_eq!(registry.gather().len(), 9);
+        for g in metrics.all_gauges() {
+            assert_eq!(g.get(), 0);
+        }
+        // Registry should now expose 9 counters + 2 gauges = 11 collectors.
+        assert_eq!(registry.gather().len(), 11);
     }
 
     #[test]
