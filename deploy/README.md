@@ -7,6 +7,8 @@ Operator-oriented templates for installing `sv2-p2pool` as a long-running servic
 | Path | What it is |
 |---|---|
 | [`systemd/sv2-p2pool.service`](systemd/sv2-p2pool.service) | systemd unit for Linux hosts |
+| [`docker-compose.yml`](docker-compose.yml) | docker-compose stack: bitcoind + sv2-p2pool |
+| [`../Dockerfile`](../Dockerfile) | multi-stage build for the binary container |
 | [`config/pool.example.toml`](config/pool.example.toml) | sv2-apps `PoolConfig` example |
 | [`config/p2pool.example.toml`](config/p2pool.example.toml) | p2poolv2 share-chain config example |
 
@@ -66,6 +68,26 @@ Both `pool.toml` and `p2pool.toml` ship with placeholder values. Before going li
   - `[stratum].solo_address` / `bootstrap_address` — your payout address.
   - `[bitcoinrpc].username` / `password` — your bitcoind RPC creds.
   - `[network].dial_peers` — at least one peer multiaddr is required for share-chain participation (the empty list is for isolated test runs).
+
+## Quickstart (docker-compose)
+
+For an isolated all-in-one stack on a single host:
+
+```sh
+# 1. Edit deploy/config/{pool,p2pool}.example.toml in place
+#    (auth keys, payout addresses, bitcoinrpc creds — see notes below).
+
+# 2. Bring up the stack from the repo root.
+docker compose -f deploy/docker-compose.yml up -d
+
+# 3. Watch the logs while bitcoind syncs.
+docker compose -f deploy/docker-compose.yml logs -f sv2-p2pool
+
+# 4. Confirm metrics.
+curl http://127.0.0.1:9000/metrics
+```
+
+See [`docker-compose.yml`](docker-compose.yml) for the bitcoind multiprocess caveat — the upstream `bitcoin/bitcoin` image doesn't ship multiprocess support, so for IPC-mode operation you need to build bitcoind with `--enable-multiprocess` or use a community image that does.
 
 ## Prometheus scrape config
 
