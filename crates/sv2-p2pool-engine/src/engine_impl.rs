@@ -44,7 +44,7 @@ use stratum_apps::{
 };
 use tracing::{debug, info, warn};
 
-use crate::{DeclaredJob, P2poolV2Engine, TipMetadata, coinbase};
+use crate::{DeclaredJob, P2poolV2Engine, TipMetadata, coinbase, metrics::PushSolutionDropReason};
 
 #[async_trait]
 impl JobValidationEngine for P2poolV2Engine {
@@ -569,6 +569,9 @@ impl JobValidationEngine for P2poolV2Engine {
                 ntime = push_solution.ntime,
                 "PushSolution received (no TDP wired); recorded synthetic share hash"
             );
+            if let Some(m) = self.metrics() {
+                m.record_push_solution_drop(PushSolutionDropReason::NoHandles);
+            }
             return;
         };
 
@@ -596,6 +599,9 @@ impl JobValidationEngine for P2poolV2Engine {
                     version = push_solution.version,
                     "PushSolution: no cached DeclaredJob matches (prev_hash, nbits, version); ignoring"
                 );
+                if let Some(m) = self.metrics() {
+                    m.record_push_solution_drop(PushSolutionDropReason::NoMatchingJob);
+                }
                 return;
             }
         };
@@ -606,6 +612,9 @@ impl JobValidationEngine for P2poolV2Engine {
                     request_id,
                     "PushSolution: cached job vanished between find_by_solution and get; ignoring"
                 );
+                if let Some(m) = self.metrics() {
+                    m.record_push_solution_drop(PushSolutionDropReason::CacheRace);
+                }
                 return;
             }
         };
@@ -620,6 +629,9 @@ impl JobValidationEngine for P2poolV2Engine {
             );
             self.recent_solutions
                 .record(synthetic_share_hash, synthetic_share_hash);
+            if let Some(m) = self.metrics() {
+                m.record_push_solution_drop(PushSolutionDropReason::NoTemplateId);
+            }
             return;
         };
 
@@ -633,6 +645,9 @@ impl JobValidationEngine for P2poolV2Engine {
                     error = %e,
                     "PushSolution: RequestTransactionData failed; cannot reconstruct block"
                 );
+                if let Some(m) = self.metrics() {
+                    m.record_push_solution_drop(PushSolutionDropReason::TdpFetchFailed);
+                }
                 return;
             }
         };
@@ -647,6 +662,9 @@ impl JobValidationEngine for P2poolV2Engine {
                     error = %e,
                     "PushSolution: block reconstruction failed"
                 );
+                if let Some(m) = self.metrics() {
+                    m.record_push_solution_drop(PushSolutionDropReason::ReconstructFailed);
+                }
                 return;
             }
         };
@@ -1783,7 +1801,15 @@ mod tests {
     async fn push_solution_no_handles_records_synthetic_only() {
         // Without handles wired, push_solution stays in structural-only mode:
         // records synthetic→synthetic in RecentSolutions; never panics.
-        let engine = P2poolV2Engine::default();
+        // Also: increments push_solution_dropped_total{reason="no_handles"}.
+        use prometheus::Registry;
+
+        use crate::EngineMetrics;
+
+        let registry = Registry::new();
+        let metrics = EngineMetrics::register(&registry).expect("register");
+        let engine = P2poolV2Engine::default().with_metrics(metrics.clone());
+
         let extranonce: Vec<u8> = vec![0; 16];
         let push = PushSolution {
             extranonce: extranonce.try_into().expect("fits"),
@@ -1796,6 +1822,81 @@ mod tests {
         let len_before = engine.recent_solutions().len();
         engine.handle_push_solution(push).await;
         assert_eq!(engine.recent_solutions().len(), len_before + 1);
+        assert_eq!(
+            metrics
+                .push_solution_dropped
+                .with_label_values(&["no_handles"])
+                .get(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn push_solution_dropped_no_matching_job_increments_counter() {
+        // TDP wired but no DeclaredJob matches the PushSolution. The
+        // engine should bail at find_by_solution and bump the counter
+        // with reason="no_matching_job".
+        use std::sync::Arc;
+
+        use bitcoindrpc::{BitcoindLike, mock::MockBitcoind};
+        use p2poolv2_lib::test_utils::setup_test_chain_store_handle;
+        use prometheus::Registry;
+
+        use crate::{EngineHandles, EngineMetrics, TdpHandle};
+
+        let registry = Registry::new();
+        let metrics = EngineMetrics::register(&registry).expect("register");
+
+        let (chain, _tmpdir) = setup_test_chain_store_handle(false).await;
+        let mock_bitcoind = Arc::new(MockBitcoind::default());
+        let bitcoind: Arc<dyn BitcoindLike> = mock_bitcoind.clone();
+        let (req_tx, _req_rx) = async_channel::unbounded();
+        let tdp = TdpHandle::new(req_tx);
+
+        let handles = EngineHandles { chain, bitcoind };
+        let engine = P2poolV2Engine::with_handles(bitcoin::Network::Regtest, handles)
+            .with_tdp(tdp)
+            .with_metrics(metrics.clone());
+
+        // No DeclaredJob ever cached. Drive a PushSolution: the engine
+        // hits the find_by_solution → None path.
+        let push = PushSolution {
+            extranonce: vec![0xab; 16].try_into().expect("fits"),
+            prev_hash: [9u8; 32].to_vec().try_into().expect("32 bytes"),
+            ntime: 1_700_000_000,
+            nonce: 0xDEADBEEF,
+            nbits: 0x207fffff,
+            version: 0x20000000,
+        };
+        engine.handle_push_solution(push).await;
+
+        assert_eq!(
+            metrics
+                .push_solution_dropped
+                .with_label_values(&["no_matching_job"])
+                .get(),
+            1,
+            "no_matching_job arm should fire when no cached DeclaredJob exists"
+        );
+        // No block submission attempt — submitted_blocks is empty.
+        assert!(mock_bitcoind.submitted_blocks().is_empty());
+        // The other reasons stay at zero.
+        for other in [
+            "cache_race",
+            "no_template_id",
+            "tdp_fetch_failed",
+            "reconstruct_failed",
+            "no_handles",
+        ] {
+            assert_eq!(
+                metrics
+                    .push_solution_dropped
+                    .with_label_values(&[other])
+                    .get(),
+                0,
+                "reason={other} should stay at zero"
+            );
+        }
     }
 
     #[tokio::test]
