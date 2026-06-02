@@ -131,9 +131,9 @@ The binary uses sv2-apps's `init_logging`. With `--log-file` set, structured JSO
 
 ## Observability
 
-When `--metrics-addr` is set, the pool exposes a Prometheus scrape target at `GET /metrics`. The endpoint serves the engine's [`EngineMetrics`](../crates/sv2-p2pool-engine/src/metrics.rs) counters in the standard exposition format:
+When `--metrics-addr` is set, the pool exposes a Prometheus scrape target at `GET /metrics`. The endpoint serves the engine's [`EngineMetrics`](../crates/sv2-p2pool-engine/src/metrics.rs) collectors in the standard exposition format:
 
-| Counter | What it tracks |
+| Metric | What it tracks |
 |---|---|
 | `sv2_p2pool_engine_declare_mining_job_accepted_total` | Successful `DeclareMiningJob` exchanges |
 | `sv2_p2pool_engine_declare_mining_job_rejected_total` | `DeclareMiningJob` calls returning an `Error` code |

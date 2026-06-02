@@ -845,7 +845,7 @@ mod tests {
         engine.stop_recent_solutions_sweeper();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn engine_sweeper_updates_cache_size_gauges() {
         use bitcoin::hashes::Hash as _;
         use prometheus::Registry;
@@ -858,6 +858,10 @@ mod tests {
         let buf = Arc::new(RecentSolutions::new(Duration::from_secs(10)));
         engine.recent_solutions = buf.clone();
 
+        // Gauges start at zero before the sweeper has ticked.
+        assert_eq!(metrics.declared_jobs_cache_size.get(), 0);
+        assert_eq!(metrics.recent_solutions_buffer_size.get(), 0);
+
         // Pre-populate both caches BEFORE the sweeper starts so the
         // first tick reports the populated state.
         engine.declared_jobs().insert(1, dummy_job(1));
@@ -868,11 +872,24 @@ mod tests {
         );
 
         engine.start_recent_solutions_sweeper(Duration::from_millis(20));
-        // Let the sweeper tick at least once.
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        // Drive the paused clock past one tick; yield twice so the
+        // spawned sweeper task gets to run before we observe.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(25)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
 
         assert_eq!(metrics.declared_jobs_cache_size.get(), 2);
         assert_eq!(metrics.recent_solutions_buffer_size.get(), 1);
+
+        // Shrink the declared-jobs cache and verify the gauge decrements
+        // on the next tick — this is the whole point of using IntGauge
+        // over IntCounter.
+        engine.declared_jobs().remove(&1);
+        tokio::time::advance(Duration::from_millis(25)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(metrics.declared_jobs_cache_size.get(), 1);
 
         engine.stop_recent_solutions_sweeper();
     }

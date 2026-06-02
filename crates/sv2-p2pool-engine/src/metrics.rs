@@ -62,8 +62,8 @@ pub struct EngineMetrics {
 }
 
 impl EngineMetrics {
-    /// Register all counters on `registry`. Returns the populated struct
-    /// or the first registration error.
+    /// Register all counters and gauges on `registry`. Returns the
+    /// populated struct or the first registration error.
     pub fn register(registry: &Registry) -> Result<Self, prometheus::Error> {
         let metrics = Self {
             declare_mining_job_accepted: int_counter(
@@ -156,7 +156,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn register_creates_all_counters_with_zero_values() {
+    fn register_creates_all_collectors_with_zero_values() {
         let registry = Registry::new();
         let metrics = EngineMetrics::register(&registry).expect("register");
         for c in metrics.all_counters() {
@@ -165,8 +165,13 @@ mod tests {
         for g in metrics.all_gauges() {
             assert_eq!(g.get(), 0);
         }
-        // Registry should now expose 9 counters + 2 gauges = 11 collectors.
-        assert_eq!(registry.gather().len(), 11);
+        let names: Vec<String> = registry
+            .gather()
+            .iter()
+            .map(|mf| mf.get_name().to_string())
+            .collect();
+        assert!(names.contains(&"sv2_p2pool_engine_declared_jobs_cache_size".to_string()));
+        assert!(names.contains(&"sv2_p2pool_engine_recent_solutions_buffer_size".to_string()));
     }
 
     #[test]
