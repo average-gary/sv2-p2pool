@@ -676,10 +676,16 @@ impl JobValidationEngine for P2poolV2Engine {
                     m.blocks_submitted.inc();
                 }
                 let bitcoind = handles.bitcoind.clone();
+                let metrics = self.metrics().cloned();
                 tokio::spawn(async move {
                     match bitcoind.submit_block(&block).await {
                         Ok(reply) => info!(%block_hash, %reply, "submit_block returned"),
-                        Err(e) => warn!(%block_hash, error = %e, "submit_block failed"),
+                        Err(e) => {
+                            warn!(%block_hash, error = %e, "submit_block failed");
+                            if let Some(m) = metrics.as_ref() {
+                                m.blocks_submit_failed.inc();
+                            }
+                        }
                     }
                 });
             }
@@ -1431,6 +1437,180 @@ mod tests {
 
         // RecentSolutions records the synthetic→real_block_hash edge.
         assert!(!engine.recent_solutions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn push_solution_increments_submit_failed_counter_on_bitcoind_error() {
+        use std::sync::Arc;
+
+        use async_trait::async_trait;
+        use bitcoin::hashes::Hash as _;
+        use bitcoindrpc::{BitcoindLike, BitcoindRpcError, GetBlockchainInfo};
+        use p2poolv2_lib::test_utils::setup_test_chain_store_handle;
+        use prometheus::Registry;
+        use stratum_apps::stratum_core::{
+            binary_sv2::{B016M, Seq064K, Seq0255},
+            job_declaration_sv2::ProvideMissingTransactionsSuccess,
+            parsers_sv2::TemplateDistribution,
+            template_distribution_sv2::{
+                NewTemplate, RequestTransactionDataSuccess, SetNewPrevHash,
+            },
+        };
+
+        use crate::{EngineHandles, EngineMetrics, TdpHandle, tdp::TxDataResult};
+
+        // submit_block always returns Err; everything else falls through
+        // to "unscripted" but the test path only touches submit_block.
+        struct FailingBitcoind;
+
+        #[async_trait]
+        impl BitcoindLike for FailingBitcoind {
+            async fn get_difficulty(&self) -> Result<f64, BitcoindRpcError> {
+                Ok(1.0)
+            }
+            async fn getblockchaininfo(&self) -> Result<GetBlockchainInfo, BitcoindRpcError> {
+                Ok(GetBlockchainInfo {
+                    initial_block_download: false,
+                })
+            }
+            async fn getblocktemplate(
+                &self,
+                _network: bitcoin::Network,
+            ) -> Result<String, BitcoindRpcError> {
+                Ok("{}".to_string())
+            }
+            async fn decoderawtransaction(
+                &self,
+                tx: &bitcoin::Transaction,
+            ) -> Result<bitcoin::Transaction, BitcoindRpcError> {
+                Ok(tx.clone())
+            }
+            async fn submit_block(
+                &self,
+                _block: &bitcoin::Block,
+            ) -> Result<String, BitcoindRpcError> {
+                Err(BitcoindRpcError::Other("simulated rpc failure".to_string()))
+            }
+            async fn validate_block_proposal(
+                &self,
+                _block: &bitcoin::Block,
+            ) -> Result<bool, BitcoindRpcError> {
+                Ok(false)
+            }
+        }
+
+        let registry = Registry::new();
+        let metrics = EngineMetrics::register(&registry).expect("register");
+
+        let (chain, _tmpdir) = setup_test_chain_store_handle(false).await;
+        let bitcoind: Arc<dyn BitcoindLike> = Arc::new(FailingBitcoind);
+        let (req_tx, req_rx) = async_channel::unbounded();
+        let tdp = TdpHandle::new(req_tx);
+
+        let tip_prev_hash_bytes = [9u8; 32];
+        let tip_nbits: u32 = 0x207fffff;
+        let tip_min_ntime: u32 = 1_700_000_000;
+        let template_id: u64 = 12345;
+
+        tdp.record_set_new_prev_hash(SetNewPrevHash {
+            template_id,
+            prev_hash: tip_prev_hash_bytes.to_vec().try_into().expect("32 bytes"),
+            header_timestamp: tip_min_ntime,
+            n_bits: tip_nbits,
+            target: [0u8; 32].to_vec().try_into().expect("32 bytes"),
+        });
+        tdp.record_new_template(NewTemplate {
+            template_id,
+            future_template: false,
+            version: 0x20000000,
+            coinbase_tx_version: 2,
+            coinbase_prefix: Vec::<u8>::new().try_into().expect("empty fits"),
+            coinbase_tx_input_sequence: 0xffff_ffff,
+            coinbase_tx_value_remaining: 50_0000_0000,
+            coinbase_tx_outputs_count: 0,
+            coinbase_tx_outputs: Vec::<u8>::new().try_into().expect("empty fits"),
+            coinbase_tx_locktime: 0,
+            merkle_path: Seq0255::new(Vec::new()).expect("empty fits"),
+        });
+
+        let handles = EngineHandles { chain, bitcoind };
+        let engine = P2poolV2Engine::with_handles(bitcoin::Network::Regtest, handles)
+            .with_tdp(tdp.clone())
+            .with_metrics(metrics.clone());
+
+        let cb = build_coinbase(vec![0; 16]);
+        let (prefix, suffix) = split_coinbase(&cb, 16);
+        let fake_tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from_bytes(vec![1, 2, 3, 4]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::ZERO,
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let wtxid_bytes: [u8; 32] = *fake_tx.compute_wtxid().as_byte_array();
+        let serialized_tx = bitcoin::consensus::serialize(&fake_tx);
+        let tx_bytes_for_pmts: B016M<'static> = serialized_tx.clone().try_into().expect("fits");
+        let pmts = ProvideMissingTransactionsSuccess {
+            request_id: 7,
+            transaction_list: Seq064K::new(vec![tx_bytes_for_pmts]).expect("fits"),
+        };
+
+        let demux_tdp = tdp.clone();
+        let stub_tx_body = serialized_tx.clone();
+        tokio::spawn(async move {
+            while let Ok(req) = req_rx.recv().await {
+                if let TemplateDistribution::RequestTransactionData(r) = req {
+                    let body: B016M<'static> = stub_tx_body.clone().try_into().expect("fits");
+                    let success = RequestTransactionDataSuccess {
+                        template_id: r.template_id,
+                        excess_data: Vec::<u8>::new().try_into().expect("empty fits"),
+                        transaction_list: Seq064K::new(vec![body]).expect("fits"),
+                    };
+                    demux_tdp.deliver_response(r.template_id, TxDataResult::Success(success));
+                }
+            }
+        });
+
+        let declare = build_declare_mining_job(
+            7,
+            99,
+            0x20000000,
+            prefix.clone(),
+            suffix.clone(),
+            vec![wtxid_bytes],
+        );
+        let result = engine.handle_declare_mining_job(declare, Some(pmts)).await;
+        assert!(matches!(result, DeclareMiningJobResult::Success));
+
+        let push = PushSolution {
+            extranonce: vec![0xab; 16].try_into().expect("fits"),
+            prev_hash: tip_prev_hash_bytes.to_vec().try_into().expect("32 bytes"),
+            ntime: tip_min_ntime,
+            nonce: 0xDEADBEEF,
+            nbits: tip_nbits,
+            version: 0x20000000,
+        };
+        engine.handle_push_solution(push).await;
+
+        // Wait for the spawned submit_block task to land its Err arm.
+        for _ in 0..40 {
+            if metrics.blocks_submit_failed.get() > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        assert_eq!(metrics.blocks_submit_failed.get(), 1);
+        // The "we tried" counter still increments — both should be 1.
+        assert_eq!(metrics.blocks_submitted.get(), 1);
     }
 
     #[tokio::test]
