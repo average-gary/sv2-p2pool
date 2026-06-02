@@ -42,7 +42,7 @@ pub use coinbase::{
     CoinbaseReconstructError, merkle_path, reconstruct_coinbase,
     reconstruct_coinbase_with_extranonce,
 };
-pub use metrics::EngineMetrics;
+pub use metrics::{EngineMetrics, PushSolutionDropReason};
 pub use recent_solutions::RecentSolutions;
 pub use reorg_detector::{DEFAULT_POLL_PERIOD, ReorgDetector};
 pub use tdp::{TdpError, TdpHandle, TxDataResult};

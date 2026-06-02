@@ -21,7 +21,50 @@
 //! monitoring server when one is configured; otherwise the engine
 //! constructs without metrics and `record_*` calls are no-ops.
 
-use prometheus::{IntCounter, IntGauge, Registry};
+use prometheus::{IntCounter, IntCounterVec, IntGauge, Opts, Registry};
+
+/// Stable `reason` label values for [`EngineMetrics::push_solution_dropped`].
+///
+/// Each variant maps to one early-exit path in
+/// [`crate::P2poolV2Engine::handle_push_solution`]. The strings are
+/// part of the public metrics surface — operators write Prometheus
+/// queries against them — so they are versioned with the same care as
+/// metric names.
+#[derive(Debug, Clone, Copy)]
+pub enum PushSolutionDropReason {
+    /// `find_by_solution` did not match any cached `DeclaredJob`.
+    /// Either a stale share or a job that was reorg-invalidated
+    /// before the solution arrived.
+    NoMatchingJob,
+    /// `find_by_solution` matched a request_id but `get` returned
+    /// `None` — the cache was mutated between the two calls.
+    CacheRace,
+    /// Cached `DeclaredJob` was declared before TDP populated a
+    /// `template_id`. Without it the engine cannot fetch tx bodies.
+    NoTemplateId,
+    /// `TdpHandle::request_tx_bodies` returned an error (TP timeout,
+    /// `RequestTransactionDataError`, etc.).
+    TdpFetchFailed,
+    /// `block::reconstruct_block` returned an error (merkle mismatch,
+    /// coinbase reconstruction failure).
+    ReconstructFailed,
+    /// `EngineHandles` not wired (Phase 2.5a / unit tests). Solution
+    /// is recorded as synthetic credit only.
+    NoHandles,
+}
+
+impl PushSolutionDropReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoMatchingJob => "no_matching_job",
+            Self::CacheRace => "cache_race",
+            Self::NoTemplateId => "no_template_id",
+            Self::TdpFetchFailed => "tdp_fetch_failed",
+            Self::ReconstructFailed => "reconstruct_failed",
+            Self::NoHandles => "no_handles",
+        }
+    }
+}
 
 /// Counter set tracked by the engine. All counters are monotonic.
 ///
@@ -59,6 +102,12 @@ pub struct EngineMetrics {
     /// `DeclaredJob`s dropped on share-chain reorg, summed across all
     /// `notify_share_chain_reorg` invocations.
     pub jobs_invalidated_total: IntCounter,
+
+    /// `PushSolution` messages that did not result in a `submit_block`
+    /// attempt, broken down by `reason`. The label values are stable
+    /// strings (see [`PushSolutionDropReason`]) so dashboards can sum
+    /// across them or break out individual failure modes.
+    pub push_solution_dropped: IntCounterVec,
 
     /// Current size of the declared-jobs cache. Updated periodically
     /// by the engine's stats sweeper task (same cadence as
@@ -131,6 +180,13 @@ impl EngineMetrics {
                 "sv2_p2pool_engine_sweeper_last_run_timestamp_seconds",
                 "Unix epoch seconds of the most recent recent-solutions sweeper tick (0 = never)",
             )?,
+            push_solution_dropped: IntCounterVec::new(
+                Opts::new(
+                    "sv2_p2pool_engine_push_solution_dropped_total",
+                    "PushSolution messages that did not result in a submit_block attempt",
+                ),
+                &["reason"],
+            )?,
         };
 
         for c in metrics.all_counters() {
@@ -139,7 +195,33 @@ impl EngineMetrics {
         for g in metrics.all_gauges() {
             registry.register(Box::new(g.clone()))?;
         }
+        registry.register(Box::new(metrics.push_solution_dropped.clone()))?;
+
+        // Pre-create one child per known reason so the labels show at
+        // zero in /metrics from boot — operator dashboards don't have
+        // to special-case "label not yet present".
+        for reason in [
+            PushSolutionDropReason::NoMatchingJob,
+            PushSolutionDropReason::CacheRace,
+            PushSolutionDropReason::NoTemplateId,
+            PushSolutionDropReason::TdpFetchFailed,
+            PushSolutionDropReason::ReconstructFailed,
+            PushSolutionDropReason::NoHandles,
+        ] {
+            metrics
+                .push_solution_dropped
+                .with_label_values(&[reason.as_str()]);
+        }
+
         Ok(metrics)
+    }
+
+    /// Increment the `push_solution_dropped_total{reason}` counter for
+    /// the given reason.
+    pub fn record_push_solution_drop(&self, reason: PushSolutionDropReason) {
+        self.push_solution_dropped
+            .with_label_values(&[reason.as_str()])
+            .inc();
     }
 
     fn all_counters(&self) -> [&IntCounter; 10] {
