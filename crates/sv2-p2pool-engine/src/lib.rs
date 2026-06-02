@@ -574,6 +574,11 @@ impl P2poolV2Engine {
                 if let Some(m) = metrics.as_ref() {
                     m.declared_jobs_cache_size.set(cache.len() as i64);
                     m.recent_solutions_buffer_size.set(buf.len() as i64);
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    m.sweeper_last_run_timestamp_seconds.set(now);
                 }
             }
         });
@@ -861,6 +866,7 @@ mod tests {
         // Gauges start at zero before the sweeper has ticked.
         assert_eq!(metrics.declared_jobs_cache_size.get(), 0);
         assert_eq!(metrics.recent_solutions_buffer_size.get(), 0);
+        assert_eq!(metrics.sweeper_last_run_timestamp_seconds.get(), 0);
 
         // Pre-populate both caches BEFORE the sweeper starts so the
         // first tick reports the populated state.
@@ -881,6 +887,14 @@ mod tests {
 
         assert_eq!(metrics.declared_jobs_cache_size.get(), 2);
         assert_eq!(metrics.recent_solutions_buffer_size.get(), 1);
+        // Liveness gauge moved off zero — proving the sweeper actually
+        // ran (and not just that the cache was inspected by something
+        // else). Don't assert an exact value: paused tokio time doesn't
+        // pause SystemTime, but the relative check is enough.
+        assert!(
+            metrics.sweeper_last_run_timestamp_seconds.get() > 0,
+            "sweeper liveness gauge should have moved off zero"
+        );
 
         // Shrink the declared-jobs cache and verify the gauge decrements
         // on the next tick — this is the whole point of using IntGauge
