@@ -1,16 +1,22 @@
-//! Tiny HTTP `/metrics` endpoint that scrapes a `prometheus::Registry`.
+//! Tiny HTTP `/metrics` + `/healthz` endpoint that scrapes a
+//! `prometheus::Registry`.
 //!
 //! Mounting any of `hyper` / `axum` / `warp` here would pull in a
-//! large transitive dep tree just to render a single endpoint. The
+//! large transitive dep tree just to render two endpoints. The
 //! Prometheus exposition format is plain text over HTTP/1.1; a manual
-//! handler in ~50 lines does the job and stays isolated from the rest
-//! of the pool's runtime.
+//! handler does the job and stays isolated from the rest of the
+//! pool's runtime.
 //!
 //! ## What it serves
 //!
 //! - `GET /metrics` → 200, `Content-Type: text/plain; version=0.0.4`,
 //!   body is whatever `TextEncoder::encode_to_string(&registry.gather())`
 //!   returns.
+//! - `GET /healthz` → 200, `Content-Type: text/plain`, body `"ok\n"`.
+//!   Process-liveness probe for orchestrators (k8s liveness,
+//!   docker `healthcheck`). Does NOT validate downstream connections
+//!   like bitcoind or the share-chain — that's a readiness concern
+//!   and would need a richer signal than this endpoint provides.
 //! - Anything else → 404.
 //!
 //! ## What it does NOT do
@@ -113,6 +119,12 @@ async fn handle_one(mut stream: TcpStream, registry: &Registry) -> std::io::Resu
         }
         let content_type = TextEncoder::new().format_type().to_string();
         write_status(&mut stream, 200, content_type.as_bytes(), &body).await?;
+    } else if path == "/healthz" {
+        // Process-liveness only — if this handler runs, the process
+        // is by definition alive and accepting TCP. Orchestrators that
+        // need a richer "ready to serve" signal should layer their own
+        // check on top (e.g. probe the mining-protocol port).
+        write_status(&mut stream, 200, b"text/plain", b"ok\n").await?;
     } else {
         write_status(&mut stream, 404, b"text/plain", b"not found\n").await?;
     }
@@ -205,6 +217,24 @@ mod tests {
             .await
             .expect("fetch within timeout");
         assert_eq!(status_404, 404);
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn healthz_endpoint_returns_ok() {
+        let registry = Registry::new();
+        let (addr, handle) =
+            spawn_metrics_endpoint(SocketAddr::from(([127, 0, 0, 1], 0)), registry)
+                .await
+                .expect("spawn");
+
+        let (status, body) = tokio::time::timeout(Duration::from_secs(2), fetch(addr, "/healthz"))
+            .await
+            .expect("fetch within timeout");
+        assert_eq!(status, 200);
+        assert_eq!(body, "ok\n");
 
         handle.abort();
         let _ = handle.await;
