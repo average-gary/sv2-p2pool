@@ -28,10 +28,16 @@
 //!
 //! ## Status
 //!
-//! The p2poolv2 server-side handler currently returns placeholder
-//! responses for every method. Real share-chain integration on the
-//! server is a follow-up PR; the client surface here is stable and
-//! ready to swap into the engine once that lands.
+//! - [`Sv2P2poolIpcClient::submit_solution`] — server-side performs a
+//!   real `shareHash == block_hash()` consistency check (deserialises
+//!   the rawBlock, recomputes the hash, rejects on mismatch). Client
+//!   surface unchanged.
+//! - [`Sv2P2poolIpcClient::validate_template`] /
+//!   [`Sv2P2poolIpcClient::subscribe_chain_tip`] — server-side still
+//!   placeholder stubs awaiting a `ChainStoreHandle` plumbed into the
+//!   IPC server, plus (for tip subscription) a tip-change broadcast
+//!   channel inside `p2poolv2_lib::shares::chain` that does not yet
+//!   exist.
 
 #![forbid(unsafe_code)]
 
@@ -312,7 +318,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_solution_round_trips_against_stub() {
+    async fn submit_solution_accepts_when_share_hash_matches_block_hash() {
+        // Phase 2-B unblock: submit_solution is no longer a pure stub.
+        // Server-side now deserialises rawBlock, recomputes block_hash,
+        // and verifies it matches the claimed shareHash. This test
+        // exercises that round-trip end-to-end across a Unix socket.
+        use bitcoin::hashes::Hash as _;
+
         let (_dir, sock) = temp_socket();
         let _server = p2poolv2_ipc::spawn_ipc_server(sock.clone());
 
@@ -322,11 +334,45 @@ mod tests {
                 wait_for_socket(&sock, Duration::from_secs(2)).await;
                 let client = Sv2P2poolIpcClient::connect(&sock).await.expect("connect");
 
-                // Round-trip: any boolean response is acceptable.
-                let _accepted = client
-                    .submit_solution(&[0u8; 80], &[0u8; 32])
+                let block = bitcoin::Block {
+                    header: bitcoin::blockdata::block::Header {
+                        version: bitcoin::blockdata::block::Version::from_consensus(1),
+                        prev_blockhash: bitcoin::BlockHash::from_raw_hash(
+                            bitcoin::hashes::Hash::all_zeros(),
+                        ),
+                        merkle_root: bitcoin::TxMerkleNode::from_raw_hash(
+                            bitcoin::hashes::Hash::all_zeros(),
+                        ),
+                        time: 1_700_000_000,
+                        bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
+                        nonce: 42,
+                    },
+                    txdata: vec![],
+                };
+                let raw = bitcoin::consensus::serialize(&block);
+                let block_hash = *block.block_hash().as_raw_hash().as_byte_array();
+
+                let accepted = client
+                    .submit_solution(&raw, &block_hash)
                     .await
                     .expect("submit_solution ok");
+                assert!(accepted, "matching shareHash MUST be accepted");
+
+                // And the rejection path: same block, wrong shareHash.
+                let mut bad_share = block_hash;
+                bad_share[0] ^= 0xff;
+                let accepted_bad = client
+                    .submit_solution(&raw, &bad_share)
+                    .await
+                    .expect("submit_solution ok");
+                assert!(!accepted_bad, "shareHash != block_hash MUST be rejected");
+
+                // And the deserialise-failure path: garbage rawBlock.
+                let accepted_garbage = client
+                    .submit_solution(b"definitely not a block", &block_hash)
+                    .await
+                    .expect("submit_solution ok");
+                assert!(!accepted_garbage, "unparseable rawBlock MUST be rejected");
             })
             .await;
     }
