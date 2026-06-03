@@ -183,5 +183,7 @@ p2poolv2's genesis builder supports **Bitcoin / Testnet4 / Signet**. **Regtest i
 |---|---|---|
 | `share-chain bootstrap: failed to open rocksdb store` | rocksdb lock held by another process | stop the other p2poolv2 / sv2-p2pool, or move `[store].path` to a free location |
 | `share-chain bootstrap: failed to construct bitcoind RPC client` | wrong creds or bitcoind not reachable | verify `[bitcoinrpc] url/username/password` against `bitcoin-cli getrpcinfo` |
+| `bitcoind getblockchaininfo failed at boot` (warn) | bitcoind not running yet, wrong creds, wrong URL | non-fatal — pool continues, but `submit_block` will fail until bitcoind is reachable. Verify `[bitcoinrpc] url/username/password`; restart pool after fixing for a clean log. |
+| `bitcoind getblockchaininfo timed out after 3s` (warn) | bitcoind slow to respond / network issue | non-fatal; same as above. If persistent, investigate bitcoind load or network path. |
 | `[jds] config is required for sv2-p2pool` | missing `[jds]` section in `pool.toml` | add `[jds]` with at least `listen_address` |
 | `Network Testnet and Regtest not yet supported` | tried `network = "regtest"` in `p2pool.toml` | switch to `testnet4` or `signet` (see "Networks" above) |

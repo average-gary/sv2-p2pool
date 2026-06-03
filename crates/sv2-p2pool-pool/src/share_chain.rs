@@ -35,7 +35,7 @@ use p2poolv2_lib::{
 };
 use sv2_p2pool_engine::EngineHandles;
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Errors from share-chain bootstrap.
 #[derive(Debug, thiserror::Error)]
@@ -123,6 +123,45 @@ pub async fn bootstrap_share_chain(
     let bitcoind_client = BitcoindRpcClient::new(&rpc.url, &rpc.username, &rpc.password)
         .map_err(ShareChainBootstrapError::BitcoindClient)?;
     let bitcoind: Arc<dyn BitcoindLike> = Arc::new(bitcoind_client);
+
+    // 4b. Best-effort probe: call getblockchaininfo with a short
+    // timeout. BitcoindRpcClient::new only constructs the HTTP
+    // client; without an actual round-trip we don't know whether the
+    // creds + URL are correct or whether bitcoind is reachable. A
+    // misconfigured pool would otherwise boot happily and only fail
+    // on the first found block (worst possible time).
+    //
+    // Non-fatal on purpose: operators may start the pool before
+    // bitcoind is ready, or restart bitcoind without restarting the
+    // pool. On probe failure we log a warning and continue; the next
+    // real call will retry naturally.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        bitcoind.getblockchaininfo(),
+    )
+    .await
+    {
+        Ok(Ok(info)) => {
+            info!(
+                bitcoinrpc_url = %rpc.url,
+                initial_block_download = info.initial_block_download,
+                "bitcoind reachable at boot"
+            );
+        }
+        Ok(Err(e)) => {
+            warn!(
+                bitcoinrpc_url = %rpc.url,
+                error = %e,
+                "bitcoind getblockchaininfo failed at boot — pool will continue but submit_block will fail until bitcoind is reachable"
+            );
+        }
+        Err(_) => {
+            warn!(
+                bitcoinrpc_url = %rpc.url,
+                "bitcoind getblockchaininfo timed out after 3s — pool will continue but submit_block will fail until bitcoind is reachable"
+            );
+        }
+    }
 
     info!("share-chain bootstrap: handles ready");
     Ok(ShareChainHandles {
