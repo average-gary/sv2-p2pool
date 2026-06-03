@@ -40,7 +40,7 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        ca-certificates libssl3 libcapnp-1.0.1 \
+        ca-certificates libssl3 libcapnp-1.0.1 wget \
     && rm -rf /var/lib/apt/lists/* && \
     useradd --system --home-dir /var/lib/sv2-p2pool --shell /usr/sbin/nologin sv2-p2pool && \
     mkdir -p /etc/sv2-p2pool /var/lib/sv2-p2pool /var/log/sv2-p2pool && \
@@ -53,6 +53,13 @@ WORKDIR /var/lib/sv2-p2pool
 
 # Mining + JDS + metrics ports (match deploy/config/pool.example.toml).
 EXPOSE 34254 34264 9000
+
+# Process-liveness probe. /healthz returns 200 OK while the metrics
+# server (and thus the parent process) is alive. Default CMD binds
+# /metrics on 0.0.0.0:9000; if the operator overrides --metrics-addr
+# to a different port they should also override this HEALTHCHECK.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD wget --quiet --spider http://127.0.0.1:9000/healthz || exit 1
 
 ENTRYPOINT ["/usr/local/bin/sv2-p2pool"]
 CMD [ \
