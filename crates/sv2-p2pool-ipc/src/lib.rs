@@ -28,17 +28,23 @@
 //!
 //! ## Status
 //!
-//! - [`Sv2P2poolIpcClient::submit_solution`] — server-side performs a
-//!   real `shareHash == block_hash()` consistency check (deserialises
-//!   the rawBlock, recomputes the hash, rejects on mismatch).
-//! - [`Sv2P2poolIpcClient::subscribe_chain_tip`] — server-side fans out
-//!   tip changes from a `tokio::sync::watch::Receiver<BlockHash>` when
+//! All three IPC server methods now perform real work:
+//!
+//! - [`Sv2P2poolIpcClient::validate_template`] — structural pre-check
+//!   (glues prefix+suffix and confirms it parses as a
+//!   `bitcoin::Transaction`). Returns `InvalidCoinbase(<reason>)` on
+//!   parse failure, `Ok` otherwise. Full share-chain admission
+//!   (coinbase value, wtxid commitment) still requires a
+//!   `ChainStoreHandle` plumbed into the daemon.
+//! - [`Sv2P2poolIpcClient::submit_solution`] — real
+//!   `shareHash == block_hash()` consistency check (deserialises the
+//!   rawBlock, recomputes the hash, rejects on mismatch).
+//! - [`Sv2P2poolIpcClient::subscribe_chain_tip`] — fans out tip
+//!   changes from a `tokio::sync::watch::Receiver<BlockHash>` when
 //!   the daemon launched the server with
 //!   `spawn_ipc_server_with_tip_source(path, Some(rx))`. Without a
 //!   wired tip source, the server preserves the original stub
 //!   behaviour (subscriptions accepted but never fire).
-//! - [`Sv2P2poolIpcClient::validate_template`] — server-side is still
-//!   a placeholder stub awaiting a `ChainStoreHandle` in the daemon.
 
 #![forbid(unsafe_code)]
 
@@ -289,7 +295,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_template_round_trips_against_stub() {
+    async fn validate_template_rejects_unparseable_coinbase_via_uds() {
+        // Phase 2-B: validate_template performs a structural pre-check.
+        // Garbage prefix+suffix bytes do NOT deserialize as a
+        // bitcoin::Transaction, so the server must return
+        // InvalidCoinbase(<reason>). End-to-end across UDS.
         let (_dir, sock) = temp_socket();
         let _server = p2poolv2_ipc::spawn_ipc_server(sock.clone());
 
@@ -299,21 +309,67 @@ mod tests {
                 wait_for_socket(&sock, Duration::from_secs(2)).await;
                 let client = Sv2P2poolIpcClient::connect(&sock).await.expect("connect");
 
-                // Stub returns Ok for any input — we just verify the
-                // round-trip succeeds and the union decodes.
                 let outcome = client
                     .validate_template(b"prefix", b"suffix", &[], &[])
                     .await
                     .expect("validate_template ok");
                 match outcome {
-                    ValidationOutcome::Ok
-                    | ValidationOutcome::StaleChainTip
-                    | ValidationOutcome::InvalidCoinbase(_)
-                    | ValidationOutcome::MissingTransactions(_) => {
-                        // Any decoded variant is acceptable — the stub's
-                        // policy isn't this client's responsibility.
+                    ValidationOutcome::InvalidCoinbase(reason) => {
+                        assert!(
+                            reason.contains("did not parse"),
+                            "expected reason text to mention parse failure; got {reason}"
+                        );
                     }
+                    other => panic!("expected InvalidCoinbase, got {other:?}"),
                 }
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn validate_template_accepts_real_coinbase_via_uds() {
+        // Build a valid coinbase tx, split at midpoint, drive the RPC.
+        // The server's structural pre-check must accept it (Ok variant).
+        use bitcoin::hashes::Hash as _;
+
+        let (_dir, sock) = temp_socket();
+        let _server = p2poolv2_ipc::spawn_ipc_server(sock.clone());
+
+        let coinbase = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from_bytes(vec![0u8; 16]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(50_0000_0000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        // Touch a hash trait method so the import isn't dead.
+        let _ = coinbase.compute_txid().as_raw_hash().as_byte_array();
+        let serialized = bitcoin::consensus::serialize(&coinbase);
+        let split = serialized.len() / 2;
+        let prefix = serialized[..split].to_vec();
+        let suffix = serialized[split..].to_vec();
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                wait_for_socket(&sock, Duration::from_secs(2)).await;
+                let client = Sv2P2poolIpcClient::connect(&sock).await.expect("connect");
+
+                let outcome = client
+                    .validate_template(&prefix, &suffix, &[], &[])
+                    .await
+                    .expect("validate_template ok");
+                assert!(
+                    matches!(outcome, ValidationOutcome::Ok),
+                    "expected Ok for a parseable coinbase; got {outcome:?}"
+                );
             })
             .await;
     }
