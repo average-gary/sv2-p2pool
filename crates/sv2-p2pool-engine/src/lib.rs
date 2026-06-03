@@ -516,7 +516,12 @@ impl P2poolV2Engine {
         let invalidator = detector.subscribe();
 
         let cache = self.declared_jobs.clone();
-        let invalidator_handle = tokio::spawn(reorg_invalidator_loop(invalidator, cache));
+        let metrics_for_invalidator = self.metrics.clone();
+        let invalidator_handle = tokio::spawn(reorg_invalidator_loop(
+            invalidator,
+            cache,
+            metrics_for_invalidator,
+        ));
         let detector_handle = tokio::spawn(detector.run());
 
         // Wrap both handles into a single supervisor: aborting the supervisor
@@ -611,11 +616,22 @@ impl Default for P2poolV2Engine {
 /// Drains tip-change broadcasts and invalidates the cache for each.
 ///
 /// Lives outside `P2poolV2Engine` so the spawned task doesn't borrow `self`.
-async fn reorg_invalidator_loop(mut rx: broadcast::Receiver<BlockHash>, cache: DeclaredJobCache) {
+/// Bumps `reorg_notifications_total` and `jobs_invalidated_total` on every
+/// real reorg event AND on the lagged-broadcast defensive-flush path —
+/// both reflect "operator-visible reorg activity that dropped jobs."
+async fn reorg_invalidator_loop(
+    mut rx: broadcast::Receiver<BlockHash>,
+    cache: DeclaredJobCache,
+    metrics: Option<EngineMetrics>,
+) {
     loop {
         match rx.recv().await {
             Ok(new_tip) => {
                 let dropped = cache.invalidate_all();
+                if let Some(m) = metrics.as_ref() {
+                    m.reorg_notifications.inc();
+                    m.jobs_invalidated_total.inc_by(dropped as u64);
+                }
                 info!(
                     new_tip = %new_tip,
                     dropped,
@@ -626,6 +642,10 @@ async fn reorg_invalidator_loop(mut rx: broadcast::Receiver<BlockHash>, cache: D
                 // We missed `n` events but the bounded broadcast caught up.
                 // Conservatively flush — we don't know which tip we're at.
                 let dropped = cache.invalidate_all();
+                if let Some(m) = metrics.as_ref() {
+                    m.reorg_notifications.inc();
+                    m.jobs_invalidated_total.inc_by(dropped as u64);
+                }
                 warn!(
                     missed = n,
                     dropped,
@@ -949,6 +969,69 @@ mod tests {
         assert!(
             engine.declared_jobs().is_empty(),
             "cache should be flushed after tip change"
+        );
+
+        engine.stop_reorg_watcher();
+    }
+
+    /// Regression test: the reorg watcher's invalidator loop must bump
+    /// `reorg_notifications_total` and `jobs_invalidated_total` on every
+    /// detected tip change. Earlier code only bumped these inside
+    /// `JobValidationEngine::notify_share_chain_reorg`, which the
+    /// production reorg watcher never calls — so both counters were
+    /// permanently stuck at zero in production.
+    #[tokio::test(start_paused = true)]
+    async fn engine_reorg_watcher_bumps_metrics_on_tip_change() {
+        use prometheus::Registry;
+
+        let registry = Registry::new();
+        let metrics = EngineMetrics::register(&registry).expect("register");
+        let mut engine =
+            P2poolV2Engine::new(bitcoin::Network::Regtest).with_metrics(metrics.clone());
+        engine.declared_jobs().insert(1, dummy_job(1));
+        engine.declared_jobs().insert(2, dummy_job(2));
+        engine.declared_jobs().insert(3, dummy_job(3));
+
+        assert_eq!(metrics.reorg_notifications.get(), 0);
+        assert_eq!(metrics.jobs_invalidated_total.get(), 0);
+
+        // Scripted tip source: tip_a (seen first poll), tip_b (forces a reorg).
+        let cursor = Arc::new(AtomicUsize::new(0));
+        let tip_source = move || {
+            let i = cursor.fetch_add(1, Ordering::SeqCst);
+            match i {
+                0 => Some(hash_from_u64(1)),
+                _ => Some(hash_from_u64(2)),
+            }
+        };
+
+        let _observer = engine.start_reorg_watcher(tip_source, Duration::from_millis(50));
+
+        for _ in 0..6 {
+            tokio::time::advance(Duration::from_millis(60)).await;
+            tokio::task::yield_now().await;
+        }
+
+        // Give the invalidator task a chance to drain.
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            engine.declared_jobs().is_empty(),
+            "cache should be flushed after tip change"
+        );
+        assert_eq!(
+            metrics.reorg_notifications.get(),
+            1,
+            "reorg_notifications must increment when the watcher detects a tip change"
+        );
+        assert_eq!(
+            metrics.jobs_invalidated_total.get(),
+            3,
+            "jobs_invalidated_total must reflect the count of jobs flushed by the invalidator"
         );
 
         engine.stop_reorg_watcher();
