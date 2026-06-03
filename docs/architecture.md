@@ -84,8 +84,10 @@ The shared-chain handles (`ChainStoreHandle`, `Arc<dyn BitcoindLike>`, `Arc<dyn 
   - 2.14 — IPC client skeleton against the upstream stub (PR #49)
   - 2.15 — Engine Prometheus counters + `/metrics` endpoint + `--log-file` wiring (PRs #51 / #52 / #53 / #54)
   - 2.16 — `config_network` testnet4 fix (PR #55)
-- **Phase 2-B**: capnp IPC integration on the engine side. The client crate is now functional against the upstream stub (PR #49); next step is replacing the in-process `EngineHandles.chain` with IPC calls to an out-of-process p2poolv2 daemon. Blocked on the daemon's stub returning real share-chain results.
-- **Phase 3**: full driving E2E test against testnet4 (drives `SubmitSharesExtended` end-to-end), the ADR 0002 token-payout interceptor (needs a JDC TLV extension or upstream sv2-apps trait change), deployment recipes (systemd, docker-compose).
+  - 2.17 — Production observability: cache-size + sweeper-liveness gauges, `blocks_submit_failed_total` (transport errors + consensus rejections), `push_solution_dropped_total{reason}` labeled counter, `share_chain_tip_height` gauge, `/healthz` endpoint, log-field correlation, reorg-counter wiring fix (PRs #61 / #62 / #63 / #64 / #65 / #66 / #71 / #72 / #74)
+  - 2.18 — Phase 2-B server-side: real `submit_solution` / `subscribe_chain_tip` / `validate_template` (PRs #68 / #69 / #70), E2E verifies JDP handshake via /metrics scrape (PR #67), warn-only bitcoind probe at boot (PR #73)
+- **Phase 2-B**: capnp IPC integration on the engine side. PRs #68 / #69 / #70 made all three IPC server methods real (`submit_solution` verifies `shareHash == block_hash()`; `subscribe_chain_tip` fans out from an injected `watch::Receiver<BlockHash>`; `validate_template` does a structural coinbase-parse pre-check). PR #67 added `--metrics-addr` plumbing to the testenv and upgraded the full-stack E2E to verify the JDP handshake actually flows. Remaining: replace the engine's in-process `EngineHandles.chain` with IPC calls to an out-of-process p2poolv2 daemon (a multi-PR refactor — needs the daemon to expose `ChainStoreHandle`-equivalent reads via IPC, which the schema doesn't yet cover).
+- **Phase 3**: full driving E2E test against testnet4 (drives `SubmitSharesExtended` end-to-end — needs bitcoind built with multiprocess support on disk), the ADR 0002 token-payout interceptor (needs a JDC TLV extension or upstream sv2-apps trait change), deployment recipes (systemd + docker-compose, both shipped in `deploy/`).
 
 ## Status by component
 
