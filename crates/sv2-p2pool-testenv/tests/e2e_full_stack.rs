@@ -80,6 +80,39 @@ fn full_stack_boots_against_testnet4_bitcoind() {
         .build()
         .expect("jd_client_sv2 starts");
     eprintln!("jd_client_sv2: listening={}", jdc.listening_addr);
+
+    // Boot is necessary but not sufficient: every binary's listener up
+    // doesn't prove the JDP handshake actually happened. Scrape the
+    // pool's /metrics and wait for evidence that DeclareMiningJob has
+    // been processed end-to-end.
+    //
+    // We accept either Success or Error counters going non-zero —
+    // testnet4's TP may produce templates the JDC declares
+    // successfully OR rejects (e.g. token-mismatch in a fresh pool
+    // session). Either case proves the engine's JDP path is live.
+    let observed = sv2
+        .wait_for_metric(
+            |body| {
+                let count = |name: &str| -> u64 {
+                    body.lines()
+                        .find(|line| line.starts_with(name) && !line.contains('{'))
+                        .and_then(|l| l.rsplit(' ').next())
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(0)
+                };
+                count("sv2_p2pool_engine_declare_mining_job_accepted_total") > 0
+                    || count("sv2_p2pool_engine_declare_mining_job_rejected_total") > 0
+                    || count("sv2_p2pool_engine_declare_mining_job_missing_txns_total") > 0
+            },
+            Duration::from_secs(60),
+        )
+        .expect("metrics scrape succeeds");
+    assert!(
+        observed,
+        "expected JDP DeclareMiningJob traffic within 60s; metrics body:\n{}",
+        sv2.scrape_metrics_body().expect("scrape body")
+    );
+    eprintln!("JDP handshake verified via /metrics");
 }
 
 /// Smaller smoke test: just bitcoind + p2poolv2. Doesn't require our
