@@ -38,8 +38,20 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-# Read-write paths — extend if your config moves rocksdb/log files.
-ReadWritePaths=/var/lib/sv2-p2pool /var/log/sv2-p2pool
+
+# Managed runtime directories. systemd creates these on first start
+# with mode 0750 and chowns them to User=/Group= above. The actual
+# paths systemd creates are /var/lib/sv2-p2pool and /var/log/sv2-p2pool,
+# which match the binary's default config paths.
+#
+# Both directives also implicitly grant the unit read+write access to
+# these paths under ProtectSystem=strict, so no separate
+# ReadWritePaths= entry is needed. Operators who want a different
+# location (e.g. a dedicated SSD for rocksdb) should override these
+# values — `systemctl edit sv2-p2pool` is the standard path — and
+# point the config files at the new directory.
+StateDirectory=sv2-p2pool
+LogsDirectory=sv2-p2pool
 
 # File-descriptor limit — rocksdb opens many small files at startup.
 LimitNOFILE=65536

@@ -24,10 +24,11 @@ Assumes:
 sudo install -o root -g root -m 0755 \
     target/release/sv2-p2pool /usr/local/bin/sv2-p2pool
 
-# 2. Create the system user + state dirs.
+# 2. Create the system user + config dir. The state and log dirs are
+#    auto-created by systemd on first start (StateDirectory= +
+#    LogsDirectory= in the unit file).
 sudo useradd --system --home-dir /var/lib/sv2-p2pool --shell /usr/sbin/nologin sv2-p2pool
-sudo mkdir -p /etc/sv2-p2pool /var/lib/sv2-p2pool /var/log/sv2-p2pool
-sudo chown sv2-p2pool:sv2-p2pool /var/lib/sv2-p2pool /var/log/sv2-p2pool
+sudo mkdir -p /etc/sv2-p2pool
 
 # 3. Drop in the configs (edit auth keys + payout address first!).
 sudo install -o root -g root -m 0644 \
@@ -51,7 +52,7 @@ curl http://127.0.0.1:9000/metrics
 
 - Runs as the unprivileged `sv2-p2pool:sv2-p2pool` user.
 - Restarts on crash (`Restart=on-failure`); a graceful Ctrl-C / SIGTERM exits 0 and is left alone.
-- `ProtectSystem=strict` + explicit `ReadWritePaths` so the binary can only write to `/var/lib/sv2-p2pool` and `/var/log/sv2-p2pool`.
+- `ProtectSystem=strict` + `StateDirectory=sv2-p2pool` + `LogsDirectory=sv2-p2pool`. systemd creates `/var/lib/sv2-p2pool` and `/var/log/sv2-p2pool` on first start (mode 0750, owned by `sv2-p2pool:sv2-p2pool`) and these are the only writable paths.
 - Bumps `LimitNOFILE` to 65536 — rocksdb opens many small files at startup.
 - Logs to a file (`/var/log/sv2-p2pool/sv2-p2pool.log`) AND the journal.
 - Mounts `/metrics` at `127.0.0.1:9000` — change to `0.0.0.0:9000` if your Prometheus scraper is on another host (and put it behind a private network).
