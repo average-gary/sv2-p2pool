@@ -121,6 +121,13 @@ pub struct EngineMetrics {
     /// runs. Operators detect a wedged sweeper task by alerting on
     /// `(time() - sweeper_last_run_timestamp_seconds) > N * scrape_interval`.
     pub sweeper_last_run_timestamp_seconds: IntGauge,
+    /// Most-recently-observed share-chain tip height. `-1` until the
+    /// first poll succeeds; `-1` again if a poll fails. Lets operator
+    /// dashboards correlate reorg counts with the heights at which
+    /// they occurred (e.g. plot `rate(reorg_notifications_total[5m])`
+    /// alongside this gauge to see whether reorgs cluster at specific
+    /// heights).
+    pub share_chain_tip_height: IntGauge,
 }
 
 impl EngineMetrics {
@@ -180,6 +187,10 @@ impl EngineMetrics {
                 "sv2_p2pool_engine_sweeper_last_run_timestamp_seconds",
                 "Unix epoch seconds of the most recent recent-solutions sweeper tick (0 = never)",
             )?,
+            share_chain_tip_height: int_gauge(
+                "sv2_p2pool_engine_share_chain_tip_height",
+                "Most-recently-observed share-chain tip height (-1 = unknown / poll failed)",
+            )?,
             push_solution_dropped: IntCounterVec::new(
                 Opts::new(
                     "sv2_p2pool_engine_push_solution_dropped_total",
@@ -196,6 +207,10 @@ impl EngineMetrics {
             registry.register(Box::new(g.clone()))?;
         }
         registry.register(Box::new(metrics.push_solution_dropped.clone()))?;
+
+        // Seed the tip-height gauge to -1 ("unknown") so dashboards
+        // can distinguish "never polled" from "tip at height 0".
+        metrics.share_chain_tip_height.set(-1);
 
         // Pre-create one child per known reason so the labels show at
         // zero in /metrics from boot — operator dashboards don't have
@@ -239,11 +254,12 @@ impl EngineMetrics {
         ]
     }
 
-    fn all_gauges(&self) -> [&IntGauge; 3] {
+    fn all_gauges(&self) -> [&IntGauge; 4] {
         [
             &self.declared_jobs_cache_size,
             &self.recent_solutions_buffer_size,
             &self.sweeper_last_run_timestamp_seconds,
+            &self.share_chain_tip_height,
         ]
     }
 }
@@ -267,9 +283,12 @@ mod tests {
         for c in metrics.all_counters() {
             assert_eq!(c.get(), 0);
         }
-        for g in metrics.all_gauges() {
-            assert_eq!(g.get(), 0);
-        }
+        // share_chain_tip_height is seeded to -1 ("unknown") at register
+        // time; every other gauge is 0.
+        assert_eq!(metrics.declared_jobs_cache_size.get(), 0);
+        assert_eq!(metrics.recent_solutions_buffer_size.get(), 0);
+        assert_eq!(metrics.sweeper_last_run_timestamp_seconds.get(), 0);
+        assert_eq!(metrics.share_chain_tip_height.get(), -1);
         let names: Vec<String> = registry
             .gather()
             .iter()
@@ -278,6 +297,7 @@ mod tests {
         assert!(names.contains(&"sv2_p2pool_engine_declared_jobs_cache_size".to_string()));
         assert!(names.contains(&"sv2_p2pool_engine_recent_solutions_buffer_size".to_string()));
         assert!(names.contains(&"sv2_p2pool_engine_blocks_submit_failed_total".to_string()));
+        assert!(names.contains(&"sv2_p2pool_engine_share_chain_tip_height".to_string()));
         assert!(
             names.contains(&"sv2_p2pool_engine_sweeper_last_run_timestamp_seconds".to_string())
         );
