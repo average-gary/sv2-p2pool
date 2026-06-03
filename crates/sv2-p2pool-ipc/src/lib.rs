@@ -30,14 +30,15 @@
 //!
 //! - [`Sv2P2poolIpcClient::submit_solution`] — server-side performs a
 //!   real `shareHash == block_hash()` consistency check (deserialises
-//!   the rawBlock, recomputes the hash, rejects on mismatch). Client
-//!   surface unchanged.
-//! - [`Sv2P2poolIpcClient::validate_template`] /
-//!   [`Sv2P2poolIpcClient::subscribe_chain_tip`] — server-side still
-//!   placeholder stubs awaiting a `ChainStoreHandle` plumbed into the
-//!   IPC server, plus (for tip subscription) a tip-change broadcast
-//!   channel inside `p2poolv2_lib::shares::chain` that does not yet
-//!   exist.
+//!   the rawBlock, recomputes the hash, rejects on mismatch).
+//! - [`Sv2P2poolIpcClient::subscribe_chain_tip`] — server-side fans out
+//!   tip changes from a `tokio::sync::watch::Receiver<BlockHash>` when
+//!   the daemon launched the server with
+//!   `spawn_ipc_server_with_tip_source(path, Some(rx))`. Without a
+//!   wired tip source, the server preserves the original stub
+//!   behaviour (subscriptions accepted but never fire).
+//! - [`Sv2P2poolIpcClient::validate_template`] — server-side is still
+//!   a placeholder stub awaiting a `ChainStoreHandle` in the daemon.
 
 #![forbid(unsafe_code)]
 
@@ -373,6 +374,72 @@ mod tests {
                     .await
                     .expect("submit_solution ok");
                 assert!(!accepted_garbage, "unparseable rawBlock MUST be rejected");
+            })
+            .await;
+    }
+
+    /// End-to-end of subscribe_chain_tip with an injected tip source:
+    /// drive a tokio::sync::watch sender from the test side, observe
+    /// the on_new_tip callback firing on the client side. The whole
+    /// thing rides over a real Unix socket via spawn_ipc_server_with_tip_source.
+    #[tokio::test]
+    async fn subscribe_chain_tip_fans_out_via_uds_round_trip() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        use bitcoin::hashes::Hash as _;
+        use tokio::sync::watch;
+
+        let (_dir, sock) = temp_socket();
+        let initial = bitcoin::BlockHash::from_raw_hash(bitcoin::hashes::Hash::all_zeros());
+        let (tip_tx, tip_rx) = watch::channel(initial);
+        let _server = p2poolv2_ipc::spawn_ipc_server_with_tip_source(sock.clone(), Some(tip_rx));
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                wait_for_socket(&sock, Duration::from_secs(2)).await;
+                let client = Sv2P2poolIpcClient::connect(&sock).await.expect("connect");
+
+                let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+                let received_clone = Arc::clone(&received);
+                let _sub = client
+                    .subscribe_chain_tip(move |bytes| {
+                        received_clone.lock().unwrap().push(bytes);
+                    })
+                    .await
+                    .expect("subscribe ok");
+
+                let mk_tip = |last: u8| {
+                    let mut h = [0u8; 32];
+                    h[31] = last;
+                    bitcoin::BlockHash::from_raw_hash(
+                        bitcoin::hashes::sha256d::Hash::from_byte_array(h),
+                    )
+                };
+                let tip_a = mk_tip(0xaa);
+                let want_a = tip_a.as_raw_hash().as_byte_array().to_vec();
+
+                tip_tx.send(tip_a).expect("send a");
+
+                // Drive the client + server LocalSets until the
+                // callback observed tip_a (or give up after a bounded
+                // wait). The IPC server runs on a separate thread/runtime
+                // so plain yields are not enough — short sleeps too.
+                let mut got_a = false;
+                for _ in 0..200 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    if received.lock().unwrap().contains(&want_a) {
+                        got_a = true;
+                        break;
+                    }
+                }
+                assert!(
+                    got_a,
+                    "expected on_new_tip callback to fire within 1s; got {:x?}",
+                    received.lock().unwrap()
+                );
             })
             .await;
     }
