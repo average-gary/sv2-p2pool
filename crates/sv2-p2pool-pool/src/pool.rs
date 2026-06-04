@@ -340,6 +340,7 @@ impl Pool {
         .await?;
 
         let channel_manager_clone = channel_manager.clone();
+        let channel_manager_for_monitoring = channel_manager.clone();
         let mut bitcoin_core_join_handle: Option<ThreadJoinHandle<()>> = None;
         let mut bitcoin_core_cancellation_token: Option<CancellationToken> = None;
 
@@ -427,6 +428,47 @@ impl Pool {
             )
             .await?;
         info!("downstream server started; waiting for shutdown signal");
+
+        // 6b. Start the upstream monitoring server when configured.
+        // Mirrors `PoolSv2::start` at
+        // `vendor/sv2-apps/pool-apps/pool/src/lib/mod.rs:162-194`.
+        // ChannelManager already implements `Sv2ClientsMonitoring`
+        // (per `vendor/sv2-apps/pool-apps/pool/src/lib/monitoring.rs`)
+        // so all per-channel `shares_accepted` / `shares_rejected`
+        // counters from upstream's PrometheusMetrics are populated
+        // automatically once a downstream connects. The pool's own
+        // `/metrics` endpoint stays where it is — this is a separate
+        // surface for the upstream JSON + Prometheus endpoints.
+        if let Some(monitoring_addr) = self.config.monitoring_address() {
+            info!(
+                "initializing upstream monitoring server on http://{}",
+                monitoring_addr
+            );
+            let refresh = std::time::Duration::from_secs(
+                self.config.monitoring_cache_refresh_secs().unwrap_or(15),
+            );
+            match stratum_apps::monitoring::MonitoringServer::new(
+                monitoring_addr,
+                None,
+                Some(Arc::new(channel_manager_for_monitoring)),
+                refresh,
+            ) {
+                Ok(monitoring_server) => {
+                    let cancellation_for_run = cancellation_token.clone();
+                    let shutdown_signal = async move {
+                        cancellation_for_run.cancelled().await;
+                    };
+                    let cancellation_for_err = cancellation_token.clone();
+                    task_manager.spawn(async move {
+                        if let Err(e) = monitoring_server.run(shutdown_signal).await {
+                            error!(error = %e, "monitoring server error");
+                            cancellation_for_err.cancel();
+                        }
+                    });
+                }
+                Err(e) => warn!(error = %e, "failed to initialize monitoring server"),
+            }
+        }
 
         // 7. Wait for Ctrl-C or external cancellation.
         tokio::select! {

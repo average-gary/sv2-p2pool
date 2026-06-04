@@ -29,14 +29,23 @@ use thiserror::Error;
 use tracing::{debug, info};
 
 pub mod jdcd;
+pub mod mujinad;
 pub mod p2poolv2d;
 pub mod sv2_p2pool_d;
+pub mod translator_sv2d;
 pub use jdcd::{DEFAULT_JD_CLIENT_READY_TIMEOUT, JdClientD, JdClientDBuilder, JdClientDError};
+pub use mujinad::{
+    DEFAULT_MUJINA_READY_TIMEOUT, MujinaMinerD, MujinaMinerDBuilder, MujinaMinerDError,
+};
 pub use p2poolv2d::{
     DEFAULT_READY_TIMEOUT as P2POOLV2_READY_TIMEOUT, P2poolV2D, P2poolV2DBuilder, P2poolV2DError,
 };
 pub use sv2_p2pool_d::{
     DEFAULT_SV2_P2POOL_READY_TIMEOUT, Sv2P2poolD, Sv2P2poolDBuilder, Sv2P2poolDError,
+};
+pub use translator_sv2d::{
+    DEFAULT_TRANSLATOR_SV2_READY_TIMEOUT, TranslatorSv2D, TranslatorSv2DBuilder,
+    TranslatorSv2DError,
 };
 
 /// Regtest test harness — at Phase 1.8, just a thin wrapper over

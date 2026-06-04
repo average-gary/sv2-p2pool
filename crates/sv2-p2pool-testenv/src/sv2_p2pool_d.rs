@@ -81,6 +81,11 @@ pub struct Sv2P2poolD {
     pub mining_addr: SocketAddr,
     /// Address of the built-in `/metrics` + `/healthz` HTTP endpoint.
     pub metrics_addr: SocketAddr,
+    /// Address of the upstream sv2-apps `MonitoringServer`. Exposes
+    /// `/metrics` (per-channel Prometheus counters including
+    /// `sv2_client_shares_accepted_total`) and JSON `/api/v0/clients`.
+    /// Driven from the pool's `monitoring_address` config field.
+    pub monitoring_addr: SocketAddr,
 }
 
 impl Sv2P2poolD {
@@ -112,15 +117,43 @@ impl Sv2P2poolD {
     /// Scrape the raw `/metrics` body. Useful for tests that want to
     /// match against multiple metrics at once.
     pub fn scrape_metrics_body(&self) -> std::io::Result<String> {
-        let mut stream = TcpStream::connect_timeout(&self.metrics_addr, Duration::from_secs(2))?;
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-        stream
-            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response)?;
-        let response = String::from_utf8_lossy(&response).to_string();
-        let body = response.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
-        Ok(body)
+        scrape_http_metrics(self.metrics_addr)
+    }
+
+    /// Scrape the upstream `MonitoringServer` `/metrics` body
+    /// (per-channel `sv2_client_shares_accepted_total` etc.).
+    ///
+    /// NOTE: the upstream server's per-channel metrics are populated
+    /// by a snapshot cache that refreshes at
+    /// `monitoring_cache_refresh_secs` (default 15s in our test
+    /// configs). A share that lands at time T may not appear in this
+    /// scrape until the next cache tick — up to ~15s lag — so callers
+    /// polling for "share landed" must allow that headroom.
+    pub fn scrape_monitoring_metrics_body(&self) -> std::io::Result<String> {
+        scrape_http_metrics(self.monitoring_addr)
+    }
+
+    /// Block until `predicate(monitoring_body)` returns true or `timeout` elapses.
+    /// See [`Self::scrape_monitoring_metrics_body`] for the snapshot-cache caveat.
+    pub fn wait_for_monitoring_metric<F>(
+        &self,
+        mut predicate: F,
+        timeout: Duration,
+    ) -> std::io::Result<bool>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let body = self.scrape_monitoring_metrics_body()?;
+            if predicate(&body) {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 
     /// Block until `predicate(scraped_body)` returns true or `timeout` elapses.
@@ -339,6 +372,7 @@ port = {p2pool_api_port}
         );
 
         let metrics_addr = SocketAddr::from(([127, 0, 0, 1], metrics_port));
+        let monitoring_addr = SocketAddr::from(([127, 0, 0, 1], monitoring_port));
         let child = Command::new(&exe)
             .arg("--config")
             .arg(&pool_config_path)
@@ -362,6 +396,7 @@ port = {p2pool_api_port}
             jds_addr,
             mining_addr,
             metrics_addr,
+            monitoring_addr,
         };
 
         wait_for_ready(&mut spawner, self.ready_timeout)?;
@@ -388,6 +423,21 @@ fn find_sv2_p2pool_in_workspace_target() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Minimal HTTP/1.1 GET for `/metrics`-style endpoints. Returns the
+/// response body (everything after the blank line). Test-harness
+/// only — avoids a hyper/reqwest dep just to walk a few hundred
+/// bytes of Prometheus exposition format.
+fn scrape_http_metrics(addr: SocketAddr) -> std::io::Result<String> {
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    let response = String::from_utf8_lossy(&response).to_string();
+    let body = response.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    Ok(body)
 }
 
 fn allocate_free_port() -> Result<u16, Sv2P2poolDError> {
