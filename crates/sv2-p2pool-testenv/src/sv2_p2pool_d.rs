@@ -201,6 +201,13 @@ pub struct Sv2P2poolDBuilder<'a> {
     /// platform equivalent) applies — for a `corepc-node` BitcoinD the
     /// caller should pass its `params.datadir.path()`.
     bitcoin_data_dir: Option<PathBuf>,
+    /// `Some((start, minimum))` overrides the share-chain difficulty
+    /// pair written to `[stratum]` in the generated `p2pool.toml`.
+    /// When `None`, the upstream-style defaults (10000 / 100) are
+    /// kept. Test paths that need a CPU miner to clear share difficulty
+    /// in milliseconds (e.g. the regtest block-submission E2E) set this
+    /// to `(1, 1)` via [`Self::with_low_difficulty`].
+    difficulty_override: Option<(u64, u64)>,
 }
 
 impl<'a> Sv2P2poolDBuilder<'a> {
@@ -211,6 +218,7 @@ impl<'a> Sv2P2poolDBuilder<'a> {
             ready_timeout: DEFAULT_SV2_P2POOL_READY_TIMEOUT,
             network: bitcoin::Network::Testnet4,
             bitcoin_data_dir: None,
+            difficulty_override: None,
         }
     }
 
@@ -226,6 +234,16 @@ impl<'a> Sv2P2poolDBuilder<'a> {
 
     pub fn with_network(mut self, network: bitcoin::Network) -> Self {
         self.network = network;
+        self
+    }
+
+    /// Drop both `start_difficulty` and `minimum_difficulty` to 1 in
+    /// the share-chain `[stratum]` config so a CPU miner clears the
+    /// channel target in milliseconds. Required for the regtest
+    /// block-submission E2E; leave defaulted for production-shaped
+    /// tests on testnet4.
+    pub fn with_low_difficulty(mut self) -> Self {
+        self.difficulty_override = Some((1, 1));
         self
     }
 
@@ -309,6 +327,8 @@ listen_address = "127.0.0.1:{jds_port}"
         let p2pool_stratum_port = allocate_free_port()?;
         let p2pool_zmq_port = allocate_free_port()?;
         let p2pool_api_port = allocate_free_port()?;
+        let (start_difficulty, minimum_difficulty) =
+            self.difficulty_override.unwrap_or((10000, 100));
         let p2pool_toml = format!(
             r#"
 [network]
@@ -335,8 +355,8 @@ pplns_ttl_days = 7
 [stratum]
 hostname = "127.0.0.1"
 port = {p2pool_stratum_port}
-start_difficulty = 10000
-minimum_difficulty = 100
+start_difficulty = {start_difficulty}
+minimum_difficulty = {minimum_difficulty}
 solo_address = "{coinbase_addr}"
 bootstrap_address = "{coinbase_addr}"
 zmqpubhashblock = "tcp://127.0.0.1:{p2pool_zmq_port}"

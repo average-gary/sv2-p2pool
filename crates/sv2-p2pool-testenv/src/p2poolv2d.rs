@@ -143,9 +143,9 @@ impl<'a> P2poolV2DBuilder<'a> {
     }
 
     /// Override the share-chain network (default `Testnet4`).
-    /// Supported: `Bitcoin`, `Testnet4`, `Signet`. `Regtest` and the
-    /// legacy `Testnet` are rejected by p2poolv2's genesis builder and
-    /// will fail at startup.
+    /// Supported: `Bitcoin`, `Testnet4`, `Signet`, `Regtest`. The
+    /// legacy `Testnet` (testnet3) is still rejected by p2poolv2's
+    /// genesis builder.
     pub fn with_network(mut self, network: bitcoin::Network) -> Self {
         self.network = network;
         self
