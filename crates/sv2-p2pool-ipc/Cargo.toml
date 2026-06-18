@@ -19,6 +19,10 @@ tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Surface `bitcoin::BlockHash` and `bitcoin::Network` in the public
+# client API. bitcoin-rs is MIT/Apache, so this does not affect the
+# AGPL boundary; the client stays consumable by non-AGPL callers.
+bitcoin = "0.32"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
@@ -26,6 +30,3 @@ tempfile = "3"
 # Server-side stub for round-trip integration tests. AGPL is OK in
 # dev-deps because the test binary isn't shipped.
 p2poolv2_ipc = { path = "../../vendor/p2poolv2/p2poolv2_ipc" }
-# Build a real bitcoin::Block in tests to exercise the submit_solution
-# round-trip. AGPL boundary unchanged — bitcoin-rs is MIT/Apache.
-bitcoin = "0.32"
