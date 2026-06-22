@@ -47,9 +47,10 @@ pub use recent_solutions::RecentSolutions;
 pub use reorg_detector::{DEFAULT_POLL_PERIOD, ReorgDetector};
 // Re-exports so consumers don't need to depend on `sv2-p2pool-ipc` for
 // the trait's data types (ADR 0011 § Decision § "Trait surface").
-#[cfg(feature = "in-process-chain")]
-pub use share_chain_reader::InProcessChain;
-pub use share_chain_reader::{ShareChainReader, ShareHeaderLookup, ShareHeaderRead};
+// `InProcessChain` and `IpcChain` live in the pool crate now — see
+// `crates/sv2-p2pool-pool/src/share_chain.rs`. The engine crate is
+// AGPL-clean: no `p2poolv2_lib` link in this dependency graph.
+pub use share_chain_reader::{BoxFuture, ShareChainReader, ShareHeaderLookup, ShareHeaderRead};
 pub use tdp::{TdpError, TdpHandle, TxDataResult};
 
 /// Opaque request-id used to key declared-job cache entries. Mirrors
@@ -289,10 +290,12 @@ pub struct EngineHandles {
     /// Phase 2-B Track A (ADR 0011) abstracts this behind the
     /// [`ShareChainReader`] trait so the engine no longer depends on
     /// the AGPL-licensed `p2poolv2_lib::ChainStoreHandle` directly.
-    /// The pool binary wraps a real `ChainStoreHandle` in
-    /// [`InProcessChain`] today; the next stage replaces that with a
-    /// `Send`-safe IPC actor and drops the in-process feature
-    /// entirely.
+    /// The pool crate provides two `Arc<dyn ShareChainReader>`
+    /// backends: an `InProcessChain` adapter that wraps a real
+    /// `ChainStoreHandle` (single-process / tests) and an `IpcChain`
+    /// actor that talks to a separate p2poolv2 daemon over capnp-on-UDS
+    /// (production). Both live in
+    /// `crates/sv2-p2pool-pool/src/share_chain.rs`.
     pub chain: Arc<dyn ShareChainReader>,
     /// Bitcoin RPC backend. Phase 2.4 uses this only for `submit_block`
     /// (forward found blocks); tip metadata + tx bodies come from the

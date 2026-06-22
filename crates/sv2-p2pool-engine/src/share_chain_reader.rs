@@ -4,18 +4,19 @@
 //! [`P2poolV2Engine`](crate::P2poolV2Engine) and whatever backend
 //! actually owns the share chain. ADR 0011 documents the design.
 //!
-//! Three implementations exist:
+//! Two implementations exist after ADR 0011 steps 6-7:
 //! - [`mock::MockShareChain`] — `#[cfg(test)]` only. Configurable
 //!   in-memory fake used by the engine's unit tests.
-//! - [`InProcessChain`] — gated on the `in-process-chain` Cargo feature.
-//!   Wraps a real `p2poolv2_lib::ChainStoreHandle`. This is the only
-//!   path that links the AGPL-licensed `p2poolv2_lib` into the engine
-//!   crate; ADR 0010 / 0011 plan to replace it with an `IpcChain`
-//!   actor over capnp IPC in the next stage. The feature exists so a
-//!   downstream binary can opt out by building with
-//!   `--no-default-features` once the IPC backend lands.
-//! - `IpcChain` — not built in this stage. ADR 0011 step 6 lands the
-//!   `Send`-safe actor wrapping the `!Send` capnp client.
+//! - `IpcChain` (lives in `crates/sv2-p2pool-pool/src/share_chain.rs`)
+//!   — production backend. Wraps the `!Send`
+//!   [`sv2_p2pool_ipc::Sv2P2poolIpcClient`] on a dedicated `LocalSet`
+//!   thread and exposes a `Send + Sync` actor handle.
+//!
+//! There is also a transitional `InProcessChain` that lives in the pool
+//! crate (also in `share_chain.rs`). It wraps a real
+//! `p2poolv2_lib::ChainStoreHandle` for single-process / test
+//! deployments. The engine crate itself no longer links
+//! `p2poolv2_lib` — that's the AGPL-clean target ADR 0010 / 0011 set.
 //!
 //! ## Async signature, no `async-trait` macro
 //!
@@ -38,19 +39,19 @@
 //! All transport-level failures funnel through
 //! [`sv2_p2pool_ipc::IpcClientError`]. ADR 0011 explicitly keeps a
 //! single error type across the seam — no `ShareChainError` is
-//! introduced. The `MockShareChain` and `InProcessChain` impls map
-//! their internal failure modes onto the same enum.
+//! introduced. The `MockShareChain`, `InProcessChain`, and `IpcChain`
+//! impls all map their internal failure modes onto the same enum.
 //!
 //! ## Sync vs async
 //!
 //! [`ShareChainReader::network`] is sync because the value is captured
 //! at construction (the IPC client receives it once via
-//! `getNetwork @6`; `InProcessChain` reads it once from
-//! `ChainStoreHandle::network()`). [`ShareChainReader::subscribe_tip`]
+//! `getNetwork @6`; the in-process pool-side wrapper reads it once
+//! from `ChainStoreHandle::network()`). [`ShareChainReader::subscribe_tip`]
 //! is sync because it just hands back a fresh
 //! [`tokio::sync::broadcast::Receiver`] cloned from a `Sender`
 //! retained on the impl. The other three methods are async because
-//! the `IpcChain` impl will await UDS round-trips.
+//! the `IpcChain` impl awaits UDS round-trips.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -77,7 +78,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// The bound is required because the engine stores
 /// `Arc<dyn ShareChainReader>` in [`EngineHandles`](crate::EngineHandles)
 /// and the engine itself crosses await points on a multi-threaded
-/// runtime. The `IpcChain` actor in the next stage achieves this by
+/// runtime. The `IpcChain` actor in the pool crate achieves this by
 /// owning the `!Send` capnp client on a dedicated `LocalSet` thread and
 /// exposing only an mpsc-backed handle.
 pub trait ShareChainReader: Send + Sync {
@@ -124,176 +125,12 @@ pub trait ShareChainReader: Send + Sync {
     /// Subscribe to push-driven tip-change notifications.
     ///
     /// Returns a fresh [`broadcast::Receiver`]. The `IpcChain` actor
-    /// in the next stage will fan out the existing capnp
-    /// `subscribeChainTip @2` callback into a broadcast channel; the
-    /// in-process and mock impls drive the channel from their own
-    /// state. ADR 0011 § Decision § "Reorg watcher migration"
-    /// documents the rewire.
+    /// fans out the existing capnp `subscribeChainTip @2` callback
+    /// into a broadcast channel; the in-process and mock impls drive
+    /// the channel from their own state. ADR 0011 § Decision §
+    /// "Reorg watcher migration" documents the rewire.
     fn subscribe_tip(&self) -> broadcast::Receiver<BlockHash>;
 }
-
-// -----------------------------------------------------------------------
-// In-process backend (transitional; AGPL-tainted via p2poolv2_lib).
-// -----------------------------------------------------------------------
-
-#[cfg(feature = "in-process-chain")]
-mod in_process {
-    use super::*;
-    use bitcoin::hashes::Hash as _;
-    use p2poolv2_lib::shares::chain::chain_store_handle::ChainStoreHandle;
-    use p2poolv2_lib::store::writer::StoreError;
-
-    /// `ShareChainReader` impl backed by an in-process
-    /// `ChainStoreHandle`. **Transitional**: this is the only place the
-    /// engine still links the AGPL-licensed `p2poolv2_lib`. The next
-    /// stage (ADR 0011 step 6) replaces this with an IPC-backed
-    /// actor; building with `--no-default-features` will then hide
-    /// this entirely.
-    ///
-    /// Mirrors the wire-level error semantics that the daemon's
-    /// `ChainReadAdapter` uses (see
-    /// `vendor/p2poolv2/p2poolv2_node/src/ipc_chain.rs`):
-    /// - `ChainStoreHandle::get_chain_tip` returning `NotFound` →
-    ///   `Ok(None)` (genesis not initialised).
-    /// - Other `StoreError`s → `IpcClientError::Capnp(..)` carrying
-    ///   the formatted message. Reusing the `Capnp` variant keeps
-    ///   the error type uniform across the seam without requiring
-    ///   a new variant — see ADR 0011 § Decision § "error model".
-    /// - `get_share_header` returning `NotFound` →
-    ///   [`ShareHeaderLookup::NotFound`].
-    /// - All-zero share-hash query → [`ShareHeaderLookup::Genesis`]
-    ///   (sentinel mirrored from the daemon's adapter).
-    /// - `prev_share_blockhash == all_zeros` →
-    ///   [`ShareHeaderLookup::Found`] with `prev_share_blockhash =
-    ///   None` so the engine's "stop at genesis" path keys off the
-    ///   explicit `None` rather than an in-band sentinel.
-    pub struct InProcessChain {
-        chain: ChainStoreHandle,
-        network: bitcoin::Network,
-        // Retained so `subscribe_tip()` can hand out fresh receivers.
-        // The in-process backend doesn't itself drive this channel —
-        // production wiring at `pool.rs` constructs the
-        // `start_reorg_watcher` over `chain.get_chain_tip()` and
-        // observes via the engine's existing detector. Tests that
-        // need a synthetic tip event reach for `MockShareChain`.
-        tip_tx: broadcast::Sender<BlockHash>,
-    }
-
-    impl InProcessChain {
-        /// Wrap a live `ChainStoreHandle`. The network is captured
-        /// from the handle so [`ShareChainReader::network`] can serve
-        /// it synchronously.
-        pub fn new(chain: ChainStoreHandle) -> Self {
-            let network = chain.network();
-            // 16-element ring buffer matches the tip broadcast capacity
-            // used elsewhere in the workspace (small & cheap).
-            let (tip_tx, _) = broadcast::channel(16);
-            Self {
-                chain,
-                network,
-                tip_tx,
-            }
-        }
-
-        /// Borrow the underlying `ChainStoreHandle`. Pool-side code
-        /// still needs it to drive
-        /// [`P2poolV2Engine::start_reorg_watcher`] over a sync
-        /// closure during the transition; once `IpcChain` lands the
-        /// closure consumes [`ShareChainReader::subscribe_tip`]
-        /// directly and this accessor becomes unnecessary.
-        pub fn chain_store_handle(&self) -> &ChainStoreHandle {
-            &self.chain
-        }
-
-        /// Sender end of the tip broadcast. Production wiring (the
-        /// reorg watcher in `pool.rs`) can keep this sender and push
-        /// every detected tip onto it so other subscribers
-        /// (`subscribe_tip`) wake up. Until that rewire lands the
-        /// channel just stays empty — `MockShareChain` is what the
-        /// tests use to drive synthetic tips.
-        pub fn tip_sender(&self) -> broadcast::Sender<BlockHash> {
-            self.tip_tx.clone()
-        }
-    }
-
-    impl ShareChainReader for InProcessChain {
-        fn get_chain_tip(&self) -> BoxFuture<'_, Result<Option<BlockHash>, IpcClientError>> {
-            // ChainStoreHandle's read paths are sync (rocksdb
-            // DashMap-backed reads); wrap in an immediate-ready
-            // future so the trait surface stays uniformly async.
-            let result = match self.chain.get_chain_tip() {
-                Ok(tip) => Ok(Some(tip)),
-                Err(StoreError::NotFound(_)) => Ok(None),
-                Err(e) => Err(IpcClientError::Capnp(capnp::Error::failed(format!(
-                    "get_chain_tip: {e}"
-                )))),
-            };
-            Box::pin(async move { result })
-        }
-
-        fn get_share_header(
-            &self,
-            share_hash: &BlockHash,
-        ) -> BoxFuture<'_, Result<ShareHeaderLookup, IpcClientError>> {
-            // Snapshot the input by-value so the returned future
-            // doesn't borrow `share_hash` past the call.
-            let share_hash = *share_hash;
-            // All-zeros sentinel → engine-side "stop walking ancestors".
-            // Mirrors `ChainReadAdapter::get_share_header` so the
-            // in-process and IPC paths behave identically.
-            let result = if share_hash
-                .as_raw_hash()
-                .as_byte_array()
-                .iter()
-                .all(|b| *b == 0)
-            {
-                Ok(ShareHeaderLookup::Genesis)
-            } else {
-                match self.chain.get_share_header(&share_hash) {
-                    Ok(header) => {
-                        let prev = header.prev_share_blockhash;
-                        let prev_opt = if prev
-                            .as_raw_hash()
-                            .as_byte_array()
-                            .iter()
-                            .all(|b| *b == 0)
-                        {
-                            None
-                        } else {
-                            Some(prev)
-                        };
-                        Ok(ShareHeaderLookup::Found(ShareHeaderRead {
-                            prev_share_blockhash: prev_opt,
-                        }))
-                    }
-                    Err(StoreError::NotFound(_)) => Ok(ShareHeaderLookup::NotFound),
-                    Err(e) => Err(IpcClientError::Capnp(capnp::Error::failed(format!(
-                        "get_share_header: {e}"
-                    )))),
-                }
-            };
-            Box::pin(async move { result })
-        }
-
-        fn get_tip_height(&self) -> BoxFuture<'_, Result<Option<u32>, IpcClientError>> {
-            let result = self.chain.get_tip_height().map_err(|e| {
-                IpcClientError::Capnp(capnp::Error::failed(format!("get_tip_height: {e}")))
-            });
-            Box::pin(async move { result })
-        }
-
-        fn network(&self) -> bitcoin::Network {
-            self.network
-        }
-
-        fn subscribe_tip(&self) -> broadcast::Receiver<BlockHash> {
-            self.tip_tx.subscribe()
-        }
-    }
-}
-
-#[cfg(feature = "in-process-chain")]
-pub use in_process::InProcessChain;
 
 // -----------------------------------------------------------------------
 // Mock backend (test-only).

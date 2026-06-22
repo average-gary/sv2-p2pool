@@ -18,6 +18,16 @@ path = "src/main.rs"
 
 [dependencies]
 sv2-p2pool-engine = { path = "../sv2-p2pool-engine" }
+# IPC client surface (`Sv2P2poolIpcClient`, `IpcClientError`,
+# `ShareHeaderLookup`, `ShareHeaderRead`). Required by `IpcChain`,
+# the production `ShareChainReader` backend that owns the `!Send`
+# capnp client on a dedicated `LocalSet` thread.
+sv2-p2pool-ipc    = { path = "../sv2-p2pool-ipc" }
+# `capnp::Error` is the variant `IpcClientError::Capnp(..)` carries.
+# The `InProcessChain` adapter in this crate rebuilds capnp errors
+# from `StoreError`s so the trait's error type is uniform across
+# backends.
+capnp             = "0.25"
 
 # sv2-apps stack: trait + ChannelManager + PoolConfig + TP + helpers.
 jd_server_sv2    = { path = "../../vendor/sv2-apps/pool-apps/jd-server" }
@@ -25,7 +35,12 @@ pool_sv2         = { path = "../../vendor/sv2-apps/pool-apps/pool" }
 stratum-apps     = { path = "../../vendor/sv2-apps/stratum-apps" }
 bitcoin_core_sv2 = { path = "../../vendor/sv2-apps/bitcoin-core-sv2" }
 
-# p2poolv2 share-chain backend (Phase 2.5b: in-process minimum slice).
+# p2poolv2 share-chain backend. The pool crate is the AGPL boundary
+# this binary inherits — `InProcessChain` (in `share_chain.rs`) wraps a
+# real `p2poolv2_lib::ChainStoreHandle` for single-process / test
+# deployments. The production binary increasingly prefers the
+# `IpcChain` actor (also in `share_chain.rs`) which talks to a
+# separate p2poolv2 daemon and lets the engine crate stay AGPL-clean.
 p2poolv2_lib = { path = "../../vendor/p2poolv2/p2poolv2_lib" }
 bitcoindrpc  = { path = "../../vendor/p2poolv2/bitcoindrpc" }
 thiserror    = { workspace = true }
@@ -52,3 +67,7 @@ clap               = { version = "4.5", features = ["derive"] }
 [dev-dependencies]
 tokio    = { workspace = true, features = ["full", "test-util"] }
 tempfile = "3"
+# IpcChain actor tests spin up an in-process IPC server via the
+# p2poolv2 daemon-side crate; not needed at runtime, only by
+# `share_chain::tests`.
+p2poolv2_ipc = { path = "../../vendor/p2poolv2/p2poolv2_ipc" }
