@@ -225,30 +225,40 @@ impl Pool {
         // declared_jobs cache on every detected tip swap. ADR 0001
         // applies — uncle admissions are not tip changes; only an
         // actual tip swap reaches the invalidator.
+        //
+        // Phase 2-B Track A (ADR 0011) put the engine behind the
+        // `ShareChainReader` async trait, but
+        // `start_reorg_watcher` and the tip-height publisher both
+        // keep their sync polling shape for API stability. Until
+        // step 7 of the ADR migrates them onto
+        // `ShareChainReader::subscribe_tip`, both read directly off
+        // the underlying `ChainStoreHandle` exposed on
+        // `ShareChainHandles.chain_store`.
         let mut tip_height_publisher_handle: Option<tokio::task::JoinHandle<()>> = None;
         if let Some(handles) = share_chain_handles.as_ref() {
-            let chain = handles.engine_handles.chain.clone();
+            let chain_store = handles.chain_store.clone();
             engine_concrete.start_reorg_watcher(
-                move || chain.get_chain_tip().ok(),
+                move || chain_store.get_chain_tip().ok(),
                 sv2_p2pool_engine::DEFAULT_POLL_PERIOD,
             );
             info!("share-chain reorg watcher started");
 
-            // Tip-height publisher: polls chain.get_tip_height() at the
-            // same cadence as the reorg watcher and writes the result
-            // (or -1 on failure) into the engine's IntGauge so dashboards
-            // can correlate reorg counts with the heights at which they
-            // occurred. Shares the underlying StoreHandle with the reorg
-            // watcher (DashMap-backed; reads are cheap).
+            // Tip-height publisher: polls chain_store.get_tip_height()
+            // at the same cadence as the reorg watcher and writes the
+            // result (or -1 on failure) into the engine's IntGauge so
+            // dashboards can correlate reorg counts with the heights
+            // at which they occurred. Shares the underlying
+            // `ChainStoreHandle` with the reorg watcher (DashMap-backed;
+            // reads are cheap).
             if let Some(metrics) = engine_concrete.metrics().cloned() {
-                let chain = handles.engine_handles.chain.clone();
+                let chain_store = handles.chain_store.clone();
                 let period = sv2_p2pool_engine::DEFAULT_POLL_PERIOD;
                 let handle = tokio::spawn(async move {
                     let mut ticker = tokio::time::interval(period);
                     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     loop {
                         ticker.tick().await;
-                        match chain.get_tip_height() {
+                        match chain_store.get_tip_height() {
                             Ok(Some(h)) => {
                                 metrics.share_chain_tip_height.set(h as i64);
                             }

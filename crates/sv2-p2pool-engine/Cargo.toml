@@ -8,6 +8,17 @@ rust-version.workspace = true
 publish.workspace = true
 description = "JobValidationEngine implementation backed by p2poolv2's share chain"
 
+[features]
+# `in-process-chain` enables the [`InProcessChain`] adapter that wraps a
+# real `p2poolv2_lib::ChainStoreHandle` behind the [`ShareChainReader`]
+# trait. This is the **transitional** path: ADR 0011 step 6 lands an
+# IPC-backed `IpcChain` actor that supersedes it. Default-on so the
+# pool binary keeps building during the transition; downstream
+# consumers will flip `--no-default-features` once `IpcChain` is in
+# place to drop the AGPL `p2poolv2_lib` link from the engine.
+default = ["in-process-chain"]
+in-process-chain = ["dep:p2poolv2_lib", "dep:capnp"]
+
 [dependencies]
 async-trait   = { workspace = true }
 async-channel = "1.5"
@@ -25,10 +36,26 @@ bitcoin     = "0.32"
 jd_server_sv2 = { path = "../../vendor/sv2-apps/pool-apps/jd-server" }
 stratum-apps  = { path = "../../vendor/sv2-apps/stratum-apps" }
 
-# p2poolv2 share-chain backend (Phase 1: in-process)
-p2poolv2_lib = { path = "../../vendor/p2poolv2/p2poolv2_lib" }
+# p2poolv2 share-chain backend — only linked when the
+# `in-process-chain` feature is enabled (transitional; ADR 0011
+# replaces this with an IPC-backed `IpcChain` actor in the next
+# stage). Once that lands, `--no-default-features` builds drop
+# this entirely.
+p2poolv2_lib = { path = "../../vendor/p2poolv2/p2poolv2_lib", optional = true }
 # BitcoindLike trait + concrete client (added by feat/bitcoind-trait, PR #18)
 bitcoindrpc  = { path = "../../vendor/p2poolv2/bitcoindrpc" }
+
+# Engine-facing IPC client: exposes `IpcClientError`, `ShareHeaderRead`,
+# `ShareHeaderLookup` re-exported through the `ShareChainReader` trait.
+# Unconditional (the trait surface is independent of which backend is
+# linked).
+sv2-p2pool-ipc = { path = "../sv2-p2pool-ipc" }
+
+# `capnp::Error` is the variant `IpcClientError::Capnp(..)` carries.
+# The `InProcessChain` adapter rebuilds capnp errors from
+# `StoreError`s so the trait's error type is uniform across backends.
+# Optional + only required by the in-process feature.
+capnp = { version = "0.25", optional = true }
 
 # Prometheus metrics surface — same version pin as sv2-apps's monitoring
 # module so collectors registered by us and CM share the registry types.

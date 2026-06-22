@@ -61,6 +61,18 @@ pub enum ShareChainBootstrapError {
 /// store; the binary holds them for the duration of `Pool::start`.
 pub struct ShareChainHandles {
     pub engine_handles: EngineHandles,
+    /// Direct, sync handle to the underlying share-chain store. Phase
+    /// 2-B Track A (ADR 0011) puts the engine behind the
+    /// [`sv2_p2pool_engine::ShareChainReader`] async trait, but
+    /// [`sv2_p2pool_engine::P2poolV2Engine::start_reorg_watcher`]
+    /// keeps a sync `Fn() -> Option<BlockHash>` signature for API
+    /// stability. The binary uses this handle for the watcher's
+    /// closure (and the tip-height publisher) until step 7 of the
+    /// ADR rewires both onto
+    /// [`sv2_p2pool_engine::ShareChainReader::subscribe_tip`]. Once
+    /// that lands and `IpcChain` replaces `InProcessChain`, this
+    /// field — and the surrounding `p2poolv2_lib` import — go away.
+    pub chain_store: ChainStoreHandle,
     pub store: Arc<Store>,
     pub store_writer_join: JoinHandle<()>,
 }
@@ -164,8 +176,22 @@ pub async fn bootstrap_share_chain(
     }
 
     info!("share-chain bootstrap: handles ready");
+    // Phase 2-B Track A (ADR 0011): the engine no longer takes a
+    // `ChainStoreHandle` directly. We wrap it in `InProcessChain` —
+    // an `Arc<dyn ShareChainReader>` adapter — which the engine
+    // consumes through the new trait. The original handle is kept
+    // separately on `ShareChainHandles.chain_store` so the pool's
+    // sync reorg-watcher closure and the tip-height publisher can
+    // keep their existing API; both move to
+    // `ShareChainReader::subscribe_tip` in step 7 of the ADR.
+    let chain_reader: Arc<dyn sv2_p2pool_engine::ShareChainReader> =
+        Arc::new(sv2_p2pool_engine::InProcessChain::new(chain.clone()));
     Ok(ShareChainHandles {
-        engine_handles: EngineHandles { chain, bitcoind },
+        engine_handles: EngineHandles {
+            chain: chain_reader,
+            bitcoind,
+        },
+        chain_store: chain,
         store,
         store_writer_join,
     })
@@ -353,7 +379,15 @@ port = 0
         );
 
         let cached = engine.declared_jobs().get(&1).expect("declared job cached");
-        let expected_tip = chain_for_assert.get_chain_tip().expect("tip readable");
+        // Phase 2-B Track A: chain handle is now async behind the
+        // `ShareChainReader` trait. `Ok(Some(tip))` is the
+        // initialised-genesis path — same observable shape as the
+        // pre-trait `chain.get_chain_tip().expect()` call.
+        let expected_tip = chain_for_assert
+            .get_chain_tip()
+            .await
+            .expect("tip readable")
+            .expect("genesis initialised");
         assert_eq!(
             cached.share_chain_tip,
             Some(expected_tip),
@@ -377,7 +411,11 @@ port = 0
             .await
             .expect("bootstrap succeeds");
         let chain = handles.engine_handles.chain.clone();
-        let genesis_tip = chain.get_chain_tip().expect("tip readable");
+        let genesis_tip = chain
+            .get_chain_tip()
+            .await
+            .expect("tip readable")
+            .expect("genesis initialised");
 
         let engine =
             P2poolV2Engine::with_handles(bitcoin::Network::Signet, handles.engine_handles.clone());
@@ -457,17 +495,22 @@ port = 0
             .await
             .expect("bootstrap succeeds");
 
-        let chain = handles.engine_handles.chain.clone();
+        // Phase 2-B Track A: the reorg watcher's closure stays sync,
+        // so it reads off the underlying `ChainStoreHandle` rather
+        // than the new async `ShareChainReader` trait. Step 7 of
+        // ADR 0011 migrates this to
+        // `ShareChainReader::subscribe_tip` (broadcast-driven).
+        let chain_store = handles.chain_store.clone();
         let mut engine =
             P2poolV2Engine::with_handles(bitcoin::Network::Signet, handles.engine_handles.clone());
 
-        // The watcher polls `chain.get_chain_tip()` on the configured
+        // The watcher polls `chain_store.get_chain_tip()` on the configured
         // schedule. With a live chain initialised at genesis,
         // get_chain_tip should always succeed and return the same
         // value — exercising the closure shape we use in Pool::start
         // without needing to drive a synthetic tip swap.
         let _observer = engine.start_reorg_watcher(
-            move || chain.get_chain_tip().ok(),
+            move || chain_store.get_chain_tip().ok(),
             Duration::from_millis(20),
         );
 
@@ -499,7 +542,13 @@ port = 0
         assert!(!handles.store_writer_join.is_finished());
 
         // Drop everything so the store-writer can shut down cleanly.
+        // Phase 2-B Track A: `chain_store` is a separate transitional
+        // handle on `ShareChainHandles`; drop it together with the
+        // engine handles so the underlying write channel really
+        // closes (otherwise the writer task waits forever on its
+        // recv loop).
         drop(handles.engine_handles);
+        drop(handles.chain_store);
         drop(handles.store);
         // Awaiting the join handle here triggers the writer to exit
         // because all senders are dropped.
