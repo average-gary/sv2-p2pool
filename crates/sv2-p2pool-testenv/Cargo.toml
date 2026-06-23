@@ -30,3 +30,14 @@ thiserror = { workspace = true }
 
 # Tempdir for spawner datadirs (Phase 2.6: p2poolv2_node spawner).
 tempfile = "3"
+
+[dev-dependencies]
+# Phase 2-B Track A (ADR 0011): integration tests under `tests/` boot a
+# real capnp IPC daemon (via `p2poolv2_ipc::spawn_ipc_server_full`) and
+# drive `sv2_p2pool::share_chain::IpcChain` against it, exercising the
+# chain-read seam end-to-end. AGPL exposure is fine for dev-deps — the
+# testenv lib + binaries do not link these.
+p2poolv2_ipc      = { path = "../../vendor/p2poolv2/p2poolv2_ipc" }
+sv2-p2pool-pool   = { path = "../sv2-p2pool-pool" }
+sv2-p2pool-engine = { path = "../sv2-p2pool-engine" }
+tokio             = { workspace = true, features = ["full", "test-util"] }
