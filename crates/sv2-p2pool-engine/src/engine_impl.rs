@@ -1555,7 +1555,7 @@ mod tests {
 
         use async_trait::async_trait;
         use bitcoin::hashes::Hash as _;
-        use bitcoindrpc::{BitcoindLike, BitcoindRpcError, GetBlockchainInfo};
+        use bitcoindrpc::{BitcoindLike, BitcoindRpcError, GetBlockchainInfo, ProposalOutcome};
         use prometheus::Registry;
         use stratum_apps::stratum_core::{
             binary_sv2::{B016M, Seq064K, Seq0255},
@@ -1606,8 +1606,8 @@ mod tests {
             async fn validate_block_proposal(
                 &self,
                 _block: &bitcoin::Block,
-            ) -> Result<bool, BitcoindRpcError> {
-                Ok(false)
+            ) -> Result<ProposalOutcome, BitcoindRpcError> {
+                Ok(ProposalOutcome::Accepted)
             }
         }
 
