@@ -13,6 +13,7 @@
 
 use async_trait::async_trait;
 use bitcoin::{TxMerkleNode, Wtxid, hashes::Hash};
+use bitcoindrpc::ProposalOutcome;
 use jd_server_sv2::job_declarator::job_validation::{
     DeclareMiningJobResult, JobValidationEngine, SetCustomMiningJobResult,
 };
@@ -526,6 +527,124 @@ impl JobValidationEngine for P2poolV2Engine {
             return bump_and_return(SetCustomMiningJobResult::Error(
                 ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_MERKLE_PATH,
             ));
+        }
+
+        // 9. (Track B) Bitcoind-side block-proposal validation. When
+        //    both the Template Provider bridge AND a `template_id` are
+        //    available, build the candidate block and hand it to
+        //    `BitcoindLike::validate_block_proposal` (BIP 23 proposal
+        //    mode). This catches consensus-invalid templates BEFORE the
+        //    JDS acknowledges the custom job — preventing the share
+        //    chain from accepting work that bitcoind would never accept.
+        //
+        //    Structural-only fallback: when TDP isn't wired, the cached
+        //    job has no `template_id`, or `EngineHandles` are absent,
+        //    skip proposal validation and accept on structural checks
+        //    alone. This preserves the existing handles-less test path.
+        match (self.tdp(), self.handles(), declared.template_id) {
+            (Some(tdp), Some(handles), Some(template_id)) => {
+                let tx_bodies = match tdp.request_tx_bodies(template_id).await {
+                    Ok(txs) => txs,
+                    Err(e) => {
+                        warn!(
+                            request_id,
+                            template_id,
+                            error = %e,
+                            "SetCustomMiningJob: TDP fetch of tx bodies failed before proposal-validation; falling back to structural-only acceptance"
+                        );
+                        if let Some(m) = self.metrics() {
+                            m.set_custom_mining_job_validation_skipped.inc();
+                        }
+                        // Treat as skip rather than reject: the JDC
+                        // didn't do anything wrong, we just lost
+                        // upstream context. The structural checks
+                        // above are still binding.
+                        info!(
+                            request_id,
+                            allocated_token, "SetCustomMiningJob accepted (validation skipped)"
+                        );
+                        return bump_and_return(SetCustomMiningJobResult::Success);
+                    }
+                };
+
+                let candidate = match crate::block::build_candidate_block(
+                    &declared,
+                    &set_custom_mining_job,
+                    tx_bodies,
+                ) {
+                    Ok(block) => block,
+                    Err(e) => {
+                        warn!(
+                            request_id,
+                            template_id,
+                            error = %e,
+                            "SetCustomMiningJob: candidate-block construction failed before proposal-validation"
+                        );
+                        return bump_and_return(SetCustomMiningJobResult::Error(
+                            ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_COINBASE_TX,
+                        ));
+                    }
+                };
+
+                let timer = self
+                    .metrics()
+                    .map(|m| m.set_custom_mining_job_validation_seconds.start_timer());
+                let outcome = handles.bitcoind.validate_block_proposal(&candidate).await;
+                if let Some(t) = timer {
+                    t.observe_duration();
+                }
+
+                match outcome {
+                    Ok(ProposalOutcome::Accepted)
+                    | Ok(ProposalOutcome::Duplicate) => {
+                        // Fall through to Success.
+                    }
+                    Ok(ProposalOutcome::Rejected(reason)) => {
+                        warn!(
+                            request_id,
+                            template_id,
+                            reject_reason = %reason,
+                            "SetCustomMiningJob: bitcoind validate_block_proposal rejected the candidate block"
+                        );
+                        if let Some(m) = self.metrics() {
+                            m.record_scmj_proposal_rejection(
+                                crate::ScmjProposalRejectReason::ConsensusRejected,
+                            );
+                        }
+                        return bump_and_return(SetCustomMiningJobResult::Error(
+                            ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_COINBASE_TX,
+                        ));
+                    }
+                    Err(e) => {
+                        warn!(
+                            request_id,
+                            template_id,
+                            error = %e,
+                            "SetCustomMiningJob: validate_block_proposal RPC error; rejecting"
+                        );
+                        if let Some(m) = self.metrics() {
+                            m.record_scmj_proposal_rejection(
+                                crate::ScmjProposalRejectReason::RpcError,
+                            );
+                        }
+                        return bump_and_return(SetCustomMiningJobResult::Error(
+                            ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_COINBASE_TX,
+                        ));
+                    }
+                }
+            }
+            _ => {
+                debug!(
+                    request_id,
+                    has_tdp = self.tdp().is_some(),
+                    has_handles = self.handles().is_some(),
+                    has_template_id = declared.template_id.is_some(),
+                    "SetCustomMiningJob: skipping validate_block_proposal (structural-only fallback)"
+                );
+                if let Some(m) = self.metrics() {
+                    m.set_custom_mining_job_validation_skipped.inc();
+                }
+            }
         }
 
         info!(request_id, allocated_token, "SetCustomMiningJob accepted");

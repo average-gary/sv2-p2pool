@@ -27,7 +27,9 @@ use bitcoin::{
     consensus::Encodable,
     hashes::Hash,
 };
-use stratum_apps::stratum_core::job_declaration_sv2::PushSolution;
+use stratum_apps::stratum_core::{
+    job_declaration_sv2::PushSolution, mining_sv2::SetCustomMiningJob,
+};
 
 use crate::{DeclaredJob, coinbase};
 
@@ -153,6 +155,99 @@ pub fn reconstruct_block(
         time: push_solution.ntime,
         bits: CompactTarget::from_consensus(push_solution.nbits),
         nonce: push_solution.nonce,
+    };
+
+    let mut txdata = Vec::with_capacity(1 + tx_bodies.len());
+    txdata.push(coinbase_tx);
+    txdata.extend(tx_bodies);
+
+    Ok(Block { header, txdata })
+}
+
+/// Build a candidate `bitcoin::Block` from a `SetCustomMiningJob` + the cached
+/// `DeclaredJob` + the non-coinbase transaction bodies fetched from the
+/// Template Provider.
+///
+/// Used at SCMJ time (Track B) to construct a proposal block that can be
+/// handed to `BitcoindLike::validate_block_proposal` BEFORE we acknowledge
+/// the custom job. This catches consensus-invalid templates (e.g. an
+/// over-paying coinbase) at the source — the JDC then knows the share-chain
+/// could never accept it either.
+///
+/// Header fields:
+/// - `version` / `prev_hash` / `nbits` come from the `SetCustomMiningJob`
+///   (these have already been cross-checked against the declared snapshot
+///   by the time this is called).
+/// - `time` = `scmj.min_ntime` (the earliest acceptable ntime for the tip;
+///   bitcoind's proposal mode validates ntime ≥ MTP+1 and against the
+///   "future block time" rule, both of which `min_ntime` satisfies by
+///   construction).
+/// - `nonce` = `0` (proposal mode does not check PoW, per BIP 23).
+///
+/// `txdata` = `[reconstructed_coinbase, ...tx_bodies]`. The coinbase is
+/// reconstructed from `declared.coinbase_tx_prefix + zero-extranonce +
+/// declared.coinbase_tx_suffix` (the extranonce slot is filled with zeros;
+/// the actual extranonce isn't chosen until a share is found, and proposal
+/// mode doesn't care).
+///
+/// As a sanity check we verify `tx_bodies` line up with the cached
+/// `txid_list` — same invariant as [`reconstruct_block`]. If the TP gave
+/// us a different transaction list than the JDC declared we'd be sending
+/// bitcoind a block whose merkle root doesn't match the JDC's SCMJ, which
+/// would just produce a confusing rejection.
+pub fn build_candidate_block(
+    declared: &DeclaredJob,
+    scmj: &SetCustomMiningJob<'_>,
+    tx_bodies: Vec<Transaction>,
+) -> Result<Block, BlockReconstructError> {
+    let txid_list = declared
+        .txid_list
+        .as_ref()
+        .ok_or(BlockReconstructError::DeclaredJobNotValidated)?;
+
+    if tx_bodies.len() != txid_list.len() {
+        return Err(BlockReconstructError::TxBodyCountMismatch {
+            expected: txid_list.len(),
+            got: tx_bodies.len(),
+        });
+    }
+    for (idx, (body, expected_txid)) in tx_bodies.iter().zip(txid_list.iter()).enumerate() {
+        let computed = body.compute_txid();
+        if computed != *expected_txid {
+            return Err(BlockReconstructError::TxBodyTxidMismatch {
+                index: idx,
+                expected: *expected_txid,
+                got: computed,
+            });
+        }
+    }
+
+    // Coinbase with the extranonce slot zeroed — proposal mode doesn't
+    // need a real extranonce since it doesn't check PoW and the coinbase
+    // txid only feeds into the merkle root (which is consistent so long
+    // as the same value is used for the merkle computation).
+    let coinbase_tx =
+        coinbase::reconstruct_coinbase(&declared.coinbase_tx_prefix, &declared.coinbase_tx_suffix)
+            .map_err(BlockReconstructError::Coinbase)?;
+    let coinbase_txid = coinbase_tx.compute_txid();
+    let merkle_root = compute_merkle_root_from_txids(coinbase_txid, txid_list);
+
+    let prev_blockhash: BlockHash = {
+        let bytes: [u8; 32] = scmj
+            .prev_hash
+            .to_vec()
+            .try_into()
+            .map_err(|_| BlockReconstructError::BadPrevHash)?;
+        BlockHash::from_byte_array(bytes)
+    };
+
+    let header = Header {
+        version: Version::from_consensus(scmj.version as i32),
+        prev_blockhash,
+        merkle_root,
+        time: scmj.min_ntime,
+        bits: CompactTarget::from_consensus(scmj.nbits),
+        nonce: 0,
     };
 
     let mut txdata = Vec::with_capacity(1 + tx_bodies.len());
