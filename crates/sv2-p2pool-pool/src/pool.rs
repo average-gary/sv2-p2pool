@@ -220,51 +220,120 @@ impl Pool {
         }
 
         // Spawn the share-chain reorg watcher when a chain handle is
-        // available. Polls `chain.get_chain_tip()` at
+        // available. Polls a sync `Fn() -> Option<BlockHash>` at
         // `DEFAULT_POLL_PERIOD` and invalidates the engine's
         // declared_jobs cache on every detected tip swap. ADR 0001
         // applies — uncle admissions are not tip changes; only an
         // actual tip swap reaches the invalidator.
+        //
+        // Phase 2-B Track A (ADR 0011 step 7) gives us two backends:
+        //
+        //  - `IpcChain` (production): the actor's subscribe-task pushes
+        //    every new tip into a lock-free `AtomicTipSnapshot`. The
+        //    watcher's closure becomes `move || tip_snapshot.load_tip()`
+        //    — no UDS round-trip per tick. The tip-height publisher
+        //    likewise reads `snapshot.load_height()`, which the actor
+        //    refreshes on every push.
+        //
+        //  - `InProcessChain` (tests / single-process): the underlying
+        //    `ChainStoreHandle` is exposed on
+        //    `ShareChainHandles.chain_store`. We keep the legacy sync
+        //    polling there because there's no daemon to push from.
         let mut tip_height_publisher_handle: Option<tokio::task::JoinHandle<()>> = None;
+        let mut ipc_shutdown_watcher_handle: Option<tokio::task::JoinHandle<()>> = None;
         if let Some(handles) = share_chain_handles.as_ref() {
-            let chain = handles.engine_handles.chain.clone();
-            engine_concrete.start_reorg_watcher(
-                move || chain.get_chain_tip().ok(),
-                sv2_p2pool_engine::DEFAULT_POLL_PERIOD,
-            );
-            info!("share-chain reorg watcher started");
+            if let Some(snapshot) = handles.ipc_tip_snapshot.clone() {
+                // IpcChain mode: lock-free tip read driven by the
+                // actor's subscribe-task.
+                let snapshot_for_watcher = snapshot.clone();
+                engine_concrete.start_reorg_watcher(
+                    move || snapshot_for_watcher.load_tip(),
+                    sv2_p2pool_engine::DEFAULT_POLL_PERIOD,
+                );
+                info!("share-chain reorg watcher started (IpcChain snapshot)");
 
-            // Tip-height publisher: polls chain.get_tip_height() at the
-            // same cadence as the reorg watcher and writes the result
-            // (or -1 on failure) into the engine's IntGauge so dashboards
-            // can correlate reorg counts with the heights at which they
-            // occurred. Shares the underlying StoreHandle with the reorg
-            // watcher (DashMap-backed; reads are cheap).
-            if let Some(metrics) = engine_concrete.metrics().cloned() {
-                let chain = handles.engine_handles.chain.clone();
-                let period = sv2_p2pool_engine::DEFAULT_POLL_PERIOD;
-                let handle = tokio::spawn(async move {
-                    let mut ticker = tokio::time::interval(period);
-                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    loop {
-                        ticker.tick().await;
-                        match chain.get_tip_height() {
-                            Ok(Some(h)) => {
-                                metrics.share_chain_tip_height.set(h as i64);
-                            }
-                            Ok(None) => {
-                                // Initial sync — don't have a tip yet.
-                                metrics.share_chain_tip_height.set(-1);
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "share_chain_tip_height: get_tip_height failed");
-                                metrics.share_chain_tip_height.set(-1);
+                if let Some(metrics) = engine_concrete.metrics().cloned() {
+                    let snapshot_for_publisher = snapshot.clone();
+                    let period = sv2_p2pool_engine::DEFAULT_POLL_PERIOD;
+                    let handle = tokio::spawn(async move {
+                        let mut ticker = tokio::time::interval(period);
+                        ticker
+                            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        loop {
+                            ticker.tick().await;
+                            match snapshot_for_publisher.load_height() {
+                                Some(h) => metrics.share_chain_tip_height.set(h as i64),
+                                None => metrics.share_chain_tip_height.set(-1),
                             }
                         }
-                    }
-                });
-                tip_height_publisher_handle = Some(handle);
-                info!("share-chain tip-height publisher started");
+                    });
+                    tip_height_publisher_handle = Some(handle);
+                    info!("share-chain tip-height publisher started (IpcChain snapshot)");
+                }
+
+                // The IpcChain actor lives on a dedicated OS thread.
+                // If it dies (panic, peer hang-up, runtime shutdown)
+                // we cancel the pool rather than silently lose chain
+                // reads. The watch::Receiver flips to `true` on the
+                // first such event.
+                if let Some(mut shutdown_rx) = handles.ipc_shutdown_signal.clone() {
+                    let cancel = cancellation_token.clone();
+                    let handle = tokio::spawn(async move {
+                        // Skip the initial `false` value; only react
+                        // to a transition to `true`.
+                        loop {
+                            if *shutdown_rx.borrow() {
+                                error!(
+                                    "IpcChain actor thread reports shutdown — cancelling pool"
+                                );
+                                cancel.cancel();
+                                return;
+                            }
+                            if shutdown_rx.changed().await.is_err() {
+                                // Sender dropped — actor handle gone.
+                                debug!("IpcChain shutdown channel closed; exiting watcher");
+                                return;
+                            }
+                        }
+                    });
+                    ipc_shutdown_watcher_handle = Some(handle);
+                    info!("IpcChain shutdown watcher started");
+                }
+            } else if let Some(chain_store) = handles.chain_store.clone() {
+                // InProcessChain mode: legacy sync polling against
+                // the rocksdb-backed handle.
+                let chain_store_for_watcher = chain_store.clone();
+                engine_concrete.start_reorg_watcher(
+                    move || chain_store_for_watcher.get_chain_tip().ok(),
+                    sv2_p2pool_engine::DEFAULT_POLL_PERIOD,
+                );
+                info!("share-chain reorg watcher started (InProcessChain polling)");
+
+                if let Some(metrics) = engine_concrete.metrics().cloned() {
+                    let chain_store_for_publisher = chain_store.clone();
+                    let period = sv2_p2pool_engine::DEFAULT_POLL_PERIOD;
+                    let handle = tokio::spawn(async move {
+                        let mut ticker = tokio::time::interval(period);
+                        ticker
+                            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        loop {
+                            ticker.tick().await;
+                            match chain_store_for_publisher.get_tip_height() {
+                                Ok(Some(h)) => metrics.share_chain_tip_height.set(h as i64),
+                                Ok(None) => metrics.share_chain_tip_height.set(-1),
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        "share_chain_tip_height: get_tip_height failed"
+                                    );
+                                    metrics.share_chain_tip_height.set(-1);
+                                }
+                            }
+                        }
+                    });
+                    tip_height_publisher_handle = Some(handle);
+                    info!("share-chain tip-height publisher started (InProcessChain polling)");
+                }
             }
         }
 
@@ -518,6 +587,13 @@ impl Pool {
             info!("share-chain tip-height publisher aborted");
         }
 
+        // Abort the IpcChain shutdown-watcher if it was started.
+        if let Some(handle) = ipc_shutdown_watcher_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+            info!("IpcChain shutdown watcher aborted");
+        }
+
         warn!("graceful shutdown: waiting {GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS}s for tasks");
         match tokio::time::timeout(
             std::time::Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS),
@@ -533,17 +609,25 @@ impl Pool {
                 warn!("forced shutdown complete");
             }
         }
-        // Drop share-chain handles last: this closes the StoreWriter
-        // channel, which causes the writer thread to exit and rocksdb
-        // to flush. Explicit drop to make the lifecycle visible.
+        // Drop share-chain handles last. For the in-process path
+        // this closes the StoreWriter channel, which causes the
+        // writer thread to exit and rocksdb to flush. For IpcChain
+        // it drops the actor handle, which causes the actor thread
+        // to exit and the runtime to shut down. Explicit drop in
+        // both modes to make the lifecycle visible.
         if let Some(handles) = share_chain_handles.take() {
             drop(handles.engine_handles);
+            drop(handles.chain_store);
             drop(handles.store);
-            // Await the writer thread; it should exit promptly once its
-            // channel sender is dropped.
-            match handles.store_writer_join.await {
-                Ok(()) => info!("StoreWriter task joined"),
-                Err(e) => warn!(?e, "StoreWriter task did not join cleanly"),
+            drop(handles.ipc_tip_snapshot);
+            drop(handles.ipc_shutdown_signal);
+            if let Some(writer) = handles.store_writer_join {
+                match writer.await {
+                    Ok(()) => info!("StoreWriter task joined"),
+                    Err(e) => warn!(?e, "StoreWriter task did not join cleanly"),
+                }
+            } else {
+                info!("share-chain handles (IpcChain mode) dropped");
             }
         }
 

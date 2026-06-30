@@ -44,7 +44,10 @@ use stratum_apps::{
 };
 use tracing::{debug, info, warn};
 
-use crate::{DeclaredJob, P2poolV2Engine, TipMetadata, coinbase, metrics::PushSolutionDropReason};
+use crate::{
+    DeclaredJob, P2poolV2Engine, ShareHeaderLookup, TipMetadata, coinbase,
+    metrics::PushSolutionDropReason,
+};
 
 #[async_trait]
 impl JobValidationEngine for P2poolV2Engine {
@@ -238,19 +241,32 @@ impl JobValidationEngine for P2poolV2Engine {
 
         // Capture the share-chain tip when handles are wired so
         // future selective-invalidation logic has the data. Reading
-        // the tip is best-effort: a transient store error must not
-        // block job acceptance.
-        let share_chain_tip = self.handles().and_then(|h| match h.chain.get_chain_tip() {
-            Ok(tip) => Some(tip),
-            Err(e) => {
-                warn!(
-                    request_id,
-                    error = %e,
-                    "share-chain tip read failed at declare time; continuing without capture"
-                );
-                None
+        // the tip is best-effort: a transient store / transport
+        // error must not block job acceptance.
+        //
+        // Phase 2-B Track A (ADR 0011): the chain handle is now an
+        // `Arc<dyn ShareChainReader>` and `get_chain_tip` is async.
+        // `Ok(None)` (genesis-uninitialised) is the "structurally
+        // correct, no tip yet" path; `Err(_)` is a transport
+        // failure. Both end up captured as `None` on the snapshot —
+        // dashboards see the failure via the warn! log.
+        let share_chain_tip = match self.handles() {
+            Some(h) => {
+                let chain = h.chain.clone();
+                match chain.get_chain_tip().await {
+                    Ok(tip) => tip,
+                    Err(e) => {
+                        warn!(
+                            request_id,
+                            error = %e,
+                            "share-chain tip read failed at declare time; continuing without capture"
+                        );
+                        None
+                    }
+                }
             }
-        });
+            None => None,
+        };
 
         let snapshot = DeclaredJob {
             version: declare_mining_job.version,
@@ -791,18 +807,57 @@ impl JobValidationEngine for P2poolV2Engine {
         // collect block hashes seen along the way. A cached job's
         // captured tip is "still on chain" iff it appears in this
         // set OR equals new_tip itself.
+        //
+        // Phase 2-B Track A (ADR 0011): each `get_share_header` is
+        // now an async UDS round-trip when the chain reader is
+        // backed by IPC. Worst case is `REORG_ANCESTRY_DEPTH = 100`
+        // sequential calls per reorg; the latency budget (~10-50 ms
+        // p99 over UDS) is documented in the ADR's Negative
+        // section. The genesis sentinel + missing-header arms are
+        // expressed via [`ShareHeaderLookup`] discrete variants
+        // rather than by inspecting `prev == BlockHash::all_zeros()`
+        // — the daemon-side adapter already encodes that on the
+        // wire so we don't double-check it here.
+        //
+        // We snapshot the chain handle (a cheap `Arc::clone`) up
+        // front so the await inside the loop doesn't borrow `handles`
+        // (which would extend the borrow across the await and break
+        // the future's `Send` bound).
+        let chain = handles.chain.clone();
         let mut ancestors: std::collections::HashSet<BlockHash> = std::collections::HashSet::new();
         ancestors.insert(new_tip);
         let mut cursor = new_tip;
         for _ in 0..REORG_ANCESTRY_DEPTH {
-            match handles.chain.get_share_header(&cursor) {
-                Ok(header) => {
-                    let prev = header.prev_share_blockhash;
-                    if prev == bitcoin::BlockHash::all_zeros() {
-                        break; // reached genesis
+            match chain.get_share_header(&cursor).await {
+                Ok(ShareHeaderLookup::Found(header)) => {
+                    match header.prev_share_blockhash {
+                        Some(prev) => {
+                            ancestors.insert(prev);
+                            cursor = prev;
+                        }
+                        None => break, // genesis predecessor encoded as None
                     }
-                    ancestors.insert(prev);
-                    cursor = prev;
+                }
+                Ok(ShareHeaderLookup::Genesis) => {
+                    // The cursor itself was the all-zeros sentinel —
+                    // we've fallen off the end of the share chain.
+                    // Same effect as the `prev == all_zeros` case
+                    // in the legacy code path: stop walking.
+                    break;
+                }
+                Ok(ShareHeaderLookup::NotFound) => {
+                    warn!(
+                        cursor = %cursor,
+                        "notify_share_chain_reorg: header not found mid-walk; falling back to invalidate_all"
+                    );
+                    let dropped = self.declared_jobs().invalidate_all();
+                    bump_dropped(dropped);
+                    info!(
+                        new_tip = %new_tip,
+                        dropped,
+                        "notify_share_chain_reorg: flushed declared-jobs cache (header not found)"
+                    );
+                    return;
                 }
                 Err(e) => {
                     warn!(
@@ -1310,7 +1365,6 @@ mod tests {
 
         use bitcoin::hashes::Hash as _;
         use bitcoindrpc::{BitcoindLike, mock::MockBitcoind};
-        use p2poolv2_lib::test_utils::setup_test_chain_store_handle;
         use stratum_apps::stratum_core::{
             binary_sv2::{Seq064K, Seq0255},
             parsers_sv2::TemplateDistribution,
@@ -1319,10 +1373,15 @@ mod tests {
             },
         };
 
-        use crate::{EngineHandles, TdpHandle, tdp::TxDataResult};
+        use crate::share_chain_reader::mock::MockShareChain;
+        use crate::{EngineHandles, ShareChainReader, TdpHandle, tdp::TxDataResult};
 
         // 1. Build the engine with handles, including a TdpHandle.
-        let (chain, _tmpdir) = setup_test_chain_store_handle(false).await;
+        //    Uses `MockShareChain::with_no_genesis()` to preserve the
+        //    original test intent (tip read returns `Ok(None)`,
+        //    `share_chain_tip` capture path stores `None`). ADR 0011
+        //    § Decision § "MockShareChain" documents the migration.
+        let chain: Arc<dyn ShareChainReader> = Arc::new(MockShareChain::with_no_genesis());
         let mock_bitcoind = Arc::new(MockBitcoind::default());
         let bitcoind: Arc<dyn BitcoindLike> = mock_bitcoind.clone();
         let (req_tx, req_rx) = async_channel::unbounded();
@@ -1497,7 +1556,6 @@ mod tests {
         use async_trait::async_trait;
         use bitcoin::hashes::Hash as _;
         use bitcoindrpc::{BitcoindLike, BitcoindRpcError, GetBlockchainInfo};
-        use p2poolv2_lib::test_utils::setup_test_chain_store_handle;
         use prometheus::Registry;
         use stratum_apps::stratum_core::{
             binary_sv2::{B016M, Seq064K, Seq0255},
@@ -1508,7 +1566,10 @@ mod tests {
             },
         };
 
-        use crate::{EngineHandles, EngineMetrics, TdpHandle, tdp::TxDataResult};
+        use crate::share_chain_reader::mock::MockShareChain;
+        use crate::{
+            EngineHandles, EngineMetrics, ShareChainReader, TdpHandle, tdp::TxDataResult,
+        };
 
         // submit_block always returns Err; everything else falls through
         // to "unscripted" but the test path only touches submit_block.
@@ -1553,7 +1614,7 @@ mod tests {
         let registry = Registry::new();
         let metrics = EngineMetrics::register(&registry).expect("register");
 
-        let (chain, _tmpdir) = setup_test_chain_store_handle(false).await;
+        let chain: Arc<dyn ShareChainReader> = Arc::new(MockShareChain::with_no_genesis());
         let bitcoind: Arc<dyn BitcoindLike> = Arc::new(FailingBitcoind);
         let (req_tx, req_rx) = async_channel::unbounded();
         let tdp = TdpHandle::new(req_tx);
@@ -1674,7 +1735,6 @@ mod tests {
 
         use bitcoin::hashes::Hash as _;
         use bitcoindrpc::{BitcoindLike, mock::MockBitcoind};
-        use p2poolv2_lib::test_utils::setup_test_chain_store_handle;
         use prometheus::Registry;
         use stratum_apps::stratum_core::{
             binary_sv2::{B016M, Seq064K, Seq0255},
@@ -1685,12 +1745,15 @@ mod tests {
             },
         };
 
-        use crate::{EngineHandles, EngineMetrics, TdpHandle, tdp::TxDataResult};
+        use crate::share_chain_reader::mock::MockShareChain;
+        use crate::{
+            EngineHandles, EngineMetrics, ShareChainReader, TdpHandle, tdp::TxDataResult,
+        };
 
         let registry = Registry::new();
         let metrics = EngineMetrics::register(&registry).expect("register");
 
-        let (chain, _tmpdir) = setup_test_chain_store_handle(false).await;
+        let chain: Arc<dyn ShareChainReader> = Arc::new(MockShareChain::with_no_genesis());
         // Mock returns Ok("\"high-hash\"") — bitcoind's wire shape for a
         // PoW-rejected block (a JSON string, including the quotes after
         // serde_json::Value::to_string()).
@@ -1852,15 +1915,15 @@ mod tests {
         use std::sync::Arc;
 
         use bitcoindrpc::{BitcoindLike, mock::MockBitcoind};
-        use p2poolv2_lib::test_utils::setup_test_chain_store_handle;
         use prometheus::Registry;
 
-        use crate::{EngineHandles, EngineMetrics, TdpHandle};
+        use crate::share_chain_reader::mock::MockShareChain;
+        use crate::{EngineHandles, EngineMetrics, ShareChainReader, TdpHandle};
 
         let registry = Registry::new();
         let metrics = EngineMetrics::register(&registry).expect("register");
 
-        let (chain, _tmpdir) = setup_test_chain_store_handle(false).await;
+        let chain: Arc<dyn ShareChainReader> = Arc::new(MockShareChain::with_no_genesis());
         let mock_bitcoind = Arc::new(MockBitcoind::default());
         let bitcoind: Arc<dyn BitcoindLike> = mock_bitcoind.clone();
         let (req_tx, _req_rx) = async_channel::unbounded();
