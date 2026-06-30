@@ -1530,6 +1530,7 @@ socket_path = "{}"
                 template_id: None,
                 share_chain_tip: Some(genesis_tip),
                 validated: true,
+                allocated_token: None,
             },
         );
         // Job B: captured tip is unknown to the chain → dropped.
@@ -1545,6 +1546,7 @@ socket_path = "{}"
                 template_id: None,
                 share_chain_tip: Some(BlockHash::from_byte_array([99u8; 32])),
                 validated: true,
+                allocated_token: None,
             },
         );
         // Job C: no captured tip → dropped (conservative).
@@ -1560,6 +1562,7 @@ socket_path = "{}"
                 template_id: None,
                 share_chain_tip: None,
                 validated: true,
+                allocated_token: None,
             },
         );
         assert_eq!(engine.declared_jobs().len(), 3);

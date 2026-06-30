@@ -104,6 +104,12 @@ pub struct DeclaredJob {
     /// Whether the job has been fully validated.
     /// Set to `true` once `handle_declare_mining_job` returns `Success`.
     pub validated: bool,
+    /// The JDP `mining_job_token` that this `DeclareMiningJob` referred to.
+    /// Captured at declare time so `handle_push_solution` (which has no
+    /// token of its own) can consult the engine's per-token payout
+    /// binding map to credit the right p2pool miner. `None` while the
+    /// JDC is still in the PMTS request/retry handshake.
+    pub allocated_token: Option<JdToken>,
 }
 
 /// Bitcoin tip metadata captured at `DeclareMiningJob` time.
@@ -247,12 +253,24 @@ impl DeclaredJobCache {
 
 /// Token-payout binding. Per ADR 0002 § Decision § 1.
 ///
-/// Maps each `JdToken` to the miner's coinbase payout script chosen by
-/// the JDC at allocation time. Populated by the binary's token-allocation
-/// interceptor (Phase 1.5) BEFORE the JDS sees the message. The engine
-/// reads from it inside `handle_push_solution` to credit the right
-/// p2pool miner.
+/// Maps each `JdToken` to the miner's coinbase payout script. Populated
+/// by the engine's `handle_allocate_mining_job_token` (Option 4
+/// follow-up — Phase 3c) when the engine elects to override the
+/// pool-wide default. The engine reads from it inside
+/// `handle_push_solution` to credit the right p2pool miner, and the
+/// `TokenPayoutEvictor` hook drains entries when the JDS's
+/// `TokenManager` evicts the corresponding token.
 pub type TokenPayoutMap = Arc<DashMap<JdToken, ScriptBuf>>;
+
+/// Inverse view of `TokenPayoutMap` keyed by the normalized
+/// `user_identifier` string. Used by
+/// `handle_allocate_mining_job_token` to detect duplicate active
+/// bindings: when the same `user_identifier` would be (re-)bound to a
+/// new `JdToken` while the previous token is still live, the engine
+/// falls back to `None` (= pool-wide default) rather than silently
+/// overwriting the script the JDC has already received. Per the task
+/// contract for Phase 3c Step 2.
+pub type UserIdentifierIndex = Arc<DashMap<String, JdToken>>;
 
 /// Token → request_id binding. Mirrors
 /// `BitcoinCoreIPCEngine::allocated_token_entries`'s lookup role at
@@ -330,6 +348,23 @@ pub struct P2poolV2Engine {
     declared_jobs: DeclaredJobCache,
     allocated_tokens: AllocatedTokenMap,
     token_payout: TokenPayoutMap,
+    /// Inverse view of `token_payout`: normalized `user_identifier`
+    /// → `JdToken` currently bound. Lets
+    /// `handle_allocate_mining_job_token` detect duplicate active
+    /// bindings (same user_identifier, different live token) and
+    /// fall back to the pool-wide default rather than overwrite.
+    user_identifier_index: UserIdentifierIndex,
+    /// Test-only override hook for the payout-script resolver. When
+    /// `Some`, `resolve_payout_script` consults this closure instead
+    /// of returning `None`. Lets the unit tests exercise the
+    /// duplicate-binding + size-budget branches without standing up
+    /// the (future) accounting selector. Production paths always
+    /// leave this `None` — the cfg gate makes that a compile-time
+    /// guarantee.
+    #[cfg(test)]
+    test_payout_resolver: std::sync::Mutex<
+        Option<Box<dyn Fn(&str) -> Option<ScriptBuf> + Send + Sync>>,
+    >,
     recent_solutions: Arc<RecentSolutions>,
     /// Bitcoin network this engine targets. Used by accounting + payout.
     network: bitcoin::Network,
@@ -378,6 +413,9 @@ impl P2poolV2Engine {
             declared_jobs: DeclaredJobCache::new(),
             allocated_tokens: Arc::new(DashMap::new()),
             token_payout: Arc::new(DashMap::new()),
+            user_identifier_index: Arc::new(DashMap::new()),
+            #[cfg(test)]
+            test_payout_resolver: std::sync::Mutex::new(None),
             recent_solutions: Arc::new(RecentSolutions::new(DEFAULT_RECENT_SOLUTIONS_TTL)),
             network,
             reorg_watcher: None,
@@ -474,15 +512,82 @@ impl P2poolV2Engine {
     /// token has no specific binding — caller should fall back to the
     /// pool-wide `coinbase_reward_script`.
     ///
-    /// Per ADR 0002, per-miner payout scripts are populated by the
-    /// binary's interceptor; until Phase 2 lands a JDC TLV extension
-    /// for sending the per-miner script in `AllocateMiningJobToken`,
-    /// this map will be empty in production and every miner gets the
-    /// pool-wide fallback.
+    /// Per ADR 0002 (Option 4), per-miner payout scripts are now
+    /// populated by the engine's
+    /// `JobValidationEngine::handle_allocate_mining_job_token` impl at
+    /// allocation time. `handle_push_solution` consults this map (via
+    /// the cached `DeclaredJob`'s `allocated_token`) when reconstructing
+    /// the block — entries with a populated binding take precedence
+    /// over the pool-wide `coinbase_reward_script` fallback held by
+    /// the JDS. Until the accounting selector lands the resolver
+    /// returns `None` for every user, so the map will be empty in
+    /// production and every miner gets the pool-wide script.
     pub fn lookup_payout_script(&self, token: JdToken) -> Option<ScriptBuf> {
         self.token_payout
             .get(&token)
             .map(|entry| entry.value().clone())
+    }
+
+    /// Resolve a per-miner payout `ScriptBuf` from a normalized
+    /// `user_identifier`. Returns `None` until the accounting selector
+    /// is wired (Phase 3c follow-up, ADR 0002 § Follow-ups). The
+    /// signature is kept intentionally narrow so that the future
+    /// accounting hook can be slotted in without changing
+    /// `handle_allocate_mining_job_token`.
+    ///
+    /// Crate-private because the only legitimate caller is the trait
+    /// impl in `engine_impl`.
+    pub(crate) fn resolve_payout_script(&self, user_identifier: &str) -> Option<ScriptBuf> {
+        #[cfg(test)]
+        {
+            if let Ok(guard) = self.test_payout_resolver.lock()
+                && let Some(resolver) = guard.as_ref()
+            {
+                return resolver(user_identifier);
+            }
+        }
+        // Phase 3c Step 2: accounting selector not yet wired. Returning
+        // `None` keeps every miner on the pool-wide `coinbase_reward_script`
+        // until the selector lands.
+        let _ = user_identifier;
+        None
+    }
+
+    /// Install a test-only payout resolver. The closure is invoked
+    /// inside `resolve_payout_script` for every `user_identifier` the
+    /// trait impl sees.
+    #[cfg(test)]
+    pub(crate) fn set_test_payout_resolver<F>(&self, resolver: F)
+    where
+        F: Fn(&str) -> Option<ScriptBuf> + Send + Sync + 'static,
+    {
+        let mut guard = self
+            .test_payout_resolver
+            .lock()
+            .expect("test_payout_resolver mutex poisoned");
+        *guard = Some(Box::new(resolver));
+    }
+
+    /// Borrow the inverse index for tests + the trait impl.
+    pub(crate) fn user_identifier_index(&self) -> &UserIdentifierIndex {
+        &self.user_identifier_index
+    }
+
+    /// Drop the per-token payout binding (if any) and the matching
+    /// inverse-index entry. Invoked by the `TokenPayoutEvictor` impl
+    /// when the JDS's `TokenManager` evicts the corresponding token.
+    pub(crate) fn drop_token_payout(&self, token: JdToken) {
+        // Take the script first so we can find the user_identifier in
+        // the inverse index without an extra full-table scan.
+        if let Some((_, _script)) = self.token_payout.remove(&token) {
+            // Drop the inverse entry pointing at this token. There's
+            // no per-token reverse pointer; do a linear scan and remove
+            // matches. The map is small (one entry per active miner)
+            // so this is cheap in practice and we don't need an extra
+            // forward pointer.
+            self.user_identifier_index
+                .retain(|_, bound_token| *bound_token != token);
+        }
     }
 
     /// Access the recent-solutions buffer (cloneable `Arc`).
@@ -705,6 +810,7 @@ mod tests {
             template_id: None,
             share_chain_tip: None,
             validated: false,
+            allocated_token: None,
         }
     }
 
@@ -723,6 +829,7 @@ mod tests {
             template_id: None,
             share_chain_tip: None,
             validated: false,
+            allocated_token: None,
         }
     }
 
