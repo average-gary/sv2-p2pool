@@ -17,18 +17,28 @@ tracing       = { workspace = true }
 anyhow        = { workspace = true }
 thiserror     = { workspace = true }
 
-# Bitcoin types — pinned to the same version p2poolv2_lib pulls in (0.32.x) so
-# `BlockHash` is the same type across the engine boundary.
+# Bitcoin types — pinned to the same version the rest of the workspace
+# uses (0.32.x) so `BlockHash` is the same type across the engine
+# boundary.
 bitcoin     = "0.32"
 
 # sv2-apps trait we implement
 jd_server_sv2 = { path = "../../vendor/sv2-apps/pool-apps/jd-server" }
 stratum-apps  = { path = "../../vendor/sv2-apps/stratum-apps" }
 
-# p2poolv2 share-chain backend (Phase 1: in-process)
-p2poolv2_lib = { path = "../../vendor/p2poolv2/p2poolv2_lib" }
-# BitcoindLike trait + concrete client (added by feat/bitcoind-trait, PR #18)
+# BitcoindLike trait + concrete client (added by feat/bitcoind-trait, PR #18).
+# The vendored fork is dual-licensed MIT/Apache, so it doesn't carry the
+# AGPL boundary `p2poolv2_lib` would.
 bitcoindrpc  = { path = "../../vendor/p2poolv2/bitcoindrpc" }
+
+# Engine-facing IPC client: exposes `IpcClientError`, `ShareHeaderRead`,
+# `ShareHeaderLookup` re-exported through the `ShareChainReader` trait.
+# This is the only chain seam the engine knows about — the AGPL-licensed
+# `p2poolv2_lib` is no longer in this crate's dependency graph (ADR 0011
+# steps 6-7). The in-process adapter that previously linked it moved to
+# the pool crate, where it still exists for tests/single-process
+# deployments.
+sv2-p2pool-ipc = { path = "../sv2-p2pool-ipc" }
 
 # Prometheus metrics surface — same version pin as sv2-apps's monitoring
 # module so collectors registered by us and CM share the registry types.
@@ -37,6 +47,7 @@ prometheus = "0.13"
 [dev-dependencies]
 proptest = "1"
 tokio    = { workspace = true, features = ["full", "test-util"] }
-# Test fixtures: MockBitcoind + setup_test_chain_store_handle.
+# Test fixtures: MockBitcoind. Engine unit tests use the in-crate
+# `MockShareChain` for share-chain reads; no `p2poolv2_lib` test dep is
+# required here.
 bitcoindrpc  = { path = "../../vendor/p2poolv2/bitcoindrpc", features = ["test-utils"] }
-p2poolv2_lib = { path = "../../vendor/p2poolv2/p2poolv2_lib", features = ["test-utils"] }

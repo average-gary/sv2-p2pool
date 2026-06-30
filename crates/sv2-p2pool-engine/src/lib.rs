@@ -24,7 +24,6 @@ use std::time::Duration;
 use bitcoin::{BlockHash, ScriptBuf, Txid};
 use bitcoindrpc::BitcoindLike;
 use dashmap::DashMap;
-use p2poolv2_lib::shares::chain::chain_store_handle::ChainStoreHandle;
 use stratum_apps::utils::types::JdToken;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -35,6 +34,7 @@ mod engine_impl;
 pub mod metrics;
 pub mod recent_solutions;
 pub mod reorg_detector;
+pub mod share_chain_reader;
 pub mod tdp;
 
 pub use block::{BlockReconstructError, reconstruct_block, reconstruct_header};
@@ -45,6 +45,12 @@ pub use coinbase::{
 pub use metrics::{EngineMetrics, PushSolutionDropReason};
 pub use recent_solutions::RecentSolutions;
 pub use reorg_detector::{DEFAULT_POLL_PERIOD, ReorgDetector};
+// Re-exports so consumers don't need to depend on `sv2-p2pool-ipc` for
+// the trait's data types (ADR 0011 § Decision § "Trait surface").
+// `InProcessChain` and `IpcChain` live in the pool crate now — see
+// `crates/sv2-p2pool-pool/src/share_chain.rs`. The engine crate is
+// AGPL-clean: no `p2poolv2_lib` link in this dependency graph.
+pub use share_chain_reader::{BoxFuture, ShareChainReader, ShareHeaderLookup, ShareHeaderRead};
 pub use tdp::{TdpError, TdpHandle, TxDataResult};
 
 /// Opaque request-id used to key declared-job cache entries. Mirrors
@@ -280,7 +286,17 @@ pub type AllocatedTokenMap = Arc<DashMap<JdToken, RequestId>>;
 pub struct EngineHandles {
     /// Read access to the share chain. Used to look up the current
     /// share-chain tip + validate share-block ancestry on reorg.
-    pub chain: ChainStoreHandle,
+    ///
+    /// Phase 2-B Track A (ADR 0011) abstracts this behind the
+    /// [`ShareChainReader`] trait so the engine no longer depends on
+    /// the AGPL-licensed `p2poolv2_lib::ChainStoreHandle` directly.
+    /// The pool crate provides two `Arc<dyn ShareChainReader>`
+    /// backends: an `InProcessChain` adapter that wraps a real
+    /// `ChainStoreHandle` (single-process / tests) and an `IpcChain`
+    /// actor that talks to a separate p2poolv2 daemon over capnp-on-UDS
+    /// (production). Both live in
+    /// `crates/sv2-p2pool-pool/src/share_chain.rs`.
+    pub chain: Arc<dyn ShareChainReader>,
     /// Bitcoin RPC backend. Phase 2.4 uses this only for `submit_block`
     /// (forward found blocks); tip metadata + tx bodies come from the
     /// SV2 Template Distribution Protocol via [`TdpHandle`]. The trait
@@ -292,7 +308,7 @@ pub struct EngineHandles {
 impl std::fmt::Debug for EngineHandles {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EngineHandles")
-            .field("chain", &"<ChainStoreHandle>")
+            .field("chain", &"<dyn ShareChainReader>")
             .field("bitcoind", &"<dyn BitcoindLike>")
             .finish()
     }
@@ -810,10 +826,15 @@ mod tests {
     #[tokio::test]
     async fn engine_with_handles_reports_handles_present() {
         use bitcoindrpc::mock::MockBitcoind;
-        use p2poolv2_lib::test_utils::setup_test_chain_store_handle;
 
-        // Build production handles via test fixtures.
-        let (chain, _tmpdir) = setup_test_chain_store_handle(false).await;
+        use crate::share_chain_reader::mock::MockShareChain;
+
+        // Build production handles via the in-memory mock chain
+        // backend. ADR 0011 § Decision § "MockShareChain" replaces
+        // the on-disk `setup_test_chain_store_handle` fixture so
+        // these tests don't require the AGPL `p2poolv2_lib`
+        // path-dep at runtime.
+        let chain: Arc<dyn ShareChainReader> = Arc::new(MockShareChain::new());
         let bitcoind: Arc<dyn BitcoindLike> = Arc::new(MockBitcoind::default());
         let (tx_sender, _tx_receiver) = async_channel::unbounded();
         let tdp = TdpHandle::new(tx_sender);

@@ -3,7 +3,7 @@
 //! The server lives at `vendor/p2poolv2/p2poolv2_ipc` and exposes a
 //! single `ShareChain` interface defined in
 //! `vendor/p2poolv2/p2poolv2-capnp-types/proto/p2poolv2.capnp`. This
-//! crate provides a typed async client for the three methods the
+//! crate provides a typed async client for the seven methods the
 //! schema currently defines:
 //!
 //! - [`Sv2P2poolIpcClient::validate_template`] — validate a candidate
@@ -12,6 +12,15 @@
 //!   plus its share hash.
 //! - [`Sv2P2poolIpcClient::subscribe_chain_tip`] — subscribe to tip
 //!   changes (callback-style).
+//! - [`Sv2P2poolIpcClient::get_chain_tip`] — read the current
+//!   confirmed share-chain tip blockhash.
+//! - [`Sv2P2poolIpcClient::get_share_header`] — look up a share
+//!   header by its blockhash; returns the minimal `prev_share_blockhash`
+//!   field plus discrete `NotFound` / `Genesis` variants.
+//! - [`Sv2P2poolIpcClient::get_tip_height`] — read the confirmed
+//!   share-chain tip height.
+//! - [`Sv2P2poolIpcClient::get_network`] — read the bitcoin network
+//!   the daemon was configured with (called once at startup).
 //!
 //! ## `!Send` constraint
 //!
@@ -28,7 +37,7 @@
 //!
 //! ## Status
 //!
-//! All three IPC server methods now perform real work:
+//! All seven IPC server methods now perform real work:
 //!
 //! - [`Sv2P2poolIpcClient::validate_template`] — structural pre-check
 //!   (glues prefix+suffix and confirms it parses as a
@@ -45,15 +54,28 @@
 //!   `spawn_ipc_server_with_tip_source(path, Some(rx))`. Without a
 //!   wired tip source, the server preserves the original stub
 //!   behaviour (subscriptions accepted but never fire).
+//! - [`Sv2P2poolIpcClient::get_chain_tip`] /
+//!   [`Sv2P2poolIpcClient::get_share_header`] /
+//!   [`Sv2P2poolIpcClient::get_tip_height`] /
+//!   [`Sv2P2poolIpcClient::get_network`] — delegate to the daemon's
+//!   in-process `ChainStoreHandle` via the new `ChainReadBackend`
+//!   adapter (added in the matching schema bump). On a daemon with
+//!   no chain backend wired they return `IpcClientError::Capnp`
+//!   carrying `capnp::Error::unimplemented`.
 
 #![forbid(unsafe_code)]
 
 use std::path::Path;
 use std::rc::Rc;
 
+use bitcoin::BlockHash;
+use bitcoin::hashes::Hash as _;
 use capnp::capability::Promise;
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
-use p2poolv2_capnp_types::p2poolv2_capnp::{chain_tip_callback, share_chain, validation_result};
+use p2poolv2_capnp_types::p2poolv2_capnp::{
+    chain_tip_callback, chain_tip_result, network_result, share_chain, share_header_result,
+    tip_height_result, validation_result,
+};
 use thiserror::Error;
 use tokio::net::UnixStream;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -75,6 +97,60 @@ pub enum IpcClientError {
     /// server schema.
     #[error("unknown ValidationResult variant: {0}")]
     UnknownValidationVariant(#[from] capnp::NotInSchema),
+    /// Server returned a payload that should have been a 32-byte
+    /// `BlockHash` but wasn't. Indicates a buggy server or version
+    /// skew at the schema layer.
+    #[error("invalid blockhash payload: expected 32 bytes, got {got}")]
+    BlockHashDecode { got: usize },
+}
+
+/// Outcome of a [`Sv2P2poolIpcClient::get_chain_tip`] call.
+#[derive(Debug, Clone)]
+pub enum ChainTipResult {
+    /// Daemon returned a confirmed share-chain tip.
+    Tip(BlockHash),
+    /// Daemon has not yet completed genesis setup.
+    Uninitialised,
+}
+
+/// Outcome of a [`Sv2P2poolIpcClient::get_tip_height`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TipHeightResult {
+    /// Daemon returned a confirmed tip height.
+    Height(u32),
+    /// Daemon has not yet completed genesis setup.
+    Uninitialised,
+}
+
+/// The minimal `ShareHeader` subset the engine consumes today.
+///
+/// The capnp wire only carries `prev_share_blockhash`. The other
+/// thirteen fields on the daemon's `p2poolv2_lib::ShareHeader`
+/// (uncles, miner_bitcoin_address, merkle_root, bitcoin_header,
+/// bits, time, donation, donation_address, fee, fee_address,
+/// coinbase_value, coinbaseaux_flags, witness_commitment,
+/// bitcoin_height, coinbase_nsecs, extranonce) are deliberately not
+/// serialised — adding any of them is a schema bump, not a
+/// drive-by client change. See ADR 0011 in this repo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShareHeaderRead {
+    /// Previous share block hash. `None` when the daemon's encoded
+    /// value is the all-zeros sentinel (genesis predecessor); the
+    /// engine treats that as "stop walking ancestors".
+    pub prev_share_blockhash: Option<BlockHash>,
+}
+
+/// Outcome of a [`Sv2P2poolIpcClient::get_share_header`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareHeaderLookup {
+    /// Header found; the engine reads only `prev_share_blockhash`.
+    Found(ShareHeaderRead),
+    /// No header for the requested share hash. The engine treats
+    /// this as a truncated walk and falls back to invalidate-all.
+    NotFound,
+    /// The requested hash is the all-zeros genesis sentinel; the
+    /// engine stops walking ancestors at this point.
+    Genesis,
 }
 
 // Convert capnp's text-decode errors into a Capnp error so the
@@ -219,6 +295,116 @@ impl Sv2P2poolIpcClient {
             _callback: retainer,
         })
     }
+
+    /// Call `getChainTip`. Returns the confirmed share-chain tip
+    /// blockhash, or `Uninitialised` if the daemon has not yet
+    /// completed genesis setup.
+    pub async fn get_chain_tip(&self) -> Result<ChainTipResult, IpcClientError> {
+        let req = self.client.get_chain_tip_request();
+        let reply = req.send().promise.await?;
+        let result = reply.get()?.get_result()?;
+        Ok(match result.which()? {
+            chain_tip_result::Which::Tip(bytes) => {
+                let bytes = bytes?;
+                ChainTipResult::Tip(decode_block_hash(bytes)?)
+            }
+            chain_tip_result::Which::Uninitialised(()) => ChainTipResult::Uninitialised,
+        })
+    }
+
+    /// Call `getShareHeader`. Returns the engine-relevant subset of
+    /// the daemon's `ShareHeader` plus discrete `NotFound` and
+    /// `Genesis` variants so the caller can distinguish a missing
+    /// header (truncated walk) from the genesis sentinel.
+    pub async fn get_share_header(
+        &self,
+        share_hash: &BlockHash,
+    ) -> Result<ShareHeaderLookup, IpcClientError> {
+        let mut req = self.client.get_share_header_request();
+        // Bitcoin block hashes are little-endian on the wire we use
+        // (raw 32-byte sha256d output). The IPC schema treats them
+        // as opaque 32-byte payloads so the encoding matches.
+        let bytes = *share_hash.as_raw_hash().as_byte_array();
+        req.get().set_share_hash(&bytes);
+        let reply = req.send().promise.await?;
+        let result = reply.get()?.get_result()?;
+        Ok(match result.which()? {
+            share_header_result::Which::Found(found) => {
+                let found = found?;
+                let prev_bytes = found.get_prev_share_blockhash()?;
+                let prev = decode_block_hash(prev_bytes)?;
+                // Map the daemon's all-zeros sentinel encoding to
+                // an explicit `None`, so engine-side reorg-walk
+                // logic doesn't have to know about it.
+                let prev = if prev.as_raw_hash().as_byte_array().iter().all(|b| *b == 0) {
+                    None
+                } else {
+                    Some(prev)
+                };
+                ShareHeaderLookup::Found(ShareHeaderRead {
+                    prev_share_blockhash: prev,
+                })
+            }
+            share_header_result::Which::NotFound(()) => ShareHeaderLookup::NotFound,
+            share_header_result::Which::Genesis(()) => ShareHeaderLookup::Genesis,
+        })
+    }
+
+    /// Call `getTipHeight`. Returns the confirmed share-chain tip
+    /// height, or `Uninitialised` when the daemon has not yet
+    /// completed genesis setup.
+    pub async fn get_tip_height(&self) -> Result<TipHeightResult, IpcClientError> {
+        let req = self.client.get_tip_height_request();
+        let reply = req.send().promise.await?;
+        let result = reply.get()?.get_result()?;
+        Ok(match result.which()? {
+            tip_height_result::Which::Height(h) => TipHeightResult::Height(h),
+            tip_height_result::Which::Uninitialised(()) => TipHeightResult::Uninitialised,
+        })
+    }
+
+    /// Call `getNetwork`. Returns the bitcoin network the daemon
+    /// was configured with. Expected to be called exactly once at
+    /// startup and cached by the caller (the daemon does not
+    /// support hot-swapping networks).
+    ///
+    /// An `unknown` discriminant from a future schema version is
+    /// surfaced as an `IpcClientError::Capnp(capnp::Error::failed)`
+    /// rather than silently mapped to a default — the engine and
+    /// pool wiring rely on the network being one of the bitcoin-rs
+    /// variants for share-chain configuration.
+    pub async fn get_network(&self) -> Result<bitcoin::Network, IpcClientError> {
+        let req = self.client.get_network_request();
+        let reply = req.send().promise.await?;
+        let result = reply.get()?.get_result()?;
+        Ok(match result.which()? {
+            network_result::Which::Mainnet(()) => bitcoin::Network::Bitcoin,
+            network_result::Which::Testnet(()) => bitcoin::Network::Testnet,
+            network_result::Which::Testnet4(()) => bitcoin::Network::Testnet4,
+            network_result::Which::Regtest(()) => bitcoin::Network::Regtest,
+            network_result::Which::Signet(()) => bitcoin::Network::Signet,
+            network_result::Which::Unknown(()) => {
+                return Err(IpcClientError::Capnp(capnp::Error::failed(
+                    "getNetwork: server returned `unknown` variant".into(),
+                )));
+            }
+        })
+    }
+}
+
+/// Decode a 32-byte blockhash payload. Mismatched lengths are a
+/// schema-level invariant violation and surface as
+/// [`IpcClientError::BlockHashDecode`] rather than collapsing into a
+/// generic capnp error.
+fn decode_block_hash(bytes: &[u8]) -> Result<BlockHash, IpcClientError> {
+    if bytes.len() != 32 {
+        return Err(IpcClientError::BlockHashDecode { got: bytes.len() });
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(bytes);
+    Ok(BlockHash::from_raw_hash(
+        bitcoin::hashes::sha256d::Hash::from_byte_array(arr),
+    ))
 }
 
 /// Callback registration token. Drop it to release the client-side
@@ -496,6 +682,196 @@ mod tests {
                     "expected on_new_tip callback to fire within 1s; got {:x?}",
                     received.lock().unwrap()
                 );
+            })
+            .await;
+    }
+
+    /// In-memory `ChainReadBackend` for round-trip tests. Mirrors
+    /// the shape of the real daemon adapter without requiring a
+    /// running p2poolv2 store.
+    struct FakeBackend {
+        tip: Option<[u8; 32]>,
+        height: Option<u32>,
+        network: bitcoin::Network,
+        headers: std::collections::HashMap<[u8; 32], [u8; 32]>,
+    }
+
+    impl p2poolv2_ipc::ChainReadBackend for FakeBackend {
+        fn get_chain_tip(&self) -> Result<Option<[u8; 32]>, String> {
+            Ok(self.tip)
+        }
+        fn get_share_header(
+            &self,
+            share_hash: &[u8; 32],
+        ) -> Result<p2poolv2_ipc::ShareHeaderOutcome, String> {
+            if share_hash.iter().all(|b| *b == 0) {
+                return Ok(p2poolv2_ipc::ShareHeaderOutcome::Genesis);
+            }
+            match self.headers.get(share_hash) {
+                Some(prev) => Ok(p2poolv2_ipc::ShareHeaderOutcome::Found {
+                    prev_share_blockhash: *prev,
+                }),
+                None => Ok(p2poolv2_ipc::ShareHeaderOutcome::NotFound),
+            }
+        }
+        fn get_tip_height(&self) -> Result<Option<u32>, String> {
+            Ok(self.height)
+        }
+        fn network(&self) -> bitcoin::Network {
+            self.network
+        }
+    }
+
+    #[tokio::test]
+    async fn get_chain_tip_round_trip_via_uds() {
+        use std::sync::Arc;
+
+        let (_dir, sock) = temp_socket();
+
+        let mut tip = [0u8; 32];
+        tip[31] = 0xab;
+        let backend: Arc<dyn p2poolv2_ipc::ChainReadBackend> = Arc::new(FakeBackend {
+            tip: Some(tip),
+            height: Some(7),
+            network: bitcoin::Network::Regtest,
+            headers: Default::default(),
+        });
+        let _server = p2poolv2_ipc::spawn_ipc_server_full(sock.clone(), None, Some(backend));
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                wait_for_socket(&sock, Duration::from_secs(2)).await;
+                let client = Sv2P2poolIpcClient::connect(&sock).await.expect("connect");
+
+                match client.get_chain_tip().await.expect("get_chain_tip ok") {
+                    ChainTipResult::Tip(h) => {
+                        let bytes = *h.as_raw_hash().as_byte_array();
+                        assert_eq!(bytes, tip, "expected tip bytes to round-trip exactly");
+                    }
+                    ChainTipResult::Uninitialised => panic!("expected Tip variant"),
+                }
+
+                match client.get_tip_height().await.expect("get_tip_height ok") {
+                    TipHeightResult::Height(h) => assert_eq!(h, 7),
+                    TipHeightResult::Uninitialised => panic!("expected Height"),
+                }
+
+                let net = client.get_network().await.expect("get_network ok");
+                assert_eq!(net, bitcoin::Network::Regtest);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn get_chain_tip_uninitialised_when_no_genesis() {
+        use std::sync::Arc;
+
+        let (_dir, sock) = temp_socket();
+        let backend: Arc<dyn p2poolv2_ipc::ChainReadBackend> = Arc::new(FakeBackend {
+            tip: None,
+            height: None,
+            network: bitcoin::Network::Regtest,
+            headers: Default::default(),
+        });
+        let _server = p2poolv2_ipc::spawn_ipc_server_full(sock.clone(), None, Some(backend));
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                wait_for_socket(&sock, Duration::from_secs(2)).await;
+                let client = Sv2P2poolIpcClient::connect(&sock).await.expect("connect");
+
+                let tip = client.get_chain_tip().await.expect("ok");
+                assert!(matches!(tip, ChainTipResult::Uninitialised));
+                let h = client.get_tip_height().await.expect("ok");
+                assert_eq!(h, TipHeightResult::Uninitialised);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn get_share_header_three_variants_round_trip() {
+        use std::sync::Arc;
+
+        let (_dir, sock) = temp_socket();
+
+        let mut h = [0u8; 32];
+        h[31] = 0x11;
+        let mut prev = [0u8; 32];
+        prev[31] = 0x22;
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(h, prev);
+        let backend: Arc<dyn p2poolv2_ipc::ChainReadBackend> = Arc::new(FakeBackend {
+            tip: None,
+            height: None,
+            network: bitcoin::Network::Regtest,
+            headers,
+        });
+        let _server = p2poolv2_ipc::spawn_ipc_server_full(sock.clone(), None, Some(backend));
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                wait_for_socket(&sock, Duration::from_secs(2)).await;
+                let client = Sv2P2poolIpcClient::connect(&sock).await.expect("connect");
+
+                let h_hash = bitcoin::BlockHash::from_raw_hash(
+                    bitcoin::hashes::sha256d::Hash::from_byte_array(h),
+                );
+                match client
+                    .get_share_header(&h_hash)
+                    .await
+                    .expect("get_share_header ok")
+                {
+                    ShareHeaderLookup::Found(read) => {
+                        let prev_hash = read.prev_share_blockhash.expect("non-zero prev");
+                        let bytes = *prev_hash.as_raw_hash().as_byte_array();
+                        assert_eq!(bytes, prev);
+                    }
+                    other => panic!("expected Found, got {other:?}"),
+                }
+
+                // Genesis sentinel: all-zeros input must produce
+                // ShareHeaderLookup::Genesis at the wire level.
+                let zeros = bitcoin::BlockHash::from_raw_hash(
+                    bitcoin::hashes::sha256d::Hash::from_byte_array([0u8; 32]),
+                );
+                match client.get_share_header(&zeros).await.expect("ok") {
+                    ShareHeaderLookup::Genesis => {}
+                    other => panic!("expected Genesis, got {other:?}"),
+                }
+
+                // Unknown hash → NotFound.
+                let mut bogus = [0u8; 32];
+                bogus[0] = 0x99;
+                let bogus_hash = bitcoin::BlockHash::from_raw_hash(
+                    bitcoin::hashes::sha256d::Hash::from_byte_array(bogus),
+                );
+                match client.get_share_header(&bogus_hash).await.expect("ok") {
+                    ShareHeaderLookup::NotFound => {}
+                    other => panic!("expected NotFound, got {other:?}"),
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn get_chain_tip_unimplemented_without_backend() {
+        // The Phase-2 stub server with no chain backend wired must
+        // surface `unimplemented` from the new chain-read methods —
+        // not silently succeed. Confirms the negative path so we
+        // don't accidentally regress the daemon's expected wiring.
+        let (_dir, sock) = temp_socket();
+        let _server = p2poolv2_ipc::spawn_ipc_server(sock.clone());
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                wait_for_socket(&sock, Duration::from_secs(2)).await;
+                let client = Sv2P2poolIpcClient::connect(&sock).await.expect("connect");
+                let res = client.get_chain_tip().await;
+                assert!(res.is_err(), "expected error from unwired backend");
             })
             .await;
     }
