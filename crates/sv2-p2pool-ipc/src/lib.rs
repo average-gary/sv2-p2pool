@@ -736,8 +736,7 @@ mod tests {
             network: bitcoin::Network::Regtest,
             headers: Default::default(),
         });
-        let _server =
-            p2poolv2_ipc::spawn_ipc_server_full(sock.clone(), None, Some(backend));
+        let _server = p2poolv2_ipc::spawn_ipc_server_full(sock.clone(), None, Some(backend));
 
         let local = tokio::task::LocalSet::new();
         local
@@ -775,8 +774,7 @@ mod tests {
             network: bitcoin::Network::Regtest,
             headers: Default::default(),
         });
-        let _server =
-            p2poolv2_ipc::spawn_ipc_server_full(sock.clone(), None, Some(backend));
+        let _server = p2poolv2_ipc::spawn_ipc_server_full(sock.clone(), None, Some(backend));
 
         let local = tokio::task::LocalSet::new();
         local
@@ -810,8 +808,7 @@ mod tests {
             network: bitcoin::Network::Regtest,
             headers,
         });
-        let _server =
-            p2poolv2_ipc::spawn_ipc_server_full(sock.clone(), None, Some(backend));
+        let _server = p2poolv2_ipc::spawn_ipc_server_full(sock.clone(), None, Some(backend));
 
         let local = tokio::task::LocalSet::new();
         local

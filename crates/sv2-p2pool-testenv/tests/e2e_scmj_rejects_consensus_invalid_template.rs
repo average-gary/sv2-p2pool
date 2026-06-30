@@ -103,7 +103,7 @@ async fn e2e_scmj_rejects_consensus_invalid_template() {
         .await;
 
     let mock_rpc_url = mock_server.uri();
-    eprintln!("wiremock RPC interceptor: {}", mock_rpc_url);
+    eprintln!("wiremock RPC interceptor: {mock_rpc_url}");
 
     let p2pool = P2poolV2DBuilder::new(&env.bitcoind)
         .with_network(bitcoin::Network::Regtest)

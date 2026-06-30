@@ -37,7 +37,9 @@ pub mod reorg_detector;
 pub mod share_chain_reader;
 pub mod tdp;
 
-pub use block::{BlockReconstructError, build_candidate_block, reconstruct_block, reconstruct_header};
+pub use block::{
+    BlockReconstructError, build_candidate_block, reconstruct_block, reconstruct_header,
+};
 pub use coinbase::{
     CoinbaseReconstructError, merkle_path, reconstruct_coinbase,
     reconstruct_coinbase_with_extranonce,
@@ -283,6 +285,14 @@ pub type UserIdentifierIndex = Arc<DashMap<String, JdToken>>;
 /// across the trait boundary, while this map is engine-internal state.
 pub type AllocatedTokenMap = Arc<DashMap<JdToken, RequestId>>;
 
+/// Test-only payout-script resolver type. Stored under
+/// `P2poolV2Engine::test_payout_resolver` so tests can stub the
+/// per-miner payout-script lookup without standing up the (future)
+/// accounting selector. Production paths leave this `None` — the cfg
+/// gate enforces that at compile time.
+#[cfg(test)]
+type TestPayoutResolver = Box<dyn Fn(&str) -> Option<ScriptBuf> + Send + Sync>;
+
 /// Backend handles for the engine.
 ///
 /// When present, the trait methods perform real share-chain validation
@@ -362,9 +372,7 @@ pub struct P2poolV2Engine {
     /// leave this `None` — the cfg gate makes that a compile-time
     /// guarantee.
     #[cfg(test)]
-    test_payout_resolver: std::sync::Mutex<
-        Option<Box<dyn Fn(&str) -> Option<ScriptBuf> + Send + Sync>>,
-    >,
+    test_payout_resolver: std::sync::Mutex<Option<TestPayoutResolver>>,
     recent_solutions: Arc<RecentSolutions>,
     /// Bitcoin network this engine targets. Used by accounting + payout.
     network: bitcoin::Network,

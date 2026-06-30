@@ -597,8 +597,7 @@ impl JobValidationEngine for P2poolV2Engine {
                 }
 
                 match outcome {
-                    Ok(ProposalOutcome::Accepted)
-                    | Ok(ProposalOutcome::Duplicate) => {
+                    Ok(ProposalOutcome::Accepted) | Ok(ProposalOutcome::Duplicate) => {
                         // Fall through to Success.
                     }
                     Ok(ProposalOutcome::Rejected(reason)) => {
@@ -1042,13 +1041,11 @@ impl JobValidationEngine for P2poolV2Engine {
         //    transient inverse-miss is harmless — at worst a concurrent
         //    duplicate allocation falls back to pool-wide.
         self.token_payout.insert(token, script);
-        self.user_identifier_index()
-            .insert(normalized, token);
+        self.user_identifier_index().insert(normalized, token);
 
         debug!(
             token,
-            serialized_len,
-            "handle_allocate_mining_job_token: per-miner payout binding installed"
+            serialized_len, "handle_allocate_mining_job_token: per-miner payout binding installed"
         );
         Some(candidate)
     }
@@ -1882,9 +1879,7 @@ mod tests {
         };
 
         use crate::share_chain_reader::mock::MockShareChain;
-        use crate::{
-            EngineHandles, EngineMetrics, ShareChainReader, TdpHandle, tdp::TxDataResult,
-        };
+        use crate::{EngineHandles, EngineMetrics, ShareChainReader, TdpHandle, tdp::TxDataResult};
 
         // submit_block always returns Err; everything else falls through
         // to "unscripted" but the test path only touches submit_block.
@@ -2061,9 +2056,7 @@ mod tests {
         };
 
         use crate::share_chain_reader::mock::MockShareChain;
-        use crate::{
-            EngineHandles, EngineMetrics, ShareChainReader, TdpHandle, tdp::TxDataResult,
-        };
+        use crate::{EngineHandles, EngineMetrics, ShareChainReader, TdpHandle, tdp::TxDataResult};
 
         let registry = Registry::new();
         let metrics = EngineMetrics::register(&registry).expect("register");
@@ -2492,9 +2485,8 @@ mod tests {
         let registry = Registry::new();
         let metrics = EngineMetrics::register(&registry).expect("register");
 
-        let mock_bitcoind = Arc::new(
-            MockBitcoind::default().with_proposal_outcome(ProposalOutcome::Accepted),
-        );
+        let mock_bitcoind =
+            Arc::new(MockBitcoind::default().with_proposal_outcome(ProposalOutcome::Accepted));
         let bitcoind: Arc<dyn BitcoindLike> = mock_bitcoind.clone();
 
         let (engine, custom) = scmj_validation_fixture(bitcoind, metrics.clone()).await;
@@ -2792,7 +2784,9 @@ mod tests {
         let engine = P2poolV2Engine::default();
         // Pre-populate as if handle_allocate_mining_job_token ran.
         engine.token_payout().insert(99, payout_script(4));
-        engine.user_identifier_index().insert("miner-A".to_string(), 99);
+        engine
+            .user_identifier_index()
+            .insert("miner-A".to_string(), 99);
         assert_eq!(engine.token_payout().len(), 1);
 
         TokenPayoutEvictor::on_allocated_evicted(&engine, 99);
@@ -2806,7 +2800,9 @@ mod tests {
         // The map is keyed by the *allocated* token; the active token
         // is only used for the TokenManager's own bookkeeping.
         engine.token_payout().insert(7, payout_script(5));
-        engine.user_identifier_index().insert("miner-B".to_string(), 7);
+        engine
+            .user_identifier_index()
+            .insert("miner-B".to_string(), 7);
 
         // active_token=42, allocated_token=7.
         TokenPayoutEvictor::on_active_evicted(&engine, 42, 7);
@@ -2820,7 +2816,9 @@ mod tests {
         // poison anything.
         let engine = P2poolV2Engine::default();
         engine.token_payout().insert(1, payout_script(6));
-        engine.user_identifier_index().insert("miner-C".to_string(), 1);
+        engine
+            .user_identifier_index()
+            .insert("miner-C".to_string(), 1);
 
         TokenPayoutEvictor::on_allocated_evicted(&engine, 999);
         // Unrelated entry survives.

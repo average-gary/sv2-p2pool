@@ -70,8 +70,7 @@
 use std::time::Duration;
 
 use sv2_p2pool_testenv::{
-    JdClientDBuilder, MujinaMinerDBuilder, Sv2P2poolDBuilder, TestEnvBuilder,
-    TranslatorSv2DBuilder,
+    JdClientDBuilder, MujinaMinerDBuilder, Sv2P2poolDBuilder, TestEnvBuilder, TranslatorSv2DBuilder,
 };
 
 #[test]
@@ -191,7 +190,8 @@ fn two_jdcs_with_distinct_user_identity_both_land_shares() {
                                 .is_some_and(|v| v > 0.0)
                     })
                 };
-                saw(&format!("user_identity=\"{ALICE}\"")) && saw(&format!("user_identity=\"{BOB}\""))
+                saw(&format!("user_identity=\"{ALICE}\""))
+                    && saw(&format!("user_identity=\"{BOB}\""))
             },
             Duration::from_secs(120),
         )

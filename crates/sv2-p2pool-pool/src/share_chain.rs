@@ -869,9 +869,8 @@ async fn actor_main(
                 }
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&bytes);
-                let tip = BlockHash::from_raw_hash(
-                    bitcoin::hashes::sha256d::Hash::from_byte_array(arr),
-                );
+                let tip =
+                    BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(arr));
                 tip_snapshot_for_cb.store_tip(tip);
                 // broadcast::Sender::send is non-blocking; it returns
                 // Err only when there are no subscribers, which we

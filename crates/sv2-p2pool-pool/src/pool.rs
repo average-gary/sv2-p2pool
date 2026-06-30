@@ -29,8 +29,7 @@ use std::thread::JoinHandle as ThreadJoinHandle;
 use async_channel::unbounded;
 use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
 use jd_server_sv2::job_declarator::{
-    JobDeclarator, job_validation::JobValidationEngine,
-    token_management::TokenPayoutEvictor,
+    JobDeclarator, job_validation::JobValidationEngine, token_management::TokenPayoutEvictor,
 };
 use p2poolv2_lib::config::Config as P2poolConfig;
 use pool_sv2::{
@@ -260,8 +259,7 @@ impl Pool {
                     let period = sv2_p2pool_engine::DEFAULT_POLL_PERIOD;
                     let handle = tokio::spawn(async move {
                         let mut ticker = tokio::time::interval(period);
-                        ticker
-                            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                         loop {
                             ticker.tick().await;
                             match snapshot_for_publisher.load_height() {
@@ -286,9 +284,7 @@ impl Pool {
                         // to a transition to `true`.
                         loop {
                             if *shutdown_rx.borrow() {
-                                error!(
-                                    "IpcChain actor thread reports shutdown — cancelling pool"
-                                );
+                                error!("IpcChain actor thread reports shutdown — cancelling pool");
                                 cancel.cancel();
                                 return;
                             }
@@ -317,8 +313,7 @@ impl Pool {
                     let period = sv2_p2pool_engine::DEFAULT_POLL_PERIOD;
                     let handle = tokio::spawn(async move {
                         let mut ticker = tokio::time::interval(period);
-                        ticker
-                            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                         loop {
                             ticker.tick().await;
                             match chain_store_for_publisher.get_tip_height() {
