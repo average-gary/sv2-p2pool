@@ -42,7 +42,10 @@ fn translator_boots_atop_jd_client_sv2() {
         .with_ready_timeout(Duration::from_secs(15))
         .build()
         .expect("sv2-p2pool starts");
-    eprintln!("sv2-p2pool: jds={} mining={}", sv2.jds_addr, sv2.mining_addr);
+    eprintln!(
+        "sv2-p2pool: jds={} mining={}",
+        sv2.jds_addr, sv2.mining_addr
+    );
 
     let jdc = JdClientDBuilder::new(&env.bitcoind, &sv2)
         .with_network(bitcoin::Network::Testnet4)
