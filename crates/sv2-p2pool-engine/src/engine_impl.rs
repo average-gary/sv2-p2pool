@@ -13,6 +13,7 @@
 
 use async_trait::async_trait;
 use bitcoin::{TxMerkleNode, Wtxid, hashes::Hash};
+use bitcoindrpc::ProposalOutcome;
 use jd_server_sv2::job_declarator::job_validation::{
     DeclareMiningJobResult, JobValidationEngine, SetCustomMiningJobResult,
 };
@@ -526,6 +527,124 @@ impl JobValidationEngine for P2poolV2Engine {
             return bump_and_return(SetCustomMiningJobResult::Error(
                 ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_MERKLE_PATH,
             ));
+        }
+
+        // 9. (Track B) Bitcoind-side block-proposal validation. When
+        //    both the Template Provider bridge AND a `template_id` are
+        //    available, build the candidate block and hand it to
+        //    `BitcoindLike::validate_block_proposal` (BIP 23 proposal
+        //    mode). This catches consensus-invalid templates BEFORE the
+        //    JDS acknowledges the custom job — preventing the share
+        //    chain from accepting work that bitcoind would never accept.
+        //
+        //    Structural-only fallback: when TDP isn't wired, the cached
+        //    job has no `template_id`, or `EngineHandles` are absent,
+        //    skip proposal validation and accept on structural checks
+        //    alone. This preserves the existing handles-less test path.
+        match (self.tdp(), self.handles(), declared.template_id) {
+            (Some(tdp), Some(handles), Some(template_id)) => {
+                let tx_bodies = match tdp.request_tx_bodies(template_id).await {
+                    Ok(txs) => txs,
+                    Err(e) => {
+                        warn!(
+                            request_id,
+                            template_id,
+                            error = %e,
+                            "SetCustomMiningJob: TDP fetch of tx bodies failed before proposal-validation; falling back to structural-only acceptance"
+                        );
+                        if let Some(m) = self.metrics() {
+                            m.set_custom_mining_job_validation_skipped.inc();
+                        }
+                        // Treat as skip rather than reject: the JDC
+                        // didn't do anything wrong, we just lost
+                        // upstream context. The structural checks
+                        // above are still binding.
+                        info!(
+                            request_id,
+                            allocated_token, "SetCustomMiningJob accepted (validation skipped)"
+                        );
+                        return bump_and_return(SetCustomMiningJobResult::Success);
+                    }
+                };
+
+                let candidate = match crate::block::build_candidate_block(
+                    &declared,
+                    &set_custom_mining_job,
+                    tx_bodies,
+                ) {
+                    Ok(block) => block,
+                    Err(e) => {
+                        warn!(
+                            request_id,
+                            template_id,
+                            error = %e,
+                            "SetCustomMiningJob: candidate-block construction failed before proposal-validation"
+                        );
+                        return bump_and_return(SetCustomMiningJobResult::Error(
+                            ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_COINBASE_TX,
+                        ));
+                    }
+                };
+
+                let timer = self
+                    .metrics()
+                    .map(|m| m.set_custom_mining_job_validation_seconds.start_timer());
+                let outcome = handles.bitcoind.validate_block_proposal(&candidate).await;
+                if let Some(t) = timer {
+                    t.observe_duration();
+                }
+
+                match outcome {
+                    Ok(ProposalOutcome::Accepted)
+                    | Ok(ProposalOutcome::Duplicate) => {
+                        // Fall through to Success.
+                    }
+                    Ok(ProposalOutcome::Rejected(reason)) => {
+                        warn!(
+                            request_id,
+                            template_id,
+                            reject_reason = %reason,
+                            "SetCustomMiningJob: bitcoind validate_block_proposal rejected the candidate block"
+                        );
+                        if let Some(m) = self.metrics() {
+                            m.record_scmj_proposal_rejection(
+                                crate::ScmjProposalRejectReason::ConsensusRejected,
+                            );
+                        }
+                        return bump_and_return(SetCustomMiningJobResult::Error(
+                            ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_COINBASE_TX,
+                        ));
+                    }
+                    Err(e) => {
+                        warn!(
+                            request_id,
+                            template_id,
+                            error = %e,
+                            "SetCustomMiningJob: validate_block_proposal RPC error; rejecting"
+                        );
+                        if let Some(m) = self.metrics() {
+                            m.record_scmj_proposal_rejection(
+                                crate::ScmjProposalRejectReason::RpcError,
+                            );
+                        }
+                        return bump_and_return(SetCustomMiningJobResult::Error(
+                            ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_COINBASE_TX,
+                        ));
+                    }
+                }
+            }
+            _ => {
+                debug!(
+                    request_id,
+                    has_tdp = self.tdp().is_some(),
+                    has_handles = self.handles().is_some(),
+                    has_template_id = declared.template_id.is_some(),
+                    "SetCustomMiningJob: skipping validate_block_proposal (structural-only fallback)"
+                );
+                if let Some(m) = self.metrics() {
+                    m.set_custom_mining_job_validation_skipped.inc();
+                }
+            }
         }
 
         info!(request_id, allocated_token, "SetCustomMiningJob accepted");
@@ -1555,7 +1674,7 @@ mod tests {
 
         use async_trait::async_trait;
         use bitcoin::hashes::Hash as _;
-        use bitcoindrpc::{BitcoindLike, BitcoindRpcError, GetBlockchainInfo};
+        use bitcoindrpc::{BitcoindLike, BitcoindRpcError, GetBlockchainInfo, ProposalOutcome};
         use prometheus::Registry;
         use stratum_apps::stratum_core::{
             binary_sv2::{B016M, Seq064K, Seq0255},
@@ -1604,8 +1723,8 @@ mod tests {
             async fn validate_block_proposal(
                 &self,
                 _block: &bitcoin::Block,
-            ) -> Result<bool, BitcoindRpcError> {
-                Ok(false)
+            ) -> Result<ProposalOutcome, BitcoindRpcError> {
+                Ok(ProposalOutcome::Accepted)
             }
         }
 
@@ -2009,5 +2128,303 @@ mod tests {
         engine.notify_share_chain_reorg(new_tip).await;
 
         assert!(engine.declared_jobs().is_empty());
+    }
+
+    /// Shared fixture for Track B SCMJ-time `validate_block_proposal`
+    /// tests: builds an engine wired to a TDP demux that returns a
+    /// single fake non-coinbase tx body, declares a mining job, then
+    /// returns everything the test needs to assemble and drive an
+    /// SCMJ that exercises the proposal-validation path.
+    async fn scmj_validation_fixture(
+        bitcoind: std::sync::Arc<dyn bitcoindrpc::BitcoindLike>,
+        metrics: crate::EngineMetrics,
+    ) -> (
+        P2poolV2Engine,
+        stratum_apps::stratum_core::mining_sv2::SetCustomMiningJob<'static>,
+    ) {
+        use std::sync::Arc;
+
+        use bitcoin::hashes::Hash as _;
+        use stratum_apps::stratum_core::{
+            binary_sv2::{B016M, Seq064K, Seq0255},
+            job_declaration_sv2::ProvideMissingTransactionsSuccess,
+            parsers_sv2::TemplateDistribution,
+            template_distribution_sv2::{
+                NewTemplate, RequestTransactionDataSuccess, SetNewPrevHash,
+            },
+        };
+
+        use crate::share_chain_reader::mock::MockShareChain;
+        use crate::{EngineHandles, ShareChainReader, TdpHandle, tdp::TxDataResult};
+
+        let chain: Arc<dyn ShareChainReader> = Arc::new(MockShareChain::with_no_genesis());
+        let (req_tx, req_rx) = async_channel::unbounded();
+        let tdp = TdpHandle::new(req_tx);
+
+        let tip_prev_hash_bytes = [9u8; 32];
+        let tip_nbits: u32 = 0x207fffff;
+        let tip_min_ntime: u32 = 1_700_000_000;
+        let template_id: u64 = 12345;
+
+        tdp.record_set_new_prev_hash(SetNewPrevHash {
+            template_id,
+            prev_hash: tip_prev_hash_bytes.to_vec().try_into().expect("32 bytes"),
+            header_timestamp: tip_min_ntime,
+            n_bits: tip_nbits,
+            target: [0u8; 32].to_vec().try_into().expect("32 bytes"),
+        });
+        tdp.record_new_template(NewTemplate {
+            template_id,
+            future_template: false,
+            version: 0x20000000,
+            coinbase_tx_version: 2,
+            coinbase_prefix: Vec::<u8>::new().try_into().expect("empty fits"),
+            coinbase_tx_input_sequence: 0xffff_ffff,
+            coinbase_tx_value_remaining: 50_0000_0000,
+            coinbase_tx_outputs_count: 0,
+            coinbase_tx_outputs: Vec::<u8>::new().try_into().expect("empty fits"),
+            coinbase_tx_locktime: 0,
+            merkle_path: Seq0255::new(Vec::new()).expect("empty fits"),
+        });
+
+        let cb = build_coinbase(vec![0; 16]);
+        let (prefix, suffix) = split_coinbase(&cb, 16);
+        let fake_tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from_bytes(vec![1, 2, 3, 4]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::ZERO,
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let wtxid_bytes: [u8; 32] = *fake_tx.compute_wtxid().as_byte_array();
+        let serialized_tx = bitcoin::consensus::serialize(&fake_tx);
+        let tx_bytes_for_pmts: B016M<'static> = serialized_tx.clone().try_into().expect("fits");
+        let pmts = ProvideMissingTransactionsSuccess {
+            request_id: 7,
+            transaction_list: Seq064K::new(vec![tx_bytes_for_pmts]).expect("fits"),
+        };
+
+        // Stub TP demux: when RequestTransactionData(template_id) lands,
+        // hand back the SAME fake_tx body. This is required so the
+        // candidate-block constructor's txid cross-check passes.
+        let demux_tdp = tdp.clone();
+        let stub_tx_body = serialized_tx.clone();
+        tokio::spawn(async move {
+            while let Ok(req) = req_rx.recv().await {
+                if let TemplateDistribution::RequestTransactionData(r) = req {
+                    let body: B016M<'static> = stub_tx_body.clone().try_into().expect("fits");
+                    let success = RequestTransactionDataSuccess {
+                        template_id: r.template_id,
+                        excess_data: Vec::<u8>::new().try_into().expect("empty fits"),
+                        transaction_list: Seq064K::new(vec![body]).expect("fits"),
+                    };
+                    demux_tdp.deliver_response(r.template_id, TxDataResult::Success(success));
+                }
+            }
+        });
+
+        let handles = EngineHandles { chain, bitcoind };
+        let engine = P2poolV2Engine::with_handles(bitcoin::Network::Regtest, handles)
+            .with_tdp(tdp.clone())
+            .with_metrics(metrics);
+
+        let declare = build_declare_mining_job(
+            7,
+            99,
+            0x20000000,
+            prefix.clone(),
+            suffix.clone(),
+            vec![wtxid_bytes],
+        );
+        let result = engine.handle_declare_mining_job(declare, Some(pmts)).await;
+        assert!(matches!(result, DeclareMiningJobResult::Success));
+
+        // Compute the matching SCMJ fields from the cached declared
+        // snapshot so the structural cross-checks pass and the only
+        // thing that varies between cases is what bitcoind says.
+        let cached = engine.declared_jobs().get(&7).expect("cached");
+        let reconstructed = crate::coinbase::reconstruct_coinbase(
+            &cached.coinbase_tx_prefix,
+            &cached.coinbase_tx_suffix,
+        )
+        .expect("reconstruct");
+        let outputs_serialized = bitcoin::consensus::serialize(&reconstructed.output);
+        let coinbase_txid = reconstructed.compute_txid();
+        let txid_list = cached.txid_list.as_ref().expect("txid_list").clone();
+        let merkle = crate::coinbase::merkle_path(coinbase_txid, &txid_list);
+        let merkle_arr: Vec<[u8; 32]> = merkle
+            .iter()
+            .map(|m| m.as_byte_array().to_owned())
+            .collect();
+
+        let custom = build_set_custom_mining_job(
+            99,
+            0x20000000,
+            tip_prev_hash_bytes,
+            tip_nbits,
+            outputs_serialized,
+            merkle_arr,
+        );
+
+        (engine, custom)
+    }
+
+    #[tokio::test]
+    async fn scmj_proposal_validation_accepted_falls_through_to_success() {
+        // ProposalOutcome::Accepted → SCMJ Success, no rejection counter,
+        // histogram observation present.
+        use std::sync::Arc;
+
+        use bitcoindrpc::{BitcoindLike, ProposalOutcome, mock::MockBitcoind};
+        use prometheus::Registry;
+
+        use crate::EngineMetrics;
+
+        let registry = Registry::new();
+        let metrics = EngineMetrics::register(&registry).expect("register");
+
+        let mock_bitcoind = Arc::new(
+            MockBitcoind::default().with_proposal_outcome(ProposalOutcome::Accepted),
+        );
+        let bitcoind: Arc<dyn BitcoindLike> = mock_bitcoind.clone();
+
+        let (engine, custom) = scmj_validation_fixture(bitcoind, metrics.clone()).await;
+
+        let result = engine.handle_set_custom_mining_job(custom, 99).await;
+        assert!(
+            matches!(result, SetCustomMiningJobResult::Success),
+            "Accepted proposal must produce SCMJ Success"
+        );
+        assert_eq!(metrics.set_custom_mining_job_accepted.get(), 1);
+        assert_eq!(metrics.set_custom_mining_job_rejected.get(), 0);
+        assert_eq!(
+            metrics
+                .set_custom_mining_job_proposal_rejected
+                .with_label_values(&["consensus_rejected"])
+                .get(),
+            0
+        );
+        assert_eq!(
+            metrics
+                .set_custom_mining_job_proposal_rejected
+                .with_label_values(&["rpc_error"])
+                .get(),
+            0
+        );
+        assert_eq!(
+            metrics.set_custom_mining_job_validation_skipped.get(),
+            0,
+            "validation path ran end-to-end; skip counter must stay at zero"
+        );
+        // Histogram observed at least once.
+        let h = metrics.set_custom_mining_job_validation_seconds.clone();
+        let sample_count = h.get_sample_count();
+        assert!(
+            sample_count >= 1,
+            "validation histogram must have observed the round-trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn scmj_proposal_validation_rejected_bumps_consensus_counter() {
+        // ProposalOutcome::Rejected("bad-cb-amount") → SCMJ rejected,
+        // consensus_rejected counter +1.
+        use std::sync::Arc;
+
+        use bitcoindrpc::{BitcoindLike, ProposalOutcome, mock::MockBitcoind};
+        use prometheus::Registry;
+
+        use crate::EngineMetrics;
+
+        let registry = Registry::new();
+        let metrics = EngineMetrics::register(&registry).expect("register");
+
+        let mock_bitcoind = Arc::new(
+            MockBitcoind::default()
+                .with_proposal_outcome(ProposalOutcome::Rejected("bad-cb-amount".to_string())),
+        );
+        let bitcoind: Arc<dyn BitcoindLike> = mock_bitcoind.clone();
+
+        let (engine, custom) = scmj_validation_fixture(bitcoind, metrics.clone()).await;
+
+        let result = engine.handle_set_custom_mining_job(custom, 99).await;
+        assert!(
+            matches!(result, SetCustomMiningJobResult::Error(_)),
+            "Rejected proposal must produce SCMJ Error"
+        );
+        assert_eq!(metrics.set_custom_mining_job_accepted.get(), 0);
+        assert_eq!(metrics.set_custom_mining_job_rejected.get(), 1);
+        assert_eq!(
+            metrics
+                .set_custom_mining_job_proposal_rejected
+                .with_label_values(&["consensus_rejected"])
+                .get(),
+            1,
+            "consensus_rejected must increment exactly once on Rejected"
+        );
+        assert_eq!(
+            metrics
+                .set_custom_mining_job_proposal_rejected
+                .with_label_values(&["rpc_error"])
+                .get(),
+            0,
+            "rpc_error label must stay at zero when bitcoind returned a verdict"
+        );
+        let h = metrics.set_custom_mining_job_validation_seconds.clone();
+        assert!(
+            h.get_sample_count() >= 1,
+            "histogram observes failure paths too"
+        );
+    }
+
+    #[tokio::test]
+    async fn scmj_proposal_validation_rpc_error_bumps_rpc_error_counter() {
+        // BitcoindRpcError → SCMJ rejected, rpc_error counter +1. The
+        // mock's validate_block_proposal is unscripted, which returns
+        // Err(BitcoindRpcError::Other("MockBitcoind::validate_block_proposal called without a canned response")).
+        use std::sync::Arc;
+
+        use bitcoindrpc::{BitcoindLike, mock::MockBitcoind};
+        use prometheus::Registry;
+
+        use crate::EngineMetrics;
+
+        let registry = Registry::new();
+        let metrics = EngineMetrics::register(&registry).expect("register");
+
+        let mock_bitcoind = Arc::new(MockBitcoind::default());
+        let bitcoind: Arc<dyn BitcoindLike> = mock_bitcoind.clone();
+
+        let (engine, custom) = scmj_validation_fixture(bitcoind, metrics.clone()).await;
+
+        let result = engine.handle_set_custom_mining_job(custom, 99).await;
+        assert!(
+            matches!(result, SetCustomMiningJobResult::Error(_)),
+            "RPC error must produce SCMJ Error"
+        );
+        assert_eq!(metrics.set_custom_mining_job_rejected.get(), 1);
+        assert_eq!(
+            metrics
+                .set_custom_mining_job_proposal_rejected
+                .with_label_values(&["rpc_error"])
+                .get(),
+            1,
+            "rpc_error must increment when the proposal call itself errors"
+        );
+        assert_eq!(
+            metrics
+                .set_custom_mining_job_proposal_rejected
+                .with_label_values(&["consensus_rejected"])
+                .get(),
+            0,
+            "consensus_rejected stays at zero when bitcoind never gave a verdict"
+        );
     }
 }

@@ -21,7 +21,7 @@
 //! monitoring server when one is configured; otherwise the engine
 //! constructs without metrics and `record_*` calls are no-ops.
 
-use prometheus::{IntCounter, IntCounterVec, IntGauge, Opts, Registry};
+use prometheus::{Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, Opts, Registry};
 
 /// Stable `reason` label values for [`EngineMetrics::push_solution_dropped`].
 ///
@@ -62,6 +62,39 @@ impl PushSolutionDropReason {
             Self::TdpFetchFailed => "tdp_fetch_failed",
             Self::ReconstructFailed => "reconstruct_failed",
             Self::NoHandles => "no_handles",
+        }
+    }
+}
+
+/// Stable `reason` label values for
+/// [`EngineMetrics::set_custom_mining_job_proposal_rejected`].
+///
+/// The two reasons correspond to the two distinct failure shapes returned
+/// by `BitcoindLike::validate_block_proposal`:
+///
+/// - [`Self::ConsensusRejected`] — bitcoind reached a verdict and rejected
+///   the candidate block (e.g. `"bad-cb-amount"`, `"bad-prevblk"`,
+///   `"inconclusive"`). The reject reason is logged at `warn` for triage
+///   but is NOT a label value (cardinality risk).
+/// - [`Self::RpcError`] — the RPC round-trip itself failed (transport,
+///   timeout, parser). Bitcoind never gave us a verdict.
+///
+/// Operators care about both: a sustained `consensus_rejected` rate flags
+/// a misconfigured pool (e.g. wrong payout script), while a sustained
+/// `rpc_error` rate flags bitcoind connectivity issues.
+#[derive(Debug, Clone, Copy)]
+pub enum ScmjProposalRejectReason {
+    /// `validate_block_proposal` returned `Ok(ProposalOutcome::Rejected(_))`.
+    ConsensusRejected,
+    /// `validate_block_proposal` returned `Err(BitcoindRpcError::*)`.
+    RpcError,
+}
+
+impl ScmjProposalRejectReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ConsensusRejected => "consensus_rejected",
+            Self::RpcError => "rpc_error",
         }
     }
 }
@@ -108,6 +141,34 @@ pub struct EngineMetrics {
     /// strings (see [`PushSolutionDropReason`]) so dashboards can sum
     /// across them or break out individual failure modes.
     pub push_solution_dropped: IntCounterVec,
+
+    /// `SetCustomMiningJob` calls rejected because the per-SCMJ
+    /// `validate_block_proposal` call either returned
+    /// `ProposalOutcome::Rejected` or errored out at the RPC layer.
+    /// Broken down by `reason` — see [`ScmjProposalRejectReason`].
+    ///
+    /// A non-zero `consensus_rejected` value is the most actionable
+    /// signal: it means a JDC published a template that bitcoind itself
+    /// would reject. Usually a misconfigured payout script (over-paying
+    /// coinbase) or a stale prev-hash that the upstream cross-checks
+    /// failed to catch.
+    pub set_custom_mining_job_proposal_rejected: IntCounterVec,
+
+    /// Wall-clock latency of `validate_block_proposal` calls made inside
+    /// `handle_set_custom_mining_job`. Captures both the
+    /// candidate-block construction time AND the RPC round-trip. Both
+    /// accepted and rejected outcomes observe — operators want the full
+    /// p99 latency distribution, including failure paths (which often
+    /// dominate the long tail when bitcoind is overloaded).
+    pub set_custom_mining_job_validation_seconds: Histogram,
+
+    /// `SetCustomMiningJob` calls that took the structural-only
+    /// fallback path (no TDP wired, no cached `template_id`, or no
+    /// handles). These never call `validate_block_proposal`. Tracked so
+    /// operators can confirm the pool is in full-validation mode and
+    /// alert if the ratio of validated → skipped flips (which would
+    /// silently downgrade consensus correctness).
+    pub set_custom_mining_job_validation_skipped: IntCounter,
 
     /// Current size of the declared-jobs cache. Updated periodically
     /// by the engine's stats sweeper task (same cadence as
@@ -198,6 +259,21 @@ impl EngineMetrics {
                 ),
                 &["reason"],
             )?,
+            set_custom_mining_job_proposal_rejected: IntCounterVec::new(
+                Opts::new(
+                    "sv2_p2pool_engine_set_custom_mining_job_proposal_rejected_total",
+                    "SetCustomMiningJob calls rejected because validate_block_proposal returned Rejected or errored",
+                ),
+                &["reason"],
+            )?,
+            set_custom_mining_job_validation_seconds: Histogram::with_opts(HistogramOpts::new(
+                "sv2_p2pool_engine_set_custom_mining_job_validation_seconds",
+                "Wall-clock latency of validate_block_proposal calls made during handle_set_custom_mining_job",
+            ))?,
+            set_custom_mining_job_validation_skipped: int_counter(
+                "sv2_p2pool_engine_set_custom_mining_job_validation_skipped_total",
+                "SetCustomMiningJob calls that bypassed validate_block_proposal (structural-only / no TDP / no template_id)",
+            )?,
         };
 
         for c in metrics.all_counters() {
@@ -207,6 +283,12 @@ impl EngineMetrics {
             registry.register(Box::new(g.clone()))?;
         }
         registry.register(Box::new(metrics.push_solution_dropped.clone()))?;
+        registry.register(Box::new(
+            metrics.set_custom_mining_job_proposal_rejected.clone(),
+        ))?;
+        registry.register(Box::new(
+            metrics.set_custom_mining_job_validation_seconds.clone(),
+        ))?;
 
         // Seed the tip-height gauge to -1 ("unknown") so dashboards
         // can distinguish "never polled" from "tip at height 0".
@@ -227,6 +309,14 @@ impl EngineMetrics {
                 .push_solution_dropped
                 .with_label_values(&[reason.as_str()]);
         }
+        for reason in [
+            ScmjProposalRejectReason::ConsensusRejected,
+            ScmjProposalRejectReason::RpcError,
+        ] {
+            metrics
+                .set_custom_mining_job_proposal_rejected
+                .with_label_values(&[reason.as_str()]);
+        }
 
         Ok(metrics)
     }
@@ -239,7 +329,16 @@ impl EngineMetrics {
             .inc();
     }
 
-    fn all_counters(&self) -> [&IntCounter; 10] {
+    /// Increment the
+    /// `set_custom_mining_job_proposal_rejected_total{reason}` counter
+    /// for the given reason.
+    pub fn record_scmj_proposal_rejection(&self, reason: ScmjProposalRejectReason) {
+        self.set_custom_mining_job_proposal_rejected
+            .with_label_values(&[reason.as_str()])
+            .inc();
+    }
+
+    fn all_counters(&self) -> [&IntCounter; 11] {
         [
             &self.declare_mining_job_accepted,
             &self.declare_mining_job_rejected,
@@ -251,6 +350,7 @@ impl EngineMetrics {
             &self.blocks_submit_failed,
             &self.reorg_notifications,
             &self.jobs_invalidated_total,
+            &self.set_custom_mining_job_validation_skipped,
         ]
     }
 

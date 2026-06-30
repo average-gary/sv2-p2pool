@@ -208,6 +208,15 @@ pub struct Sv2P2poolDBuilder<'a> {
     /// in milliseconds (e.g. the regtest block-submission E2E) set this
     /// to `(1, 1)` via [`Self::with_low_difficulty`].
     difficulty_override: Option<(u64, u64)>,
+    /// `Some(url)` overrides the bitcoind RPC URL written into the
+    /// generated `p2pool.toml`. Defaults to `self.bitcoind.rpc_url()`.
+    /// Used by the SCMJ-rejection E2E in `tests/` where we point
+    /// `[bitcoinrpc]` at a wiremock server that returns
+    /// `getblocktemplate` proposal-mode rejections, while leaving
+    /// IPC/templating against real bitcoind untouched. The credentials
+    /// continue to come from the real bitcoind unless an override is
+    /// supplied separately.
+    bitcoinrpc_url_override: Option<String>,
 }
 
 impl<'a> Sv2P2poolDBuilder<'a> {
@@ -219,6 +228,7 @@ impl<'a> Sv2P2poolDBuilder<'a> {
             network: bitcoin::Network::Testnet4,
             bitcoin_data_dir: None,
             difficulty_override: None,
+            bitcoinrpc_url_override: None,
         }
     }
 
@@ -254,6 +264,19 @@ impl<'a> Sv2P2poolDBuilder<'a> {
         self
     }
 
+    /// Override the bitcoind RPC URL written into the generated
+    /// `p2pool.toml`. Defaults to `bitcoind.rpc_url()` from the
+    /// `corepc-node` handle passed to [`Self::new`].
+    ///
+    /// Use this to interpose a wiremock HTTP server in front of bitcoind
+    /// (e.g. so `getblocktemplate` proposal-mode calls return a canned
+    /// rejection) without touching the underlying regtest node. The IPC
+    /// template provider continues to talk to the real bitcoind.
+    pub fn with_bitcoinrpc_url_override(mut self, url: impl Into<String>) -> Self {
+        self.bitcoinrpc_url_override = Some(url.into());
+        self
+    }
+
     /// Spawn and wait for readiness.
     pub fn build(self) -> Result<Sv2P2poolD, Sv2P2poolDError> {
         let exe = self
@@ -276,7 +299,10 @@ impl<'a> Sv2P2poolDBuilder<'a> {
         std::fs::create_dir_all(&stats_dir)
             .map_err(|e| Sv2P2poolDError::WriteConfig(e.to_string()))?;
 
-        let bitcoinrpc_url = self.bitcoind.rpc_url();
+        let bitcoinrpc_url = self
+            .bitcoinrpc_url_override
+            .clone()
+            .unwrap_or_else(|| self.bitcoind.rpc_url());
         let (user, pass) = crate::p2poolv2d::bitcoind_credentials_pub(self.bitcoind);
         let network_name = network_to_name(self.network);
         let coinbase_addr = address_for_network(self.network);

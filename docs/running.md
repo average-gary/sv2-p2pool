@@ -140,6 +140,9 @@ When `--metrics-addr` is set, the pool exposes a Prometheus scrape target at `GE
 | `sv2_p2pool_engine_declare_mining_job_missing_txns_total` | `DeclareMiningJob` calls returning `MissingTransactions` |
 | `sv2_p2pool_engine_set_custom_mining_job_accepted_total` | Successful `SetCustomMiningJob` cross-checks |
 | `sv2_p2pool_engine_set_custom_mining_job_rejected_total` | `SetCustomMiningJob` calls returning an `Error` code |
+| `sv2_p2pool_engine_set_custom_mining_job_proposal_rejected_total{reason}` | `SetCustomMiningJob` calls rejected by the ADR 0012 bitcoind pre-flight. Stable labels: `consensus_rejected` (bitcoind returned `ProposalOutcome::Rejected`), `rpc_error` (RPC round-trip failed). A non-zero `consensus_rejected` rate flags a misconfigured JDC (e.g. wrong payout script). |
+| `sv2_p2pool_engine_set_custom_mining_job_validation_seconds` | Wall-clock latency of the SCMJ-time `validate_block_proposal` round-trip (histogram; observes both accepted and rejected outcomes). |
+| `sv2_p2pool_engine_set_custom_mining_job_validation_skipped_total` | SCMJ handler took the structural-only fallback (no TDP wired, no `template_id`, or no `EngineHandles`). Watch the ratio against `…_accepted_total` — drift toward skipped silently downgrades correctness. |
 | `sv2_p2pool_engine_push_solution_received_total` | `PushSolution` messages handled |
 | `sv2_p2pool_engine_push_solution_dropped_total{reason}` | `PushSolution` messages that did not result in a `submit_block` attempt, broken down by reason. Stable labels: `no_matching_job`, `cache_race`, `no_template_id`, `tdp_fetch_failed`, `reconstruct_failed`, `no_handles`. |
 | `sv2_p2pool_engine_blocks_submitted_total` | Reconstructed blocks forwarded to `bitcoind.submit_block` (counts attempts; success and failure) |
