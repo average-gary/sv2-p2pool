@@ -195,9 +195,8 @@ impl MujinaMinerDBuilder {
         // grows a config-on-disk. Mirrors the tempdir pattern used
         // by every sibling spawner. The XDG subdir is created
         // eagerly so callers don't have to special-case missing dirs.
-        let tempdir = tempfile::tempdir().map_err(|e| {
-            MujinaMinerDError::Spawn(format!("failed to create tempdir: {e}"))
-        })?;
+        let tempdir = tempfile::tempdir()
+            .map_err(|e| MujinaMinerDError::Spawn(format!("failed to create tempdir: {e}")))?;
         let xdg_config = tempdir.path().join("config");
         std::fs::create_dir_all(&xdg_config).map_err(|e| {
             MujinaMinerDError::Spawn(format!("failed to create XDG config dir: {e}"))

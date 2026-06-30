@@ -179,7 +179,11 @@ async fn ipc_chain_get_chain_tip_returns_configured_value() {
     assert_eq!(got_tip, Some(bh(tip_bytes)), "tip round-trips over capnp");
 
     let got_height = chain.get_tip_height().await.expect("get_tip_height ok");
-    assert_eq!(got_height, Some(12_345), "tip height round-trips over capnp");
+    assert_eq!(
+        got_height,
+        Some(12_345),
+        "tip height round-trips over capnp"
+    );
 
     // Uninitialised path: clear the tip, re-read. The capnp result
     // should be the `Uninitialised` arm of `ChainTipResult` which the
@@ -262,9 +266,7 @@ async fn ipc_chain_walks_full_100_hop_ancestry_to_genesis() {
             }
             ShareHeaderLookup::Genesis => break,
             ShareHeaderLookup::NotFound => {
-                panic!(
-                    "unexpected NotFound during a fully-seeded 100-hop walk at step {walked}"
-                );
+                panic!("unexpected NotFound during a fully-seeded 100-hop walk at step {walked}");
             }
         }
     }
@@ -325,10 +327,7 @@ async fn ipc_chain_walk_truncates_on_missing_header_midway() {
             }
         }
     }
-    assert!(
-        hit_not_found,
-        "walk should hit NotFound at the yanked slot"
-    );
+    assert!(hit_not_found, "walk should hit NotFound at the yanked slot");
     // Walked 49 ancestor pointers BEFORE hitting the gap (slot 99 →
     // slot 98 → ... → slot 50 was where prev was [50], pointing to a
     // hash that no longer exists in the backend). The exact count is

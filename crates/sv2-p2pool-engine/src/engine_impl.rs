@@ -1567,9 +1567,7 @@ mod tests {
         };
 
         use crate::share_chain_reader::mock::MockShareChain;
-        use crate::{
-            EngineHandles, EngineMetrics, ShareChainReader, TdpHandle, tdp::TxDataResult,
-        };
+        use crate::{EngineHandles, EngineMetrics, ShareChainReader, TdpHandle, tdp::TxDataResult};
 
         // submit_block always returns Err; everything else falls through
         // to "unscripted" but the test path only touches submit_block.
@@ -1746,9 +1744,7 @@ mod tests {
         };
 
         use crate::share_chain_reader::mock::MockShareChain;
-        use crate::{
-            EngineHandles, EngineMetrics, ShareChainReader, TdpHandle, tdp::TxDataResult,
-        };
+        use crate::{EngineHandles, EngineMetrics, ShareChainReader, TdpHandle, tdp::TxDataResult};
 
         let registry = Registry::new();
         let metrics = EngineMetrics::register(&registry).expect("register");

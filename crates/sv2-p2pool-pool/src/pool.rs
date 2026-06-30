@@ -257,8 +257,7 @@ impl Pool {
                     let period = sv2_p2pool_engine::DEFAULT_POLL_PERIOD;
                     let handle = tokio::spawn(async move {
                         let mut ticker = tokio::time::interval(period);
-                        ticker
-                            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                         loop {
                             ticker.tick().await;
                             match snapshot_for_publisher.load_height() {
@@ -283,9 +282,7 @@ impl Pool {
                         // to a transition to `true`.
                         loop {
                             if *shutdown_rx.borrow() {
-                                error!(
-                                    "IpcChain actor thread reports shutdown — cancelling pool"
-                                );
+                                error!("IpcChain actor thread reports shutdown — cancelling pool");
                                 cancel.cancel();
                                 return;
                             }
@@ -314,8 +311,7 @@ impl Pool {
                     let period = sv2_p2pool_engine::DEFAULT_POLL_PERIOD;
                     let handle = tokio::spawn(async move {
                         let mut ticker = tokio::time::interval(period);
-                        ticker
-                            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                         loop {
                             ticker.tick().await;
                             match chain_store_for_publisher.get_tip_height() {

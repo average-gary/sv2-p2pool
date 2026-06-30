@@ -37,8 +37,7 @@
 use std::time::Duration;
 
 use sv2_p2pool_testenv::{
-    JdClientDBuilder, MujinaMinerDBuilder, Sv2P2poolDBuilder, TestEnvBuilder,
-    TranslatorSv2DBuilder,
+    JdClientDBuilder, MujinaMinerDBuilder, Sv2P2poolDBuilder, TestEnvBuilder, TranslatorSv2DBuilder,
 };
 
 #[test]
