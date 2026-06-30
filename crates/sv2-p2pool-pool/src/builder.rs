@@ -7,15 +7,21 @@
 //! # ADR 0002 — token → payout script
 //!
 //! The upstream `JobDeclarator::new` takes a single pool-wide
-//! `coinbase_reward_script` ([reference][1]). For Phase 1, every miner
-//! gets that script as their payout — matching upstream behavior. The
-//! engine's `TokenPayoutMap` is exposed via [`PoolBuilder::engine`] so
-//! a future interceptor (Phase 2 work, requires either a JDC TLV
-//! extension or an upstream sv2-apps trait change) can write per-miner
-//! overrides.
+//! `coinbase_reward_script` ([reference][1]). The engine's
+//! `TokenPayoutMap` is populated by
+//! `JobValidationEngine::handle_allocate_mining_job_token` (Option 4 —
+//! Phase 3c) when the engine's accounting selector returns a per-miner
+//! script. The JDS then emits that custom `TxOut` instead of the
+//! pool-wide default in `AllocateMiningJobTokenSuccess`, and the
+//! `TokenManager` is wired with the engine's `TokenPayoutEvictor`
+//! impl so per-token side-state drains in lockstep with the JDS's
+//! own bookkeeping.
 //!
-//! `P2poolV2Engine::lookup_payout_script` returns `None` for unknown
-//! tokens; callers should fall back to the binary's configured
+//! `P2poolV2Engine::lookup_payout_script` is consulted at
+//! share-submission time (inside `handle_push_solution`, keyed by the
+//! cached `DeclaredJob`'s `allocated_token`) so operator dashboards
+//! see the per-miner binding for each found block; callers that lack
+//! a binding fall back to the binary's configured
 //! `coinbase_reward_script`.
 //!
 //! [1]: ../../vendor/sv2-apps/pool-apps/jd-server/src/lib/job_declarator/mod.rs:111-148

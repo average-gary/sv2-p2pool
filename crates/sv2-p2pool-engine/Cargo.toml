@@ -44,6 +44,12 @@ sv2-p2pool-ipc = { path = "../sv2-p2pool-ipc" }
 # module so collectors registered by us and CM share the registry types.
 prometheus = "0.13"
 
+# Unicode normalization for `user_identifier` (NFKC) per the trait
+# contract for `JobValidationEngine::handle_allocate_mining_job_token`.
+# Pinned to the same minor used by the upstream JDS handler so the
+# normalization tables are identical across the trait boundary.
+unicode-normalization = "0.1"
+
 [dev-dependencies]
 proptest = "1"
 tokio    = { workspace = true, features = ["full", "test-util"] }

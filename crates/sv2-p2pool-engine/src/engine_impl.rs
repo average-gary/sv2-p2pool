@@ -12,10 +12,11 @@
 //! together. (Phase 1.2 detects + rejects; broader policy lives in the ADR.)
 
 use async_trait::async_trait;
-use bitcoin::{TxMerkleNode, Wtxid, hashes::Hash};
+use bitcoin::{TxMerkleNode, TxOut, Wtxid, hashes::Hash};
 use bitcoindrpc::ProposalOutcome;
-use jd_server_sv2::job_declarator::job_validation::{
-    DeclareMiningJobResult, JobValidationEngine, SetCustomMiningJobResult,
+use jd_server_sv2::job_declarator::{
+    job_validation::{DeclareMiningJobResult, JobValidationEngine, SetCustomMiningJobResult},
+    token_management::TokenPayoutEvictor,
 };
 use stratum_apps::{
     stratum_core::{
@@ -279,6 +280,7 @@ impl JobValidationEngine for P2poolV2Engine {
             template_id,
             share_chain_tip,
             validated: true,
+            allocated_token: Some(allocated_token),
         };
         self.declared_jobs().insert(request_id, snapshot);
         // Track (token → request_id) so handle_set_custom_mining_job can
@@ -595,8 +597,7 @@ impl JobValidationEngine for P2poolV2Engine {
                 }
 
                 match outcome {
-                    Ok(ProposalOutcome::Accepted)
-                    | Ok(ProposalOutcome::Duplicate) => {
+                    Ok(ProposalOutcome::Accepted) | Ok(ProposalOutcome::Duplicate) => {
                         // Fall through to Success.
                     }
                     Ok(ProposalOutcome::Rejected(reason)) => {
@@ -805,6 +806,43 @@ impl JobValidationEngine for P2poolV2Engine {
         };
         let block_hash = block.block_hash();
 
+        // 4b. Resolve the per-miner payout script bound to this job's
+        //     allocated token (ADR 0002, Option 4 — Phase 3c). The
+        //     coinbase output bytes are already baked into the cached
+        //     `coinbase_tx_prefix`/`coinbase_tx_suffix` (the JDC
+        //     produced them against the `TxOut` we returned at
+        //     `AllocateMiningJobToken` time), so this is a
+        //     defence-in-depth read: it confirms the engine still
+        //     knows which miner this block credits and gives operator
+        //     dashboards a clean signal when the binding has gone
+        //     missing (e.g. token evicted between declare and
+        //     push_solution). On `None` we fall back to the pool-wide
+        //     `coinbase_reward_script` baked into the coinbase
+        //     prefix/suffix by the JDS, which is identical to today's
+        //     behavior.
+        let payout_script = match declared.allocated_token {
+            Some(token) => self.lookup_payout_script(token),
+            None => None,
+        };
+        if let Some(ref script) = payout_script {
+            debug!(
+                request_id,
+                template_id,
+                %block_hash,
+                allocated_token = ?declared.allocated_token,
+                script_len = script.len(),
+                "PushSolution: per-miner payout binding resolved"
+            );
+        } else {
+            debug!(
+                request_id,
+                template_id,
+                %block_hash,
+                allocated_token = ?declared.allocated_token,
+                "PushSolution: no per-miner payout binding; pool-wide script applies"
+            );
+        }
+
         // 5. Record block-finder credit BEFORE submitting so a fast
         //    SubmitSharesExtended can claim it even if submit_block
         //    hasn't returned.
@@ -884,6 +922,132 @@ impl JobValidationEngine for P2poolV2Engine {
                 );
             }
         }
+    }
+
+    /// Engine hook for `AllocateMiningJobToken`.
+    ///
+    /// Per the trait contract (see
+    /// `vendor/sv2-apps/pool-apps/jd-server/src/lib/job_declarator/job_validation/mod.rs`)
+    /// the JDS calls this after `TokenManager::allocate` has produced
+    /// `token` and after `user_identifier` has already been NFKC-
+    /// normalized + ASCII-whitespace-trimmed by the upstream handler.
+    /// `coinbase_output_max_additional_size` is the serialized size of
+    /// the pool-wide default `TxOut` the JDS would otherwise emit.
+    ///
+    /// We layer a defensive copy of the same normalization on top so a
+    /// future upstream change that loosens the contract doesn't bypass
+    /// the duplicate-binding logic, then:
+    ///
+    /// 1. Resolve the per-miner script via `resolve_payout_script`
+    ///    (today: returns `None`; the accounting selector is a
+    ///    follow-up).
+    /// 2. On `Some(script)`, **first** check the inverse
+    ///    `user_identifier_index` — if the same user already has a
+    ///    live token bound to a different value, we fall back to
+    ///    `None` rather than overwrite the existing binding. The JDS
+    ///    will then use the pool-wide `coinbase_reward_script`.
+    /// 3. Otherwise, ensure the script's `TxOut` fits within
+    ///    `coinbase_output_max_additional_size`; if not, fall back to
+    ///    `None`. The JDS will not produce an oversize coinbase.
+    /// 4. On all checks passing, insert into both `token_payout` and
+    ///    `user_identifier_index` and return
+    ///    `Some(TxOut { value: 0, script_pubkey: script })`. The
+    ///    `value` field is filled in later by the coinbase reward at
+    ///    block-build time; the trait is only selecting the script.
+    async fn handle_allocate_mining_job_token(
+        &self,
+        token: stratum_apps::utils::types::JdToken,
+        user_identifier: &str,
+        coinbase_output_max_additional_size: usize,
+    ) -> Option<TxOut> {
+        // 0. Re-validate + re-normalize defensively. The JDS already does
+        //    UTF-8 strict / NFKC / ASCII-trim before reaching here, so
+        //    everything we get should be well-formed. We repeat the
+        //    cheap parts (trim, reject empty) so the engine remains
+        //    correct if a future caller bypasses the upstream normalizer.
+        let normalized: String = {
+            use unicode_normalization::UnicodeNormalization;
+            user_identifier
+                .trim_matches(|c: char| c.is_ascii_whitespace())
+                .nfkc()
+                .collect()
+        };
+        if normalized.is_empty() {
+            debug!(
+                token,
+                "handle_allocate_mining_job_token: empty user_identifier after \
+                 normalization; falling back to pool-wide script"
+            );
+            return None;
+        }
+
+        // 1. Ask the accounting selector for a per-miner script. Today
+        //    this always returns `None`; until the selector lands,
+        //    every miner gets the pool-wide fallback.
+        let script = self.resolve_payout_script(&normalized)?;
+
+        // 2. Duplicate-binding guard. If the same user_identifier
+        //    already has a live binding to a *different* token, we do
+        //    NOT overwrite — the JDC has already received the prior
+        //    binding's TxOut and will be building coinbases against
+        //    it. Returning `None` here keeps the JDS on its pool-wide
+        //    fallback for *this* token; the prior token's binding is
+        //    untouched and will continue to credit its share-finder
+        //    until evicted by the janitor.
+        //
+        //    Using `entry().or_insert_with(|| token)` would be a tighter
+        //    primitive but DashMap's `entry` API is not ergonomic for
+        //    the "match-or-take" semantics we want; a plain `get`
+        //    keeps the logic readable.
+        if let Some(existing) = self.user_identifier_index().get(&normalized) {
+            let existing_token = *existing.value();
+            if existing_token != token {
+                debug!(
+                    new_token = token,
+                    existing_token,
+                    user_identifier = %normalized,
+                    "handle_allocate_mining_job_token: user_identifier already bound to a \
+                     different live token; falling back to pool-wide script"
+                );
+                return None;
+            }
+            // Same user re-bound to the same token: idempotent; fall through.
+        }
+
+        // 3. Size budget. The serialized size of the candidate output
+        //    must fit within what the JDS would have produced
+        //    otherwise. If it doesn't, fall back rather than emit an
+        //    oversize coinbase.
+        let candidate = TxOut {
+            value: bitcoin::Amount::ZERO,
+            script_pubkey: script.clone(),
+        };
+        let serialized_len = bitcoin::consensus::serialize(&candidate).len();
+        if serialized_len > coinbase_output_max_additional_size {
+            warn!(
+                token,
+                serialized_len,
+                budget = coinbase_output_max_additional_size,
+                "handle_allocate_mining_job_token: per-miner TxOut exceeds JDS size budget; \
+                 falling back to pool-wide script"
+            );
+            return None;
+        }
+
+        // 4. Commit the binding. Insert into the forward map first so
+        //    `lookup_payout_script` succeeds immediately; the inverse
+        //    index follows. The two writes are not atomic together but
+        //    `handle_push_solution` only reads the forward map, so a
+        //    transient inverse-miss is harmless — at worst a concurrent
+        //    duplicate allocation falls back to pool-wide.
+        self.token_payout.insert(token, script);
+        self.user_identifier_index().insert(normalized, token);
+
+        debug!(
+            token,
+            serialized_len, "handle_allocate_mining_job_token: per-miner payout binding installed"
+        );
+        Some(candidate)
     }
 
     /// Hook fired by the share-chain when a tip swap happens.
@@ -1009,6 +1173,35 @@ impl JobValidationEngine for P2poolV2Engine {
             ancestors_walked = ancestors.len(),
             "notify_share_chain_reorg: selective invalidation complete"
         );
+    }
+}
+
+/// Drain the engine's per-token payout binding when the JDS's
+/// `TokenManager` evicts a token.
+///
+/// Per `TokenManager`'s contract (see
+/// `vendor/sv2-apps/pool-apps/jd-server/src/lib/job_declarator/token_management/mod.rs`):
+///
+/// - `on_allocated_evicted` fires when a token that was returned to a
+///   JDC by `AllocateMiningJobTokenSuccess` was never activated (the
+///   10-minute allocated-TTL janitor expires it, or the downstream
+///   disconnects).
+/// - `on_active_evicted` fires when an active token's 10-second TTL
+///   expires. The trait passes both the active and the originally
+///   allocated `JdToken`; we drop by the allocated value because that
+///   is the key our `token_payout` map uses (per `TokenManager::activate`
+///   doc-comment in the upstream module).
+impl TokenPayoutEvictor for P2poolV2Engine {
+    fn on_allocated_evicted(&self, token: stratum_apps::utils::types::JdToken) {
+        self.drop_token_payout(token);
+    }
+
+    fn on_active_evicted(
+        &self,
+        _active_token: stratum_apps::utils::types::JdToken,
+        allocated_token: stratum_apps::utils::types::JdToken,
+    ) {
+        self.drop_token_payout(allocated_token);
     }
 }
 
@@ -2106,6 +2299,7 @@ mod tests {
                 template_id: None,
                 share_chain_tip: None,
                 validated: true,
+                allocated_token: None,
             },
         );
         engine.declared_jobs().insert(
@@ -2120,6 +2314,7 @@ mod tests {
                 template_id: None,
                 share_chain_tip: None,
                 validated: true,
+                allocated_token: None,
             },
         );
         assert_eq!(engine.declared_jobs().len(), 2);
@@ -2290,9 +2485,8 @@ mod tests {
         let registry = Registry::new();
         let metrics = EngineMetrics::register(&registry).expect("register");
 
-        let mock_bitcoind = Arc::new(
-            MockBitcoind::default().with_proposal_outcome(ProposalOutcome::Accepted),
-        );
+        let mock_bitcoind =
+            Arc::new(MockBitcoind::default().with_proposal_outcome(ProposalOutcome::Accepted));
         let bitcoind: Arc<dyn BitcoindLike> = mock_bitcoind.clone();
 
         let (engine, custom) = scmj_validation_fixture(bitcoind, metrics.clone()).await;
@@ -2329,6 +2523,72 @@ mod tests {
         assert!(
             sample_count >= 1,
             "validation histogram must have observed the round-trip"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    //  handle_allocate_mining_job_token / TokenPayoutEvictor (Phase 3c)
+    // ------------------------------------------------------------------
+
+    /// Build a unique-ish payout script per test so the engine's
+    /// `token_payout` writes carry distinguishing bytes the assertions
+    /// can recognize.
+    fn payout_script(tag: u8) -> bitcoin::ScriptBuf {
+        // P2WPKH-ish 22-byte script with `tag` in the witness program
+        // bytes — gives us a deterministic, well-formed `ScriptBuf`
+        // without needing to construct a real address. Size is the same
+        // shape the pool-wide fallback produces, so the size budget
+        // path is exercised realistically.
+        let mut bytes = vec![0x00, 0x14];
+        bytes.extend(std::iter::repeat_n(tag, 20));
+        bitcoin::ScriptBuf::from_bytes(bytes)
+    }
+
+    #[tokio::test]
+    async fn allocate_token_returns_none_without_resolver() {
+        // Default engine: resolver returns None for every user; the
+        // trait method must propagate that as None (= JDS falls back
+        // to the pool-wide script). No state should be written.
+        let engine = P2poolV2Engine::default();
+        let result = engine
+            .handle_allocate_mining_job_token(42, "miner-1", 64)
+            .await;
+        assert!(result.is_none());
+        assert_eq!(engine.token_payout().len(), 0);
+        assert_eq!(engine.user_identifier_index().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn allocate_token_normalizes_user_identifier() {
+        // user_identifier with leading + trailing ASCII whitespace
+        // and a non-NFKC form ('fi' ligature U+FB01) should normalize
+        // before being keyed.
+        let engine = P2poolV2Engine::default();
+        let script = payout_script(1);
+        // Resolver only matches the *normalized* form so we can prove
+        // the trait method normalized before calling.
+        let expected_normalized = "final";
+        let script_clone = script.clone();
+        engine.set_test_payout_resolver(move |uid| {
+            if uid == expected_normalized {
+                Some(script_clone.clone())
+            } else {
+                None
+            }
+        });
+
+        // Input with ligature ﬁ (U+FB01) — NFKC decomposes it to 'fi'.
+        // Plus leading/trailing whitespace that the trim must strip.
+        let raw = "  \tﬁnal\n";
+        let out = engine.handle_allocate_mining_job_token(7, raw, 64).await;
+        assert!(out.is_some(), "expected a custom TxOut after normalization");
+
+        // The inverse index uses the *normalized* key.
+        assert!(engine.user_identifier_index().contains_key("final"));
+        // The forward map has the right token.
+        assert_eq!(
+            engine.lookup_payout_script(7).expect("script present"),
+            script
         );
     }
 
@@ -2426,5 +2686,144 @@ mod tests {
             0,
             "consensus_rejected stays at zero when bitcoind never gave a verdict"
         );
+    }
+
+    #[tokio::test]
+    async fn allocate_token_rejects_empty_after_trim() {
+        let engine = P2poolV2Engine::default();
+        // Whitespace-only input → empty after trim → None.
+        let out = engine
+            .handle_allocate_mining_job_token(1, "   \t  ", 64)
+            .await;
+        assert!(out.is_none());
+        // No bindings written.
+        assert!(engine.token_payout().is_empty());
+        assert!(engine.user_identifier_index().is_empty());
+    }
+
+    #[tokio::test]
+    async fn allocate_token_duplicate_user_identifier_falls_back() {
+        // Two distinct tokens for the same user_identifier should not
+        // overwrite the prior binding. The second call returns None.
+        let engine = P2poolV2Engine::default();
+        let script = payout_script(2);
+        let script_clone = script.clone();
+        engine.set_test_payout_resolver(move |_| Some(script_clone.clone()));
+
+        // First allocation succeeds.
+        let first = engine
+            .handle_allocate_mining_job_token(100, "miner-X", 64)
+            .await;
+        assert!(first.is_some());
+        assert_eq!(engine.token_payout().len(), 1);
+        assert!(engine.token_payout().contains_key(&100));
+
+        // Second allocation for the same user_identifier with a NEW
+        // token must fall back to None and NOT overwrite the prior
+        // binding.
+        let second = engine
+            .handle_allocate_mining_job_token(101, "miner-X", 64)
+            .await;
+        assert!(
+            second.is_none(),
+            "duplicate user_identifier binding must fall back to None"
+        );
+        assert_eq!(
+            engine.token_payout().len(),
+            1,
+            "second allocation must not have overwritten the prior binding"
+        );
+        assert!(engine.token_payout().contains_key(&100));
+        assert!(!engine.token_payout().contains_key(&101));
+    }
+
+    #[tokio::test]
+    async fn allocate_token_idempotent_for_same_token() {
+        // Same user_identifier + same token: idempotent — the binding
+        // sticks and a custom TxOut is returned.
+        let engine = P2poolV2Engine::default();
+        let script = payout_script(3);
+        let script_clone = script.clone();
+        engine.set_test_payout_resolver(move |_| Some(script_clone.clone()));
+
+        let first = engine
+            .handle_allocate_mining_job_token(200, "miner-Y", 64)
+            .await;
+        assert!(first.is_some());
+
+        let second = engine
+            .handle_allocate_mining_job_token(200, "miner-Y", 64)
+            .await;
+        assert!(
+            second.is_some(),
+            "same (token, user_identifier) must remain bound"
+        );
+        assert_eq!(engine.token_payout().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn allocate_token_respects_size_budget() {
+        // Force the resolver to return a script that, once wrapped in
+        // a TxOut, exceeds the size budget. Method must return None
+        // rather than emit an oversize coinbase.
+        let engine = P2poolV2Engine::default();
+        // Big script: 1024 zero bytes — way over any sane budget.
+        let big = bitcoin::ScriptBuf::from_bytes(vec![0u8; 1024]);
+        engine.set_test_payout_resolver(move |_| Some(big.clone()));
+
+        // Budget too small to fit the candidate TxOut.
+        let out = engine
+            .handle_allocate_mining_job_token(7, "miner-Z", 32)
+            .await;
+        assert!(out.is_none(), "oversize TxOut must fall back to None");
+        assert!(engine.token_payout().is_empty());
+    }
+
+    #[test]
+    fn token_payout_evictor_drops_allocated() {
+        let engine = P2poolV2Engine::default();
+        // Pre-populate as if handle_allocate_mining_job_token ran.
+        engine.token_payout().insert(99, payout_script(4));
+        engine
+            .user_identifier_index()
+            .insert("miner-A".to_string(), 99);
+        assert_eq!(engine.token_payout().len(), 1);
+
+        TokenPayoutEvictor::on_allocated_evicted(&engine, 99);
+        assert!(engine.token_payout().is_empty());
+        assert!(engine.user_identifier_index().is_empty());
+    }
+
+    #[test]
+    fn token_payout_evictor_drops_active_by_allocated_key() {
+        let engine = P2poolV2Engine::default();
+        // The map is keyed by the *allocated* token; the active token
+        // is only used for the TokenManager's own bookkeeping.
+        engine.token_payout().insert(7, payout_script(5));
+        engine
+            .user_identifier_index()
+            .insert("miner-B".to_string(), 7);
+
+        // active_token=42, allocated_token=7.
+        TokenPayoutEvictor::on_active_evicted(&engine, 42, 7);
+        assert!(engine.token_payout().is_empty());
+        assert!(engine.user_identifier_index().is_empty());
+    }
+
+    #[test]
+    fn token_payout_evictor_unknown_token_is_a_noop() {
+        // Receiving an eviction for a token we never tracked must not
+        // poison anything.
+        let engine = P2poolV2Engine::default();
+        engine.token_payout().insert(1, payout_script(6));
+        engine
+            .user_identifier_index()
+            .insert("miner-C".to_string(), 1);
+
+        TokenPayoutEvictor::on_allocated_evicted(&engine, 999);
+        // Unrelated entry survives.
+        assert_eq!(engine.token_payout().len(), 1);
+        assert!(engine.token_payout().contains_key(&1));
+        assert!(engine.user_identifier_index().contains_key("miner-C"));
     }
 }

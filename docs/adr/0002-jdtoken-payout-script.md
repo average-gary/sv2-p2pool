@@ -58,7 +58,7 @@ Concretely:
 - **Positive.** Phase 1 unblocked with no upstream-PR dependency; one new `DashMap`; eviction reuses an existing janitor; engine layering matches the rest of the codebase.
 - **Negative.** Two parallel maps keyed by `JdToken` (token-state vs payout-script) must stay in sync — mitigated by collocating their mutations in the wrapper. JDS scaling beyond a single process needs a different design (deferred).
 - **Follow-ups.**
-  1. Upstream sv2-apps issue: extend `JobValidationEngine` to own token allocation (Option 4).
+  1. Upstream sv2-apps issue: extend `JobValidationEngine` to own token allocation (Option 4). **Landed in Phase 3c — see [ADR 0013](0013-per-miner-payout-binding.md).** The trait extension and the engine wiring ship on testnet behind the accounting selector; the in-binary wrapper sketched in this ADR's Decision §1 is superseded by the engine-side `handle_allocate_mining_job_token` impl.
   2. Engine README documents the wrapper and the lifetime invariant.
   3. Reorg-revocation hook (open question §5 in the wiki article) is a separate ADR.
 

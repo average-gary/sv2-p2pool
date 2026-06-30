@@ -28,7 +28,9 @@ use std::thread::JoinHandle as ThreadJoinHandle;
 
 use async_channel::unbounded;
 use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
-use jd_server_sv2::job_declarator::{JobDeclarator, job_validation::JobValidationEngine};
+use jd_server_sv2::job_declarator::{
+    JobDeclarator, job_validation::JobValidationEngine, token_management::TokenPayoutEvictor,
+};
 use p2poolv2_lib::config::Config as P2poolConfig;
 use pool_sv2::{
     channel_manager::ChannelManager,
@@ -341,7 +343,15 @@ impl Pool {
         );
         info!("recent-solutions sweeper started");
 
-        let engine: Arc<dyn JobValidationEngine> = Arc::new(engine_concrete);
+        let engine_arc = Arc::new(engine_concrete);
+        // Two trait-object views of the *same* engine: one as the JDS's
+        // `JobValidationEngine` (handles all four wire-level methods),
+        // one as the `TokenManager`'s `TokenPayoutEvictor` (drains
+        // per-token side-state when the JDS evicts a token). Both
+        // share the same `Arc` so the engine isn't constructed twice.
+        // ADR 0002 (Option 4) — Phase 3c.
+        let engine: Arc<dyn JobValidationEngine> = engine_arc.clone();
+        let payout_evictor: Arc<dyn TokenPayoutEvictor> = engine_arc;
 
         // 3b. Spawn the TDP demux tasks. These bridge the CM↔TP channel
         //    pair to the engine's TdpHandle. JoinHandles are kept so
@@ -359,11 +369,12 @@ impl Pool {
             merged_to_tp_sender,
         );
         info!("TDP demux tasks spawned");
-        let jd = JobDeclarator::new(
+        let jd = JobDeclarator::new_with_payout_evictor(
             engine,
             cancellation_token.clone(),
             jds_config.coinbase_reward_script().clone(),
             task_manager.clone(),
+            Some(payout_evictor),
         )
         .await
         .map_err(PoolErrorKind::Jds)?;

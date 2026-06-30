@@ -97,6 +97,14 @@ pub struct JdClientDBuilder<'a> {
     ready_timeout: Duration,
     network: bitcoin::Network,
     bitcoin_data_dir: Option<PathBuf>,
+    /// JDC `user_identity` config field. Mirrors
+    /// [`crate::translator_sv2d::TranslatorSv2DBuilder::with_user_identity`]:
+    /// the JDC plumbs this through `DeclareMiningJob.user_identifier`,
+    /// which is what the engine's
+    /// `handle_allocate_mining_job_token` (ADR 0002 / ADR 0013) keys
+    /// its per-miner payout binding by. Tests that want two distinct
+    /// bindings spin up two JDCs with two distinct identities.
+    user_identity: String,
 }
 
 impl<'a> JdClientDBuilder<'a> {
@@ -108,6 +116,7 @@ impl<'a> JdClientDBuilder<'a> {
             ready_timeout: DEFAULT_JD_CLIENT_READY_TIMEOUT,
             network: bitcoin::Network::Testnet4,
             bitcoin_data_dir: None,
+            user_identity: "sv2-p2pool-testenv".to_string(),
         }
     }
 
@@ -131,6 +140,21 @@ impl<'a> JdClientDBuilder<'a> {
         self
     }
 
+    /// Override the JDC's `user_identity`. Defaults to
+    /// `"sv2-p2pool-testenv"`. Mirrors
+    /// [`crate::translator_sv2d::TranslatorSv2DBuilder::with_user_identity`].
+    ///
+    /// The JDC plumbs this through every `DeclareMiningJob.user_identifier`
+    /// it sends, which the engine's
+    /// `JobValidationEngine::handle_allocate_mining_job_token` impl
+    /// keys its per-miner payout binding by (ADR 0002 / ADR 0013).
+    /// Tests that need two distinct bindings stand up two JDCs with
+    /// two distinct identities.
+    pub fn with_user_identity(mut self, identity: impl Into<String>) -> Self {
+        self.user_identity = identity.into();
+        self
+    }
+
     pub fn build(self) -> Result<JdClientD, JdClientDError> {
         let exe = self
             .jd_client_exe
@@ -149,6 +173,7 @@ impl<'a> JdClientDBuilder<'a> {
         let coinbase_addr = address_for_network(self.network);
         let pool_addr = self.upstream.mining_addr;
         let jds_addr = self.upstream.jds_addr;
+        let user_identity = &self.user_identity;
 
         let mut toml = format!(
             r#"
@@ -161,7 +186,7 @@ authority_public_key = "{TEST_AUTHORITY_PUBLIC_KEY}"
 authority_secret_key = "{TEST_AUTHORITY_SECRET_KEY}"
 cert_validity_sec = 3600
 
-user_identity = "sv2-p2pool-testenv"
+user_identity = "{user_identity}"
 
 shares_per_minute = 6.0
 share_batch_size = 10
