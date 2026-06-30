@@ -37,12 +37,12 @@ pub mod reorg_detector;
 pub mod share_chain_reader;
 pub mod tdp;
 
-pub use block::{BlockReconstructError, reconstruct_block, reconstruct_header};
+pub use block::{BlockReconstructError, build_candidate_block, reconstruct_block, reconstruct_header};
 pub use coinbase::{
     CoinbaseReconstructError, merkle_path, reconstruct_coinbase,
     reconstruct_coinbase_with_extranonce,
 };
-pub use metrics::{EngineMetrics, PushSolutionDropReason};
+pub use metrics::{EngineMetrics, PushSolutionDropReason, ScmjProposalRejectReason};
 pub use recent_solutions::RecentSolutions;
 pub use reorg_detector::{DEFAULT_POLL_PERIOD, ReorgDetector};
 // Re-exports so consumers don't need to depend on `sv2-p2pool-ipc` for

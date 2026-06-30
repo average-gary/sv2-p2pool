@@ -41,3 +41,11 @@ p2poolv2_ipc      = { path = "../../vendor/p2poolv2/p2poolv2_ipc" }
 sv2-p2pool-pool   = { path = "../sv2-p2pool-pool" }
 sv2-p2pool-engine = { path = "../sv2-p2pool-engine" }
 tokio             = { workspace = true, features = ["full", "test-util"] }
+
+# wiremock backs the SCMJ-rejection E2E
+# (`tests/e2e_scmj_rejects_consensus_invalid_template.rs`): we host an
+# HTTP server that intercepts bitcoind JSON-RPC calls and returns a
+# canned `getblocktemplate` proposal-mode rejection so the engine's
+# validate_block_proposal hop fires `consensus_rejected`.
+wiremock = "0.6"
+serde_json = "1"

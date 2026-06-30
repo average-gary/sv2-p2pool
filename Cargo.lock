@@ -5194,12 +5194,14 @@ dependencies = [
  "bitcoin",
  "corepc-node",
  "p2poolv2_ipc",
+ "serde_json",
  "sv2-p2pool-engine",
  "sv2-p2pool-pool",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
