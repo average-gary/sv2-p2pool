@@ -189,6 +189,30 @@ pub struct EngineMetrics {
     /// alongside this gauge to see whether reorgs cluster at specific
     /// heights).
     pub share_chain_tip_height: IntGauge,
+
+    /// Per-miner payout binding installations, broken down by
+    /// `user_identifier`. Incremented exactly once when
+    /// `handle_allocate_mining_job_token` commits a new (token,
+    /// user_identifier → script) binding — collisions on the
+    /// duplicate-binding guard do NOT double-increment.
+    ///
+    /// The label space is unbounded (one per miner), so children are
+    /// created lazily on first insertion rather than pre-seeded at
+    /// register time. Operator dashboards should aggregate rather
+    /// than sum-by-label unless the miner set is known to be small.
+    ///
+    /// This counter is the primary E2E witness that the accounting
+    /// payout resolver was consulted per-user with a distinct script:
+    /// it is monotonic and survives the transient eviction of
+    /// `token_payout` entries under `TokenPayoutEvictor`.
+    pub payout_binding_installed_total: IntCounterVec,
+
+    /// Wall-clock latency of the installed [`crate::PayoutScriptResolver`]'s
+    /// `resolve` call. Makes the trait's sync-only contract observable:
+    /// a future implementor that reaches for `block_on(reqwest::get)`
+    /// is visible here as a long tail rather than a silent throughput
+    /// regression.
+    pub payout_resolver_resolve_duration_seconds: Histogram,
 }
 
 impl EngineMetrics {
@@ -274,6 +298,17 @@ impl EngineMetrics {
                 "sv2_p2pool_engine_set_custom_mining_job_validation_skipped_total",
                 "SetCustomMiningJob calls that bypassed validate_block_proposal (structural-only / no TDP / no template_id)",
             )?,
+            payout_binding_installed_total: IntCounterVec::new(
+                Opts::new(
+                    "sv2_p2pool_engine_payout_binding_installed_total",
+                    "Per-miner payout bindings committed by handle_allocate_mining_job_token (labelled by user_identifier)",
+                ),
+                &["user_identifier"],
+            )?,
+            payout_resolver_resolve_duration_seconds: Histogram::with_opts(HistogramOpts::new(
+                "sv2_p2pool_engine_payout_resolver_resolve_duration_seconds",
+                "Wall-clock latency of PayoutScriptResolver::resolve calls (enforces the sync-only trait contract)",
+            ))?,
         };
 
         for c in metrics.all_counters() {
@@ -288,6 +323,13 @@ impl EngineMetrics {
         ))?;
         registry.register(Box::new(
             metrics.set_custom_mining_job_validation_seconds.clone(),
+        ))?;
+        // `payout_binding_installed_total` has an unbounded label space
+        // (one per miner). Do NOT pre-create children — lazy-create on
+        // first insertion in `handle_allocate_mining_job_token`.
+        registry.register(Box::new(metrics.payout_binding_installed_total.clone()))?;
+        registry.register(Box::new(
+            metrics.payout_resolver_resolve_duration_seconds.clone(),
         ))?;
 
         // Seed the tip-height gauge to -1 ("unknown") so dashboards

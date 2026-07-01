@@ -58,6 +58,11 @@ pub struct LoadedConfigs {
     pub pool: PoolConfig,
     pub p2pool: P2poolConfig,
     pub metrics_addr: Option<SocketAddr>,
+    /// Path to the sv2-apps PoolConfig TOML — retained so callers can
+    /// re-open the same file to parse additive sections (e.g. the
+    /// sv2-p2pool `[payout]` section handled by
+    /// [`crate::payout_config`]).
+    pub pool_config_path: PathBuf,
 }
 
 /// Parse CLI arguments and load both TOML configs.
@@ -83,5 +88,6 @@ pub fn process_cli_args() -> anyhow::Result<LoadedConfigs> {
         pool,
         p2pool,
         metrics_addr: args.metrics_addr,
+        pool_config_path: args.config_path,
     })
 }

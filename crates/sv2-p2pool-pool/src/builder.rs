@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use jd_server_sv2::job_declarator::job_validation::JobValidationEngine;
 use pool_sv2::config::PoolConfig;
-use sv2_p2pool_engine::{EngineHandles, P2poolV2Engine};
+use sv2_p2pool_engine::{EngineHandles, NullResolver, P2poolV2Engine, PayoutScriptResolver};
 
 use crate::Pool;
 
@@ -42,6 +42,14 @@ use crate::Pool;
 /// a [`Pool`] given a loaded [`PoolConfig`].
 pub struct PoolBuilder {
     network: bitcoin::Network,
+    /// Optional per-miner payout-script resolver. When `Some`, gets
+    /// applied to the engine via `.with_payout_resolver` in
+    /// [`Self::build_engine`] / [`Self::build_engine_with_handles`]
+    /// AND is copied onto the returned [`Pool`] so [`Pool::start`]'s
+    /// inner engine construction can install it (the wiring fix from
+    /// ADR 0014: the outer `PoolBuilder` alone doesn't persist into
+    /// the inner `PoolBuilder::new` that `Pool::start` constructs).
+    resolver: Option<Arc<dyn PayoutScriptResolver>>,
 }
 
 impl PoolBuilder {
@@ -50,13 +58,40 @@ impl PoolBuilder {
     /// Most setups will use `bitcoin::Network::Regtest` for tests,
     /// `Signet` or `Mainnet` for deployment.
     pub fn new(network: bitcoin::Network) -> Self {
-        Self { network }
+        Self {
+            network,
+            resolver: None,
+        }
+    }
+
+    /// Install a per-miner payout-script resolver. Threaded onto the
+    /// engine at construction time by every `build_engine*` method,
+    /// AND copied onto the returned [`Pool`] so [`Pool::start`]'s
+    /// inner engine construction can pick it up (the wiring fix).
+    pub fn with_payout_resolver(mut self, resolver: Arc<dyn PayoutScriptResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
+    }
+
+    /// Borrow the currently-installed resolver, if any. Used by
+    /// `Pool::start` tests to verify the wiring.
+    pub fn payout_resolver(&self) -> Option<&Arc<dyn PayoutScriptResolver>> {
+        self.resolver.as_ref()
+    }
+
+    /// Return an `Arc<dyn PayoutScriptResolver>` for engine
+    /// installation: the caller-configured resolver, or a fresh
+    /// [`NullResolver`] when none was supplied.
+    fn resolver_or_null(&self) -> Arc<dyn PayoutScriptResolver> {
+        self.resolver
+            .clone()
+            .unwrap_or_else(|| Arc::new(NullResolver))
     }
 
     /// Build a fresh [`P2poolV2Engine`] without backend handles
     /// (structural-only mode).
     pub fn build_engine(&self) -> P2poolV2Engine {
-        P2poolV2Engine::new(self.network)
+        P2poolV2Engine::new(self.network).with_payout_resolver(self.resolver_or_null())
     }
 
     /// Build a [`P2poolV2Engine`] with real backend handles (chain +
@@ -64,6 +99,7 @@ impl PoolBuilder {
     /// share-chain config is attached to the binary.
     pub fn build_engine_with_handles(&self, handles: EngineHandles) -> P2poolV2Engine {
         P2poolV2Engine::with_handles(self.network, handles)
+            .with_payout_resolver(self.resolver_or_null())
     }
 
     /// Build the engine wrapped in `Arc<dyn JobValidationEngine>` so it
@@ -75,7 +111,12 @@ impl PoolBuilder {
     /// Build a [`Pool`] from a loaded [`PoolConfig`]. The pool isn't
     /// started until [`Pool::start`] is called.
     pub fn build_pool(self, config: PoolConfig) -> Pool {
-        Pool::new(config)
+        let resolver = self.resolver.clone();
+        let mut pool = Pool::new(config);
+        if let Some(r) = resolver {
+            pool = pool.with_payout_resolver(r);
+        }
+        pool
     }
 
     /// Build a [`Pool`] with both the sv2-apps [`PoolConfig`] and the
@@ -86,13 +127,56 @@ impl PoolBuilder {
         config: PoolConfig,
         p2pool_config: p2poolv2_lib::config::Config,
     ) -> Pool {
-        Pool::new(config).with_p2pool_config(p2pool_config)
+        let resolver = self.resolver.clone();
+        let mut pool = Pool::new(config).with_p2pool_config(p2pool_config);
+        if let Some(r) = resolver {
+            pool = pool.with_payout_resolver(r);
+        }
+        pool
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use bitcoin::ScriptBuf;
+    use sv2_p2pool_engine::StaticMapResolver;
+
     use super::*;
+
+    /// Lock the wiring fix from ADR 0014 §Correctness §1: a resolver
+    /// installed on [`PoolBuilder`] must reach [`P2poolV2Engine`]
+    /// through every `build_engine*` path.
+    #[test]
+    fn pool_builder_threads_resolver_into_engine() {
+        let resolver: Arc<dyn PayoutScriptResolver> = Arc::new(
+            StaticMapResolver::new([(
+                "miner-1".to_string(),
+                ScriptBuf::from_bytes(vec![0xaa; 22]),
+            )])
+            .expect("build resolver"),
+        );
+        let builder = PoolBuilder::new(bitcoin::Network::Regtest).with_payout_resolver(resolver);
+        // build_engine (structural-only) path.
+        let engine = builder.build_engine();
+        assert_eq!(
+            engine.payout_resolver().name(),
+            "static-map",
+            "build_engine must install the caller's resolver, not the NullResolver default"
+        );
+    }
+
+    /// Without an explicit resolver, `build_engine` produces an engine
+    /// backed by the NullResolver — preserves today's byte-for-byte
+    /// pool-wide-fallback semantics.
+    #[test]
+    fn pool_builder_defaults_to_null_resolver() {
+        let engine = PoolBuilder::new(bitcoin::Network::Regtest).build_engine();
+        assert_eq!(
+            engine.payout_resolver().name(),
+            "null",
+            "no with_payout_resolver call means NullResolver default"
+        );
+    }
 
     #[test]
     fn build_engine_arc_returns_dyn_trait() {

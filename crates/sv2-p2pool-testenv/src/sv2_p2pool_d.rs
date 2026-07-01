@@ -217,6 +217,12 @@ pub struct Sv2P2poolDBuilder<'a> {
     /// continue to come from the real bitcoind unless an override is
     /// supplied separately.
     bitcoinrpc_url_override: Option<String>,
+    /// `Some(map)` writes a `[payout.static]` block into the generated
+    /// `pool.toml` at spawn time, populated with `(user_identifier,
+    /// script_hex)` pairs. Preserves the Command::new subprocess
+    /// model — the resolver is stood up inside the spawned pool from
+    /// TOML, not injected in-process.
+    payout_static_map: Option<std::collections::HashMap<String, bitcoin::ScriptBuf>>,
 }
 
 impl<'a> Sv2P2poolDBuilder<'a> {
@@ -229,6 +235,7 @@ impl<'a> Sv2P2poolDBuilder<'a> {
             bitcoin_data_dir: None,
             difficulty_override: None,
             bitcoinrpc_url_override: None,
+            payout_static_map: None,
         }
     }
 
@@ -274,6 +281,20 @@ impl<'a> Sv2P2poolDBuilder<'a> {
     /// template provider continues to talk to the real bitcoind.
     pub fn with_bitcoinrpc_url_override(mut self, url: impl Into<String>) -> Self {
         self.bitcoinrpc_url_override = Some(url.into());
+        self
+    }
+
+    /// Attach a `[payout.static]` map. Each entry becomes a row in the
+    /// generated `pool.toml`'s `[[payout.static.entries]]` array;
+    /// `sv2-p2pool` parses it at boot and installs a
+    /// `StaticMapResolver`. The scripts are hex-encoded for TOML
+    /// transport. Preserves the Command::new subprocess model — no
+    /// in-process resolver injection.
+    pub fn with_payout_static_map(
+        mut self,
+        map: std::collections::HashMap<String, bitcoin::ScriptBuf>,
+    ) -> Self {
+        self.payout_static_map = Some(map);
         self
     }
 
@@ -343,6 +364,29 @@ min_interval = 5
 listen_address = "127.0.0.1:{jds_port}"
 "#
         ));
+
+        // Append the additive `[payout.static]` block when configured.
+        // Written as a table array so the on-disk shape matches what
+        // production operator configs use — see docs/adr/0014.
+        if let Some(map) = self.payout_static_map.as_ref() {
+            if !map.is_empty() {
+                pool_toml.push('\n');
+                // Sort keys for deterministic on-disk ordering (helps
+                // when eyeballing the tempdir output during debug).
+                let mut entries: Vec<(&String, &bitcoin::ScriptBuf)> = map.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+                for (user_identifier, script) in entries {
+                    let hex: String = script
+                        .as_bytes()
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    pool_toml.push_str(&format!(
+                        "[[payout.static.entries]]\nuser_identifier = \"{user_identifier}\"\nscript_hex = \"{hex}\"\n"
+                    ));
+                }
+            }
+        }
 
         let pool_config_path = tempdir.path().join("pool.toml");
         std::fs::write(&pool_config_path, pool_toml.as_bytes())
