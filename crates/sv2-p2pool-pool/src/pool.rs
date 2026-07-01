@@ -173,7 +173,7 @@ impl Pool {
         // outlive the engine, so we keep them on the stack here.
         let mut share_chain_handles: Option<share_chain::ShareChainHandles> = None;
         let mut engine_concrete = if let Some(p2pool_config) = self.p2pool_config.as_ref() {
-            let handles = share_chain::bootstrap_share_chain(p2pool_config)
+            let handles = share_chain::bootstrap_share_chain(p2pool_config, &self.metrics_registry)
                 .await
                 .map_err(|e| PoolErrorKind::Configuration(format!("share-chain bootstrap: {e}")))?;
             info!("share-chain handles wired into engine");

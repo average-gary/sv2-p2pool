@@ -90,6 +90,17 @@ pub enum IpcClientError {
         #[source]
         source: std::io::Error,
     },
+    /// Wraps any underlying `capnp::Error`. Also used by the pool
+    /// crate's `IpcChain` to surface per-request and connect-phase
+    /// timeouts (see `crates/sv2-p2pool-pool/src/share_chain.rs`).
+    ///
+    /// NOTE: the timeout error-message string this variant carries
+    /// is **load-bearing for observability** — Grafana / log-search
+    /// alerts match on `"IpcChain <op> timed out after"` and
+    /// `"IpcChain connect timed out after"`. If a future retry
+    /// layer needs to discriminate timeouts from other capnp
+    /// failures, promote a dedicated `Timeout` variant rather than
+    /// changing the string here.
     #[error("capnp error: {0}")]
     Capnp(#[from] capnp::Error),
     /// Server returned a `ValidationResult` discriminant the schema

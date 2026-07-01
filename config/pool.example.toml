@@ -1,4 +1,9 @@
 # sv2-p2pool example config (Phase 0 stub — not yet consumed)
+#
+# NOTE: when running sv2-p2pool alongside a p2poolv2 daemon (the
+# production IpcChain mode), the daemon needs its OWN TOML — see
+# ./p2poolv2.example.toml in this directory for the [ipc] block that
+# controls socket_path + request_timeout + connect_timeout.
 
 [pool]
 listen_address = "0.0.0.0:34254"

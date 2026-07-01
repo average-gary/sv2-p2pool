@@ -56,6 +56,10 @@ async-channel      = "1.5"
 prometheus         = "0.13"
 
 tokio              = { workspace = true }
+# `CancellationToken` used by `IpcChain` to cancel the actor's
+# connect-phase pre-init block on outer-timeout without leaking the
+# dedicated OS thread across bootstrap retries.
+tokio-util         = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow             = { workspace = true }

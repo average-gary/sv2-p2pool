@@ -49,3 +49,8 @@ tokio             = { workspace = true, features = ["full", "test-util"] }
 # validate_block_proposal hop fires `consensus_rejected`.
 wiremock = "0.6"
 serde_json = "1"
+
+# `IpcChain::connect` (in `e2e_ipc_chain.rs`) takes an
+# `IpcChainMetrics` now — build a fresh one via
+# `Registry::new()` for each test.
+prometheus = "0.13"
