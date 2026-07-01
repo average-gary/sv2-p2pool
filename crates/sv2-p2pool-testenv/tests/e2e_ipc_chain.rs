@@ -10,12 +10,19 @@
 //! `ChainReadBackend` trait is an in-memory fake so we can script the
 //! scenario.
 //!
-//! All tests are `#[ignore]` because they spawn extra threads + open
-//! UDS sockets and aren't part of the cheap default `cargo test` run.
-//! The nightly CI workflow at `.github/workflows/nightly.yml` runs
-//! `cargo test --workspace -- --ignored` and exercises these.
+//! Historically all tests here were `#[ignore]` because they spawn
+//! extra threads + open UDS sockets and weren't part of the cheap
+//! default `cargo test` run. The two 100-hop ancestor-walk tests were
+//! promoted out of `#[ignore]` (Phase 3 Track 3, item #11) because they
+//! only need a UDS tempdir and are the load-bearing coverage for the
+//! ADR 0011 § "selective invalidation" reorg walker — running them by
+//! default catches regressions faster. The remaining `#[ignore]` tests
+//! (`get_chain_tip` round-trip + 50-tip subscription burst) still bind
+//! UDS sockets on shared paths and can be flaky under parallel CI; the
+//! nightly CI workflow at `.github/workflows/nightly.yml` runs
+//! `cargo test --workspace -- --ignored` and exercises those.
 //!
-//! Run locally:
+//! Run all locally (including the nightly-only ones):
 //!
 //! ```sh
 //! cargo test -p sv2-p2pool-testenv --test e2e_ipc_chain -- --ignored
@@ -223,7 +230,6 @@ fn seed_linear_chain(backend: &ScriptedBackend, depth: usize) -> Vec<[u8; 32]> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "spawns a UDS-bound capnp daemon thread; runs in nightly --ignored"]
 async fn ipc_chain_walks_full_100_hop_ancestry_to_genesis() {
     let (_dir, sock) = temp_socket();
     let backend = Arc::new(ScriptedBackend::new(bitcoin::Network::Regtest));
@@ -283,7 +289,6 @@ async fn ipc_chain_walks_full_100_hop_ancestry_to_genesis() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "spawns a UDS-bound capnp daemon thread; runs in nightly --ignored"]
 async fn ipc_chain_walk_truncates_on_missing_header_midway() {
     let (_dir, sock) = temp_socket();
     let backend = Arc::new(ScriptedBackend::new(bitcoin::Network::Regtest));
