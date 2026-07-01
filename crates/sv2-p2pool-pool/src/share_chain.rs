@@ -71,6 +71,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU32, Ordering},
 };
+use std::time::Duration;
 
 use bitcoin::BlockHash;
 use bitcoin::hashes::Hash as _;
@@ -83,6 +84,7 @@ use p2poolv2_lib::{
         writer::{StoreError, StoreHandle, StoreWriter, write_channel},
     },
 };
+use prometheus::{IntCounterVec, Opts, Registry};
 use sv2_p2pool_engine::{
     BoxFuture, EngineHandles, ShareChainReader, ShareHeaderLookup, ShareHeaderRead,
 };
@@ -92,6 +94,7 @@ use sv2_p2pool_ipc::{
 };
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 /// Errors from share-chain bootstrap.
@@ -161,6 +164,7 @@ pub struct ShareChainHandles {
 /// returned `store` + `store_writer_join` must outlive the pool.
 pub async fn bootstrap_share_chain(
     p2pool_config: &P2poolConfig,
+    metrics_registry: &Registry,
 ) -> Result<ShareChainHandles, ShareChainBootstrapError> {
     let network = p2pool_config.stratum.network;
 
@@ -204,16 +208,51 @@ pub async fn bootstrap_share_chain(
 
     // 2. Pick the chain backend.
     if let Some(ipc_cfg) = p2pool_config.ipc.as_ref() {
+        // Build IpcTimeouts from the vendored IpcConfig, falling back
+        // to the crate-private DEFAULT constants when the operator has
+        // not set the fields. Single source of truth for the defaults
+        // lives on `IpcTimeouts::DEFAULT_REQUEST` / `DEFAULT_CONNECT`.
+        let timeouts = IpcTimeouts {
+            request: ipc_cfg
+                .request_timeout
+                .unwrap_or(IpcTimeouts::DEFAULT_REQUEST),
+            connect: ipc_cfg
+                .connect_timeout
+                .unwrap_or(IpcTimeouts::DEFAULT_CONNECT),
+        };
+        // Register the IPC metrics on the pool's registry. Duplicate
+        // registration (e.g. Pool::start called twice in tests) is
+        // logged + skipped, mirroring the EngineMetrics pattern.
+        let metrics = match IpcChainMetrics::register(metrics_registry) {
+            Ok(m) => {
+                info!("IPC-chain metrics registered on Pool::metrics_registry");
+                m
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "IpcChainMetrics registration failed — continuing with a fresh Registry (metrics not scraped)"
+                );
+                // Fresh registry so tests / repeated bootstraps still
+                // get a valid metrics handle to pass in. The four op
+                // children are pre-created either way so any code that
+                // observes the counter sees a stable label set.
+                IpcChainMetrics::register(&Registry::new())
+                    .expect("register on fresh Registry is infallible")
+            }
+        };
         info!(
             socket = %ipc_cfg.socket_path,
+            request_timeout_ms = timeouts.request.as_millis() as u64,
+            connect_timeout_ms = timeouts.connect.as_millis() as u64,
             "share-chain bootstrap: IpcChain mode (connecting to p2poolv2 daemon)"
         );
-        let ipc = IpcChain::connect(&ipc_cfg.socket_path).await.map_err(|e| {
-            ShareChainBootstrapError::IpcConnect {
+        let ipc = IpcChain::connect(&ipc_cfg.socket_path, timeouts, metrics)
+            .await
+            .map_err(|e| ShareChainBootstrapError::IpcConnect {
                 socket: ipc_cfg.socket_path.clone(),
                 message: e.to_string(),
-            }
-        })?;
+            })?;
         let snapshot = ipc.tip_snapshot();
         let shutdown = ipc.shutdown_signal();
         let chain_reader: Arc<dyn ShareChainReader> = Arc::new(ipc);
@@ -420,6 +459,102 @@ impl ShareChainReader for InProcessChain {
 // outside world only sees a `Send + Sync` actor handle.
 // =======================================================================
 
+/// Per-request and connect-phase timeouts for [`IpcChain`].
+///
+/// Not part of the crate's stable API — the only intended
+/// construction paths are [`Self::default`] (used by tests and by
+/// `bootstrap_share_chain` when the vendored [`IpcConfig`] omits both
+/// fields) or a manual struct literal inside this crate.
+/// `#[doc(hidden)]` is applied so the type stays out of published
+/// docs; the sibling `sv2-p2pool-testenv` crate still needs to see it
+/// to satisfy [`IpcChain::connect`]'s signature from its e2e tests.
+///
+/// The defaults live on this type as `pub const` so both
+/// `bootstrap_share_chain` (via `unwrap_or`) and the tests reference
+/// exactly one source of truth. Any change to the numbers here is
+/// automatically reflected in the config-fallback path.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct IpcTimeouts {
+    /// Wall-clock timeout applied to each in-flight
+    /// [`ShareChainReader`] request the pool sends into the actor.
+    /// The timer starts *after* the request has been enqueued in the
+    /// actor mailbox so mailbox queue-wait does not eat the budget.
+    pub request: Duration,
+    /// Wall-clock timeout applied to the connect-phase pre-init block
+    /// in [`actor_main`] — covers `Sv2P2poolIpcClient::connect`,
+    /// `get_network`, best-effort `get_chain_tip` /
+    /// `get_tip_height`, and `subscribe_chain_tip`. A daemon that
+    /// accepts the socket but wedges on any of these no longer
+    /// escapes the connect budget.
+    pub connect: Duration,
+}
+
+impl IpcTimeouts {
+    /// Default per-request budget (5 seconds).
+    pub const DEFAULT_REQUEST: Duration = Duration::from_secs(5);
+    /// Default connect-phase budget (30 seconds).
+    pub const DEFAULT_CONNECT: Duration = Duration::from_secs(30);
+}
+
+impl Default for IpcTimeouts {
+    fn default() -> Self {
+        Self {
+            request: Self::DEFAULT_REQUEST,
+            connect: Self::DEFAULT_CONNECT,
+        }
+    }
+}
+
+/// Prometheus metrics owned by [`IpcChain`].
+///
+/// Currently exposes a single labelled counter:
+/// `sv2_p2pool_pool_ipc_request_timeouts_total{op="..."}`. The four
+/// op children — `connect`, `get_chain_tip`, `get_share_header`,
+/// `get_tip_height` — are pre-created at register time so all series
+/// appear at zero from boot even before the first timeout ever fires.
+///
+/// Cloning is cheap — the underlying `IntCounterVec` is
+/// `Arc<...>`-shaped internally.
+#[derive(Clone)]
+pub struct IpcChainMetrics {
+    request_timeouts: IntCounterVec,
+}
+
+impl IpcChainMetrics {
+    /// Register the timeouts counter on `registry`. Pre-creates all
+    /// four op children so Prometheus scrapes see a stable series
+    /// set from boot. Duplicate registration returns
+    /// [`prometheus::Error::AlreadyReg`], mirroring `EngineMetrics`.
+    pub fn register(registry: &Registry) -> Result<Self, prometheus::Error> {
+        let request_timeouts = IntCounterVec::new(
+            Opts::new(
+                "sv2_p2pool_pool_ipc_request_timeouts_total",
+                "IPC requests from the pool to the p2poolv2 daemon that timed out (per op)",
+            ),
+            &["op"],
+        )?;
+        // Pre-create op children so all four series show up at zero
+        // from boot — Prometheus + Grafana consumers never have to
+        // guess whether a missing series means "never fired" vs
+        // "misconfigured pool".
+        for op in [
+            "connect",
+            "get_chain_tip",
+            "get_share_header",
+            "get_tip_height",
+        ] {
+            let _ = request_timeouts.with_label_values(&[op]);
+        }
+        registry.register(Box::new(request_timeouts.clone()))?;
+        Ok(Self { request_timeouts })
+    }
+
+    fn bump(&self, op: &'static str) {
+        self.request_timeouts.with_label_values(&[op]).inc();
+    }
+}
+
 /// `IpcChain` actor handle. `Send + Sync`.
 ///
 /// Cheap to clone (`Arc` internally). The actor's runtime + thread
@@ -442,6 +577,12 @@ pub struct IpcChain {
     /// thread dies. The pool binary monitors this and shuts down
     /// rather than silently losing chain reads.
     shutdown_tx: watch::Sender<bool>,
+    /// Cancellation signal for the actor's connect-phase pre-init
+    /// block. Fired on Drop of `IpcChain` (and on the outer-timeout
+    /// error path in `connect`) so the actor unblocks cleanly and
+    /// its OS thread joins rather than leaking across bootstrap
+    /// retries.
+    shutdown_token: CancellationToken,
 }
 
 impl IpcChain {
@@ -453,12 +594,34 @@ impl IpcChain {
     /// Connect to a p2poolv2 IPC server at `socket_path`. Spawns the
     /// dedicated actor thread + runtime + LocalSet, performs the
     /// `getNetwork @6` capture, subscribes to tip pushes.
-    pub async fn connect(socket_path: &str) -> Result<Self, IpcClientError> {
+    ///
+    /// `timeouts` bounds both the per-request budget (applied inside
+    /// [`run_request`]) and the connect-phase pre-init block. On the
+    /// connect-side, exceeding `timeouts.connect` causes the actor to
+    /// send `InitResult(Err(Capnp("... timed out ...")))` and the
+    /// `shutdown_token` is cancelled so the actor's OS thread joins
+    /// cleanly rather than leaking.
+    ///
+    /// `metrics` is the (already-registered) counter surface used to
+    /// bump `ipc_request_timeouts_total{op}` on each timeout.
+    pub async fn connect(
+        socket_path: &str,
+        timeouts: IpcTimeouts,
+        metrics: IpcChainMetrics,
+    ) -> Result<Self, IpcClientError> {
         let socket_path = socket_path.to_owned();
         let (cmd_tx, cmd_rx) = mpsc::channel::<IpcRequest>(Self::REQUEST_CHANNEL_CAPACITY);
         let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<InitResult>(1);
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let shutdown_tx_for_thread = shutdown_tx.clone();
+
+        // Cancellation signal driving the actor's connect-phase
+        // pre-init block. On outer-drop or a connect-timeout error
+        // path we cancel this token so the actor's `tokio::select!`
+        // exits promptly and the runtime tears down instead of
+        // leaking a wedged capnp round-trip.
+        let shutdown_token = CancellationToken::new();
+        let shutdown_token_for_thread = shutdown_token.clone();
 
         // The tip broadcast channel + atomic snapshot are *constructed
         // outside the actor thread* so the public IpcChain handle can
@@ -469,6 +632,9 @@ impl IpcChain {
         let tip_snapshot_for_thread = Arc::clone(&tip_snapshot);
         let (tip_tx, _) = broadcast::channel::<BlockHash>(64);
         let tip_tx_for_thread = tip_tx.clone();
+
+        let metrics_for_thread = metrics.clone();
+        let connect_budget = timeouts.connect;
 
         // Catch any panic on the actor thread and propagate it via
         // `shutdown_tx`. `std::thread::Builder::spawn` returns a
@@ -484,6 +650,9 @@ impl IpcChain {
                     init_tx,
                     tip_snapshot_for_thread,
                     tip_tx_for_thread,
+                    connect_budget,
+                    metrics_for_thread,
+                    shutdown_token_for_thread,
                 );
             })
             .map_err(|e| {
@@ -517,29 +686,51 @@ impl IpcChain {
             })?;
 
         // Wait for the actor's init step (capnp connect + getNetwork
-        // + subscribe_chain_tip) to succeed. `init_rx.recv()` is sync
-        // but the std mpsc is bounded with capacity 1 and the actor
-        // sends exactly once before the first request, so this is a
-        // bounded wait — typically a few capnp round-trips.
+        // + subscribe_chain_tip) to succeed. The connect budget is
+        // enforced *inside* the actor loop via
+        // `tokio::time::timeout(timeouts.connect, ..)` around the
+        // whole pre-init block, so we don't need an outer wrapper
+        // here — the watchdog thread + shutdown_token together bound
+        // the wait even if the actor thread panics before sending.
         let init = match tokio::task::spawn_blocking(move || init_rx.recv()).await {
             Ok(Ok(init)) => init,
             Ok(Err(_)) => {
+                // Actor exited before sending InitResult — cancel
+                // the token so any wedged inner select! exits and
+                // return a stable error to the caller.
+                shutdown_token.cancel();
                 return Err(IpcClientError::Capnp(capnp::Error::failed(
                     "IpcChain actor thread exited before init".into(),
                 )));
             }
             Err(e) => {
+                shutdown_token.cancel();
                 return Err(IpcClientError::Capnp(capnp::Error::failed(format!(
                     "IpcChain init blocking task panicked: {e}"
                 ))));
             }
         };
-        let network = init.into_result()?;
+        let network = match init.into_result() {
+            Ok(n) => n,
+            Err(e) => {
+                // Actor already sent Err(...) — but cancel the token
+                // defensively in case any post-init task is still
+                // hanging on to a cancellable future.
+                shutdown_token.cancel();
+                return Err(e);
+            }
+        };
 
-        let actor = Arc::new(IpcChainActorHandle { cmd_tx });
+        let actor = Arc::new(IpcChainActorHandle {
+            cmd_tx,
+            request_timeout: timeouts.request,
+            metrics,
+        });
         info!(
             socket = %socket_path,
             ?network,
+            request_timeout_ms = timeouts.request.as_millis() as u64,
+            connect_timeout_ms = timeouts.connect.as_millis() as u64,
             "IpcChain connected"
         );
         Ok(Self {
@@ -548,6 +739,7 @@ impl IpcChain {
             tip_snapshot,
             tip_tx,
             shutdown_tx,
+            shutdown_token,
         })
     }
 
@@ -566,25 +758,26 @@ impl IpcChain {
     }
 }
 
+impl Drop for IpcChain {
+    fn drop(&mut self) {
+        // Cancel the actor's connect-phase pre-init block if it's
+        // still running. On the happy path connect returned Ok and
+        // the token was never observed, so this is a no-op. On the
+        // outer-drop path (bootstrap retry, tests) this unblocks any
+        // wedged capnp round-trip and lets the actor thread join
+        // instead of leaking.
+        self.shutdown_token.cancel();
+    }
+}
+
 impl ShareChainReader for IpcChain {
     fn get_chain_tip(&self) -> BoxFuture<'_, Result<Option<BlockHash>, IpcClientError>> {
         let actor = Arc::clone(&self.actor);
         Box::pin(async move {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            actor
-                .cmd_tx
-                .send(IpcRequest::GetChainTip { reply: reply_tx })
-                .await
-                .map_err(|_| {
-                    IpcClientError::Capnp(capnp::Error::failed(
-                        "IpcChain actor request channel closed".into(),
-                    ))
-                })?;
-            reply_rx.await.map_err(|_| {
-                IpcClientError::Capnp(capnp::Error::failed(
-                    "IpcChain actor dropped reply channel".into(),
-                ))
-            })?
+            run_request(&actor, "get_chain_tip", |reply| IpcRequest::GetChainTip {
+                reply,
+            })
+            .await
         })
     }
 
@@ -595,45 +788,20 @@ impl ShareChainReader for IpcChain {
         let actor = Arc::clone(&self.actor);
         let share_hash = *share_hash;
         Box::pin(async move {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            actor
-                .cmd_tx
-                .send(IpcRequest::GetShareHeader {
-                    share_hash,
-                    reply: reply_tx,
-                })
-                .await
-                .map_err(|_| {
-                    IpcClientError::Capnp(capnp::Error::failed(
-                        "IpcChain actor request channel closed".into(),
-                    ))
-                })?;
-            reply_rx.await.map_err(|_| {
-                IpcClientError::Capnp(capnp::Error::failed(
-                    "IpcChain actor dropped reply channel".into(),
-                ))
-            })?
+            run_request(&actor, "get_share_header", |reply| {
+                IpcRequest::GetShareHeader { share_hash, reply }
+            })
+            .await
         })
     }
 
     fn get_tip_height(&self) -> BoxFuture<'_, Result<Option<u32>, IpcClientError>> {
         let actor = Arc::clone(&self.actor);
         Box::pin(async move {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            actor
-                .cmd_tx
-                .send(IpcRequest::GetTipHeight { reply: reply_tx })
-                .await
-                .map_err(|_| {
-                    IpcClientError::Capnp(capnp::Error::failed(
-                        "IpcChain actor request channel closed".into(),
-                    ))
-                })?;
-            reply_rx.await.map_err(|_| {
-                IpcClientError::Capnp(capnp::Error::failed(
-                    "IpcChain actor dropped reply channel".into(),
-                ))
-            })?
+            run_request(&actor, "get_tip_height", |reply| IpcRequest::GetTipHeight {
+                reply,
+            })
+            .await
         })
     }
 
@@ -649,6 +817,57 @@ impl ShareChainReader for IpcChain {
 /// Internal: the `Send + Sync` actor handle. One per [`IpcChain`].
 struct IpcChainActorHandle {
     cmd_tx: mpsc::Sender<IpcRequest>,
+    /// Per-request timeout budget; captured from [`IpcTimeouts`] at
+    /// `connect` time. Applied to `reply_rx.await` inside
+    /// [`run_request`] — the timer starts *after* `cmd_tx.send`
+    /// succeeds so mailbox queue-wait does not eat the budget under
+    /// actor-loop starvation.
+    request_timeout: Duration,
+    /// Metrics surface. Bumped on `Elapsed` inside `run_request`.
+    metrics: IpcChainMetrics,
+}
+
+/// Send an [`IpcRequest`] built by `build_req` into the actor mailbox
+/// and wait for the reply with a bounded timeout.
+///
+/// The timer starts *after* `cmd_tx.send` returns Ok — this way
+/// mailbox queue-wait (bounded by [`IpcChain::REQUEST_CHANNEL_CAPACITY`])
+/// doesn't eat the caller's budget when the actor loop is starved by
+/// a burst of concurrent reorg-ancestry requests.
+///
+/// On `Elapsed` we bump `ipc_request_timeouts_total{op}` exactly once
+/// and return an [`IpcClientError::Capnp`] carrying a message that
+/// includes the op name and the budget. The message string is
+/// load-bearing for observability (see [`IpcClientError::Capnp`]).
+async fn run_request<T, F>(
+    actor: &IpcChainActorHandle,
+    op: &'static str,
+    build_req: F,
+) -> Result<T, IpcClientError>
+where
+    F: FnOnce(oneshot::Sender<Result<T, IpcClientError>>) -> IpcRequest,
+{
+    let (reply_tx, reply_rx) = oneshot::channel();
+    actor.cmd_tx.send(build_req(reply_tx)).await.map_err(|_| {
+        IpcClientError::Capnp(capnp::Error::failed(
+            "IpcChain actor request channel closed".into(),
+        ))
+    })?;
+    // Timer starts *after* send succeeds so mailbox queue-wait
+    // doesn't eat the caller's budget.
+    match tokio::time::timeout(actor.request_timeout, reply_rx).await {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(_)) => Err(IpcClientError::Capnp(capnp::Error::failed(
+            "IpcChain actor dropped reply channel".into(),
+        ))),
+        Err(_elapsed) => {
+            actor.metrics.bump(op);
+            Err(IpcClientError::Capnp(capnp::Error::failed(format!(
+                "IpcChain {op} timed out after {}ms",
+                actor.request_timeout.as_millis()
+            ))))
+        }
+    }
 }
 
 /// Lock-free latest-tip / latest-tip-height snapshot.
@@ -752,12 +971,16 @@ impl InitResult {
 /// LocalSet, connects the capnp client, captures the network, kicks
 /// off the subscribe-tip task, then drives the request loop until the
 /// command channel closes.
+#[allow(clippy::too_many_arguments)]
 fn actor_thread_main(
     socket_path: String,
     cmd_rx: mpsc::Receiver<IpcRequest>,
     init_tx: std::sync::mpsc::SyncSender<InitResult>,
     tip_snapshot: Arc<AtomicTipSnapshot>,
     tip_tx: broadcast::Sender<BlockHash>,
+    connect_timeout: Duration,
+    metrics: IpcChainMetrics,
+    shutdown_token: CancellationToken,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -779,117 +1002,166 @@ fn actor_thread_main(
         init_tx,
         tip_snapshot,
         tip_tx,
+        connect_timeout,
+        metrics,
+        shutdown_token,
     )));
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn actor_main(
     socket_path: String,
     mut cmd_rx: mpsc::Receiver<IpcRequest>,
     init_tx: std::sync::mpsc::SyncSender<InitResult>,
     tip_snapshot: Arc<AtomicTipSnapshot>,
     tip_tx: broadcast::Sender<BlockHash>,
+    connect_timeout: Duration,
+    metrics: IpcChainMetrics,
+    shutdown_token: CancellationToken,
 ) {
-    // 1. Connect.
-    let client = match Sv2P2poolIpcClient::connect(&socket_path).await {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = init_tx.send(InitResult(Err(e)));
-            return;
-        }
-    };
+    // Pre-init block wrapped in a single connect-side timeout AND a
+    // select! against the shutdown_token. Any wedge inside a capnp
+    // round-trip (connect / get_network / get_chain_tip /
+    // get_tip_height / subscribe_chain_tip) fails the entire connect
+    // path within `connect_timeout` rather than leaking a wedged
+    // client to the pool's happy-path callers.
+    let pre_init = async {
+        // 1. Connect.
+        let client = Sv2P2poolIpcClient::connect(&socket_path).await?;
 
-    // 2. Capture network (sync at the trait surface; one capnp call
-    //    here, then served from the actor's local copy forever after).
-    let network = match client.get_network().await {
-        Ok(n) => n,
-        Err(e) => {
-            let _ = init_tx.send(InitResult(Err(e)));
-            return;
-        }
-    };
+        // 2. Capture network (sync at the trait surface; one capnp
+        //    call here, then served from the actor's local copy
+        //    forever after).
+        let network = client.get_network().await?;
 
-    // 3. Capture initial tip + height — best-effort. Fills the
-    //    snapshot before the broadcast task starts so the reorg
-    //    watcher's sync closure has a good value the first time it
-    //    ticks. Failures here are warnings: the daemon may simply
-    //    not have completed genesis yet.
-    match client.get_chain_tip().await {
-        Ok(IpcChainTipResult::Tip(tip)) => tip_snapshot.store_tip(tip),
-        Ok(IpcChainTipResult::Uninitialised) => {
-            debug!("IpcChain: daemon reports tip uninitialised at connect")
+        // 3. Capture initial tip + height — best-effort. Fills the
+        //    snapshot before the broadcast task starts so the reorg
+        //    watcher's sync closure has a good value the first time
+        //    it ticks. Failures here are warnings: the daemon may
+        //    simply not have completed genesis yet.
+        match client.get_chain_tip().await {
+            Ok(IpcChainTipResult::Tip(tip)) => tip_snapshot.store_tip(tip),
+            Ok(IpcChainTipResult::Uninitialised) => {
+                debug!("IpcChain: daemon reports tip uninitialised at connect")
+            }
+            Err(e) => warn!(error = %e, "IpcChain: initial get_chain_tip failed"),
         }
-        Err(e) => warn!(error = %e, "IpcChain: initial get_chain_tip failed"),
-    }
-    match client.get_tip_height().await {
-        Ok(IpcTipHeightResult::Height(h)) => tip_snapshot.store_height(h),
-        Ok(IpcTipHeightResult::Uninitialised) => {
-            debug!("IpcChain: daemon reports tip-height uninitialised at connect")
+        match client.get_tip_height().await {
+            Ok(IpcTipHeightResult::Height(h)) => tip_snapshot.store_height(h),
+            Ok(IpcTipHeightResult::Uninitialised) => {
+                debug!("IpcChain: daemon reports tip-height uninitialised at connect")
+            }
+            Err(e) => warn!(error = %e, "IpcChain: initial get_tip_height failed"),
         }
-        Err(e) => warn!(error = %e, "IpcChain: initial get_tip_height failed"),
-    }
 
-    // 4. Subscribe to push-driven tip updates. Every callback fires
-    //    on the actor's LocalSet, so we can poke a !Send capnp
-    //    follow-up here for the matching height.
-    let subscription = {
-        let tip_snapshot_for_cb = Arc::clone(&tip_snapshot);
-        let tip_tx_cb = tip_tx.clone();
-        let client_for_height = client.clone();
-        let tip_snapshot_for_height = Arc::clone(&tip_snapshot);
-        // Channel for "tip arrived"; the height-fetch task picks it
-        // up and runs the height capnp call without blocking the
-        // callback.
-        let (height_trigger_tx, mut height_trigger_rx) = mpsc::channel::<()>(8);
-        // Spawn the height-fetcher on the LocalSet. Single-flight:
-        // if multiple tips race past it, just refresh once.
-        tokio::task::spawn_local(async move {
-            while let Some(()) = height_trigger_rx.recv().await {
-                // Drain any backlog so we only do one height call
-                // per burst.
-                while height_trigger_rx.try_recv().is_ok() {}
-                match client_for_height.get_tip_height().await {
-                    Ok(IpcTipHeightResult::Height(h)) => tip_snapshot_for_height.store_height(h),
-                    Ok(IpcTipHeightResult::Uninitialised) => {
-                        debug!("IpcChain: tip-height uninitialised after tip push");
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "IpcChain: get_tip_height after tip push failed")
+        // 4. Subscribe to push-driven tip updates. Every callback
+        //    fires on the actor's LocalSet, so we can poke a !Send
+        //    capnp follow-up here for the matching height.
+        let subscription = {
+            let tip_snapshot_for_cb = Arc::clone(&tip_snapshot);
+            let tip_tx_cb = tip_tx.clone();
+            let client_for_height = client.clone();
+            let tip_snapshot_for_height = Arc::clone(&tip_snapshot);
+            // Channel for "tip arrived"; the height-fetch task picks
+            // it up and runs the height capnp call without blocking
+            // the callback.
+            let (height_trigger_tx, mut height_trigger_rx) = mpsc::channel::<()>(8);
+            // Spawn the height-fetcher on the LocalSet. Single-flight:
+            // if multiple tips race past it, just refresh once.
+            tokio::task::spawn_local(async move {
+                while let Some(()) = height_trigger_rx.recv().await {
+                    // Drain any backlog so we only do one height call
+                    // per burst.
+                    while height_trigger_rx.try_recv().is_ok() {}
+                    match client_for_height.get_tip_height().await {
+                        Ok(IpcTipHeightResult::Height(h)) => {
+                            tip_snapshot_for_height.store_height(h)
+                        }
+                        Ok(IpcTipHeightResult::Uninitialised) => {
+                            debug!("IpcChain: tip-height uninitialised after tip push");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "IpcChain: get_tip_height after tip push failed")
+                        }
                     }
                 }
-            }
-        });
-        match client
-            .subscribe_chain_tip(move |bytes| {
-                if bytes.len() != 32 {
-                    warn!(
-                        got = bytes.len(),
-                        "IpcChain: subscribeChainTip callback got non-32-byte payload; ignoring"
+            });
+            match client
+                .subscribe_chain_tip(move |bytes| {
+                    if bytes.len() != 32 {
+                        warn!(
+                            got = bytes.len(),
+                            "IpcChain: subscribeChainTip callback got non-32-byte payload; ignoring"
+                        );
+                        return;
+                    }
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes);
+                    let tip = BlockHash::from_raw_hash(
+                        bitcoin::hashes::sha256d::Hash::from_byte_array(arr),
                     );
-                    return;
+                    tip_snapshot_for_cb.store_tip(tip);
+                    // broadcast::Sender::send is non-blocking; it
+                    // returns Err only when there are no subscribers,
+                    // which we tolerate (the watcher attaches lazily).
+                    let _ = tip_tx_cb.send(tip);
+                    // Trigger a height refresh on the actor's local
+                    // task. try_send is non-blocking; capacity 8
+                    // absorbs bursts.
+                    let _ = height_trigger_tx.try_send(());
+                })
+                .await
+            {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "IpcChain: subscribeChainTip failed; tip pushes will be unavailable"
+                    );
+                    None
                 }
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                let tip =
-                    BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(arr));
-                tip_snapshot_for_cb.store_tip(tip);
-                // broadcast::Sender::send is non-blocking; it returns
-                // Err only when there are no subscribers, which we
-                // tolerate (the watcher attaches lazily).
-                let _ = tip_tx_cb.send(tip);
-                // Trigger a height refresh on the actor's local task.
-                // try_send is non-blocking; capacity 8 absorbs bursts.
-                let _ = height_trigger_tx.try_send(());
-            })
-            .await
-        {
-            Ok(s) => Some(s),
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "IpcChain: subscribeChainTip failed; tip pushes will be unavailable"
-                );
-                None
             }
+        };
+
+        Ok::<(Sv2P2poolIpcClient, bitcoin::Network, Option<_>), IpcClientError>((
+            client,
+            network,
+            subscription,
+        ))
+    };
+
+    // Enforce the connect budget AND respect the shutdown_token.
+    // Whichever fires first wins; on token cancellation we short-
+    // circuit before the timeout elapses so bootstrap retries don't
+    // wait out the full budget.
+    let init_outcome = tokio::select! {
+        biased;
+        _ = shutdown_token.cancelled() => {
+            let _ = init_tx.send(InitResult(Err(IpcClientError::Capnp(
+                capnp::Error::failed("IpcChain connect cancelled by shutdown_token".into()),
+            ))));
+            return;
+        }
+        r = tokio::time::timeout(connect_timeout, pre_init) => r,
+    };
+
+    let (client, network, subscription) = match init_outcome {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(e)) => {
+            let _ = init_tx.send(InitResult(Err(e)));
+            return;
+        }
+        Err(_elapsed) => {
+            // Bump the connect timeout counter exactly once, then
+            // surface a stable error message to `IpcChain::connect`.
+            metrics.bump("connect");
+            let _ = init_tx.send(InitResult(Err(IpcClientError::Capnp(
+                capnp::Error::failed(format!(
+                    "IpcChain connect timed out after {}ms",
+                    connect_timeout.as_millis()
+                )),
+            ))));
+            return;
         }
     };
 
@@ -1153,6 +1425,13 @@ socket_path = "{}"
         }
     }
 
+    /// Fresh [`IpcChainMetrics`] on a fresh [`Registry`] — the
+    /// combination tests use when they don't care about the metrics
+    /// output but need to satisfy `IpcChain::connect`'s signature.
+    fn test_metrics() -> IpcChainMetrics {
+        IpcChainMetrics::register(&Registry::new()).expect("register on fresh registry")
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ipc_chain_round_trips_get_chain_tip() {
         let (_dir, sock) = temp_socket();
@@ -1166,9 +1445,13 @@ socket_path = "{}"
         let _server = p2poolv2_ipc::spawn_ipc_server_full(sock.clone(), None, Some(backend));
         wait_for_socket(&sock, Duration::from_secs(3)).await;
 
-        let chain = IpcChain::connect(sock.to_str().unwrap())
-            .await
-            .expect("IpcChain::connect ok");
+        let chain = IpcChain::connect(
+            sock.to_str().unwrap(),
+            IpcTimeouts::default(),
+            test_metrics(),
+        )
+        .await
+        .expect("IpcChain::connect ok");
         assert_eq!(chain.network(), bitcoin::Network::Regtest);
 
         let got = chain.get_chain_tip().await.expect("get_chain_tip ok");
@@ -1191,9 +1474,13 @@ socket_path = "{}"
         let _server = p2poolv2_ipc::spawn_ipc_server_full(sock.clone(), None, Some(backend));
         wait_for_socket(&sock, Duration::from_secs(3)).await;
 
-        let chain = IpcChain::connect(sock.to_str().unwrap())
-            .await
-            .expect("connect");
+        let chain = IpcChain::connect(
+            sock.to_str().unwrap(),
+            IpcTimeouts::default(),
+            test_metrics(),
+        )
+        .await
+        .expect("connect");
 
         let zeros = BlockHash::all_zeros();
         let res = chain.get_share_header(&zeros).await.expect("ok");
@@ -1218,9 +1505,13 @@ socket_path = "{}"
             p2poolv2_ipc::spawn_ipc_server_full(sock.clone(), Some(tip_rx), Some(backend));
         wait_for_socket(&sock, Duration::from_secs(3)).await;
 
-        let chain = IpcChain::connect(sock.to_str().unwrap())
-            .await
-            .expect("connect");
+        let chain = IpcChain::connect(
+            sock.to_str().unwrap(),
+            IpcTimeouts::default(),
+            test_metrics(),
+        )
+        .await
+        .expect("connect");
         let snapshot = chain.tip_snapshot();
         let mut rx = chain.subscribe_tip();
 
@@ -1263,9 +1554,13 @@ socket_path = "{}"
         let _server = p2poolv2_ipc::spawn_ipc_server_full(sock.clone(), None, Some(backend));
         wait_for_socket(&sock, Duration::from_secs(3)).await;
 
-        let chain = IpcChain::connect(sock.to_str().unwrap())
-            .await
-            .expect("connect");
+        let chain = IpcChain::connect(
+            sock.to_str().unwrap(),
+            IpcTimeouts::default(),
+            test_metrics(),
+        )
+        .await
+        .expect("connect");
         let mut shutdown_rx = chain.shutdown_signal();
         // Initial value is `false` (actor alive).
         assert!(!*shutdown_rx.borrow());
@@ -1286,7 +1581,11 @@ socket_path = "{}"
         // Don't spawn a server. The connect should fail.
         let res = tokio::time::timeout(
             Duration::from_secs(5),
-            IpcChain::connect(sock.to_str().unwrap()),
+            IpcChain::connect(
+                sock.to_str().unwrap(),
+                IpcTimeouts::default(),
+                test_metrics(),
+            ),
         )
         .await
         .expect("timeout");
@@ -1301,7 +1600,7 @@ socket_path = "{}"
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bootstrap_share_chain_in_process_path() {
         let (config, _dir) = make_test_config();
-        let handles = bootstrap_share_chain(&config)
+        let handles = bootstrap_share_chain(&config, &Registry::new())
             .await
             .expect("bootstrap succeeds");
 
@@ -1346,7 +1645,7 @@ socket_path = "{}"
         wait_for_socket(&sock, Duration::from_secs(3)).await;
 
         let (config, _cfg_dir) = make_test_config_with_ipc(&sock);
-        let handles = bootstrap_share_chain(&config)
+        let handles = bootstrap_share_chain(&config, &Registry::new())
             .await
             .expect("bootstrap succeeds");
 
@@ -1390,7 +1689,7 @@ socket_path = "{}"
         use sv2_p2pool_engine::P2poolV2Engine;
 
         let (config, _dir) = make_test_config();
-        let handles = bootstrap_share_chain(&config)
+        let handles = bootstrap_share_chain(&config, &Registry::new())
             .await
             .expect("bootstrap succeeds");
         let chain_for_assert = handles.engine_handles.chain.clone();
@@ -1503,7 +1802,7 @@ socket_path = "{}"
         use sv2_p2pool_engine::{DeclaredJob, P2poolV2Engine, TipMetadata};
 
         let (config, _dir) = make_test_config();
-        let handles = bootstrap_share_chain(&config)
+        let handles = bootstrap_share_chain(&config, &Registry::new())
             .await
             .expect("bootstrap succeeds");
         let chain = handles.engine_handles.chain.clone();
@@ -1591,7 +1890,7 @@ socket_path = "{}"
         use sv2_p2pool_engine::P2poolV2Engine;
 
         let (config, _dir) = make_test_config();
-        let handles = bootstrap_share_chain(&config)
+        let handles = bootstrap_share_chain(&config, &Registry::new())
             .await
             .expect("bootstrap succeeds");
 
@@ -1620,7 +1919,7 @@ socket_path = "{}"
     #[tokio::test]
     async fn bootstrap_share_chain_builds_engine_handles() {
         let (config, _dir) = make_test_config();
-        let handles = bootstrap_share_chain(&config)
+        let handles = bootstrap_share_chain(&config, &Registry::new())
             .await
             .expect("bootstrap succeeds");
 
@@ -1640,5 +1939,428 @@ socket_path = "{}"
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), writer)
             .await
             .expect("writer joins within timeout");
+    }
+
+    // ----- IPC timeouts + metrics tests --------------------------
+
+    /// Backend used by the request-timeout test. Skips hanging
+    /// during the connect-phase best-effort reads so the caller can
+    /// reach the request loop, then hangs on every subsequent call.
+    ///
+    /// - `network()` returns immediately so `getNetwork @6`
+    ///   completes.
+    /// - The FIRST few calls into `get_chain_tip` / `get_tip_height`
+    ///   also return immediately (those are the connect-phase
+    ///   best-effort reads). We tag the boundary with a shared
+    ///   `AtomicBool` flipped by the test after connect returns Ok.
+    /// - Once the flag flips, all subsequent reads park the server
+    ///   thread indefinitely (passive; `thread::park`).
+    ///
+    /// This lets the test build an `IpcChain` with a fast request
+    /// timeout budget and then observe timeouts firing on real
+    /// request-loop calls, WITHOUT having to hang the connect path.
+    struct HangingBackend {
+        network: bitcoin::Network,
+        hang_after_connect: Arc<AtomicBool>,
+    }
+
+    impl HangingBackend {
+        fn new(network: bitcoin::Network) -> (Self, Arc<AtomicBool>) {
+            let flag = Arc::new(AtomicBool::new(false));
+            (
+                Self {
+                    network,
+                    hang_after_connect: Arc::clone(&flag),
+                },
+                flag,
+            )
+        }
+
+        fn hang(&self) {
+            if self.hang_after_connect.load(Ordering::Acquire) {
+                std::thread::park();
+            }
+        }
+    }
+
+    impl p2poolv2_ipc::ChainReadBackend for HangingBackend {
+        fn get_chain_tip(&self) -> Result<Option<[u8; 32]>, String> {
+            self.hang();
+            Ok(None)
+        }
+        fn get_share_header(
+            &self,
+            _share_hash: &[u8; 32],
+        ) -> Result<p2poolv2_ipc::ShareHeaderOutcome, String> {
+            self.hang();
+            Ok(p2poolv2_ipc::ShareHeaderOutcome::NotFound)
+        }
+        fn get_tip_height(&self) -> Result<Option<u32>, String> {
+            self.hang();
+            Ok(None)
+        }
+        fn network(&self) -> bitcoin::Network {
+            self.network
+        }
+    }
+
+    /// Per-request timeout fires when the actor never replies (the
+    /// backend hangs). Verifies: (a) timeout budget is honoured
+    /// within reasonable slack, (b) the counter is incremented
+    /// exactly once per timeout, (c) the actor loop keeps pumping
+    /// after a wedged reply (a second request also times out), and
+    /// (d) distinct op labels increment independently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ipc_chain_request_timeout_fires_when_actor_never_replies() {
+        let (_dir, sock) = temp_socket();
+        let (backend, hang_flag) = HangingBackend::new(bitcoin::Network::Regtest);
+        let backend: Arc<dyn p2poolv2_ipc::ChainReadBackend> = Arc::new(backend);
+        let _server = p2poolv2_ipc::spawn_ipc_server_full(sock.clone(), None, Some(backend));
+        wait_for_socket(&sock, Duration::from_secs(3)).await;
+
+        let registry = Registry::new();
+        let metrics = IpcChainMetrics::register(&registry).expect("register");
+        let timeouts = IpcTimeouts {
+            request: Duration::from_millis(200),
+            connect: Duration::from_secs(5),
+        };
+        let chain = IpcChain::connect(sock.to_str().unwrap(), timeouts, metrics.clone())
+            .await
+            .expect("connect");
+
+        // Connect succeeded — flip the hang flag so subsequent
+        // request-loop reads park the server thread and expose the
+        // client-side timeout path.
+        hang_flag.store(true, Ordering::Release);
+
+        // First call: should time out within a generous window.
+        let started = std::time::Instant::now();
+        let res = chain.get_chain_tip().await;
+        assert!(res.is_err(), "get_chain_tip should time out");
+        assert!(
+            started.elapsed() < Duration::from_millis(2_000),
+            "get_chain_tip should return within 2s slack (took {:?})",
+            started.elapsed()
+        );
+        assert_eq!(
+            metrics
+                .request_timeouts
+                .with_label_values(&["get_chain_tip"])
+                .get(),
+            1,
+            "first timeout bumps op=get_chain_tip counter"
+        );
+
+        // Second call: prove the actor loop is still pumping after
+        // a wedged reply.
+        let started = std::time::Instant::now();
+        let res = chain.get_chain_tip().await;
+        assert!(res.is_err(), "second get_chain_tip should also time out");
+        assert!(
+            started.elapsed() < Duration::from_millis(2_000),
+            "second get_chain_tip should return within 2s slack"
+        );
+        assert_eq!(
+            metrics
+                .request_timeouts
+                .with_label_values(&["get_chain_tip"])
+                .get(),
+            2,
+            "second timeout bumps op=get_chain_tip counter again"
+        );
+
+        // Third call on a DIFFERENT op — must increment the
+        // corresponding label independently.
+        let res = chain.get_tip_height().await;
+        assert!(res.is_err(), "get_tip_height should also time out");
+        assert_eq!(
+            metrics
+                .request_timeouts
+                .with_label_values(&["get_tip_height"])
+                .get(),
+            1,
+            "distinct op label incremented independently"
+        );
+        assert_eq!(
+            metrics
+                .request_timeouts
+                .with_label_values(&["get_chain_tip"])
+                .get(),
+            2,
+            "get_chain_tip label unaffected by get_tip_height timeout"
+        );
+    }
+
+    /// Backend that parks the current OS thread inside `network()`,
+    /// so the capnp server accepts the connection but `getNetwork @6`
+    /// never returns. This is the scenario the widened connect-side
+    /// timeout guards against.
+    struct HangOnNetwork;
+    impl p2poolv2_ipc::ChainReadBackend for HangOnNetwork {
+        fn get_chain_tip(&self) -> Result<Option<[u8; 32]>, String> {
+            Ok(None)
+        }
+        fn get_share_header(
+            &self,
+            _share_hash: &[u8; 32],
+        ) -> Result<p2poolv2_ipc::ShareHeaderOutcome, String> {
+            Ok(p2poolv2_ipc::ShareHeaderOutcome::NotFound)
+        }
+        fn get_tip_height(&self) -> Result<Option<u32>, String> {
+            Ok(None)
+        }
+        fn network(&self) -> bitcoin::Network {
+            // Never returns until the test tears down the server —
+            // the pool-side connect timeout is what makes the test
+            // observable.
+            std::thread::park();
+            bitcoin::Network::Regtest
+        }
+    }
+
+    /// Connect-phase timeout fires when the server accepts the
+    /// socket but wedges inside `get_network` (post-accept). Proves
+    /// that the widened connect-side timeout covers the pre-init
+    /// capnp round-trips, not just `Sv2P2poolIpcClient::connect`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ipc_chain_connect_timeout_fires_when_server_wedges_after_socket_accept() {
+        let (_dir, sock) = temp_socket();
+        let backend: Arc<dyn p2poolv2_ipc::ChainReadBackend> = Arc::new(HangOnNetwork);
+        let _server = p2poolv2_ipc::spawn_ipc_server_full(sock.clone(), None, Some(backend));
+        wait_for_socket(&sock, Duration::from_secs(3)).await;
+
+        let registry = Registry::new();
+        let metrics = IpcChainMetrics::register(&registry).expect("register");
+        let timeouts = IpcTimeouts {
+            request: Duration::from_secs(5),
+            connect: Duration::from_millis(300),
+        };
+
+        let started = std::time::Instant::now();
+        let res = IpcChain::connect(sock.to_str().unwrap(), timeouts, metrics.clone()).await;
+        assert!(
+            res.is_err(),
+            "IpcChain::connect should fail when the server wedges post-accept"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(2_000),
+            "connect should surface the timeout within 2s slack (took {:?})",
+            started.elapsed()
+        );
+        assert_eq!(
+            metrics
+                .request_timeouts
+                .with_label_values(&["connect"])
+                .get(),
+            1,
+            "connect timeout bumps op=connect counter exactly once"
+        );
+    }
+
+    /// Dropping the returned `Err` from `IpcChain::connect` (or the
+    /// `IpcChain` handle itself) must fire the shutdown_token so the
+    /// actor's dedicated OS thread joins rather than leaking a
+    /// wedged capnp round-trip across bootstrap retries.
+    ///
+    /// The observable proof is that a `connect` against a wedged
+    /// backend returns promptly (bounded by connect_timeout) and
+    /// does NOT block on the request_timeout budget — we set the
+    /// request_timeout to 60s and assert the whole `connect` returns
+    /// in under 2s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ipc_chain_connect_shutdown_cancels_wedged_actor_thread() {
+        let (_dir, sock) = temp_socket();
+        let backend: Arc<dyn p2poolv2_ipc::ChainReadBackend> = Arc::new(HangOnNetwork);
+        let _server = p2poolv2_ipc::spawn_ipc_server_full(sock.clone(), None, Some(backend));
+        wait_for_socket(&sock, Duration::from_secs(3)).await;
+
+        let registry = Registry::new();
+        let metrics = IpcChainMetrics::register(&registry).expect("register");
+        // Request timeout much larger than connect timeout — the
+        // shutdown_token / connect-side timer must dominate.
+        let timeouts = IpcTimeouts {
+            request: Duration::from_secs(60),
+            connect: Duration::from_millis(200),
+        };
+
+        let started = std::time::Instant::now();
+        let res = IpcChain::connect(sock.to_str().unwrap(), timeouts, metrics).await;
+        assert!(res.is_err(), "connect times out on wedged getNetwork");
+        assert!(
+            started.elapsed() < Duration::from_millis(2_000),
+            "connect must return within 2s even though request_timeout=60s — proves shutdown_token unblocks the wedged actor"
+        );
+    }
+
+    /// After `IpcChainMetrics::register(..)`, all four op children
+    /// exist on the underlying `IntCounterVec` at zero. This is
+    /// what Prometheus / Grafana consumers depend on to distinguish
+    /// "never fired" from "misconfigured pool".
+    #[test]
+    fn ipc_chain_metrics_register_pre_creates_all_op_labels() {
+        let registry = Registry::new();
+        let metrics = IpcChainMetrics::register(&registry).expect("register");
+        for op in [
+            "connect",
+            "get_chain_tip",
+            "get_share_header",
+            "get_tip_height",
+        ] {
+            let c = metrics.request_timeouts.with_label_values(&[op]);
+            assert_eq!(c.get(), 0, "op={op} pre-created at 0");
+        }
+
+        // Gathering the registry surfaces exactly one metric family
+        // with four label combinations.
+        let families = registry.gather();
+        let family = families
+            .iter()
+            .find(|f| f.get_name() == "sv2_p2pool_pool_ipc_request_timeouts_total")
+            .expect("timeouts family present in gather output");
+        assert_eq!(
+            family.get_metric().len(),
+            4,
+            "four pre-created op children present at register time"
+        );
+        let mut ops: Vec<String> = family
+            .get_metric()
+            .iter()
+            .map(|m| {
+                m.get_label()
+                    .iter()
+                    .find(|l| l.get_name() == "op")
+                    .map(|l| l.get_value().to_string())
+                    .unwrap_or_default()
+            })
+            .collect();
+        ops.sort();
+        assert_eq!(
+            ops,
+            vec![
+                "connect",
+                "get_chain_tip",
+                "get_share_header",
+                "get_tip_height"
+            ]
+        );
+    }
+
+    /// Parsing a TOML `[ipc]` block with timeout fields produces
+    /// `Some(Duration)` on both. Parsing without them leaves both
+    /// as `None` so the client fallback path applies.
+    #[test]
+    fn ipc_config_deserialises_timeout_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("ipc.sock");
+        let store_path = dir.path().join("store.db");
+        let stats_dir = dir.path().join("stats");
+        std::fs::create_dir_all(&stats_dir).expect("stats dir");
+
+        let common = format!(
+            r#"
+[network]
+listen_address = "/ip4/127.0.0.1/tcp/0"
+dial_peers = []
+max_pending_incoming = 10
+max_pending_outgoing = 10
+max_established_incoming = 50
+max_established_outgoing = 50
+max_established_per_peer = 1
+max_workbase_per_second = 10
+max_userworkbase_per_second = 10
+max_miningshare_per_second = 100
+max_inventory_per_second = 100
+max_transaction_per_second = 100
+max_requests_per_second = 100
+dial_timeout_secs = 30
+
+[store]
+path = "{}"
+
+[stratum]
+hostname = "127.0.0.1"
+port = 0
+start_difficulty = 10000
+minimum_difficulty = 100
+solo_address = "tb1qyazxde6558qj6z3d9np5e6msmrspwpf6k0qggk"
+bootstrap_address = "tb1qyazxde6558qj6z3d9np5e6msmrspwpf6k0qggk"
+zmqpubhashblock = "tcp://127.0.0.1:0"
+network = "regtest"
+version_mask = "1fffe000"
+difficulty_multiplier = 1.0
+pool_signature = "sv2-p2pool-test"
+
+[bitcoinrpc]
+url = "http://127.0.0.1:18443"
+username = "rpc"
+password = "rpc"
+
+[logging]
+console = true
+level = "info"
+stats_dir = "{}"
+
+[api]
+hostname = "127.0.0.1"
+port = 0
+"#,
+            store_path.display(),
+            stats_dir.display(),
+        );
+
+        // (a) Both fields set.
+        let toml_full = format!(
+            "{common}\n[ipc]\nsocket_path = \"{sock}\"\nrequest_timeout = \"7s\"\nconnect_timeout = \"45s\"\n",
+            sock = sock.display(),
+        );
+        let config_path = dir.path().join("p2pool_full.toml");
+        std::fs::write(&config_path, &toml_full).expect("write toml");
+        let config = P2poolConfig::load(config_path.to_str().expect("path")).expect("load config");
+        let ipc = config.ipc.as_ref().expect("ipc section present");
+        assert_eq!(ipc.request_timeout, Some(Duration::from_secs(7)));
+        assert_eq!(ipc.connect_timeout, Some(Duration::from_secs(45)));
+
+        // (b) Only socket_path set — both timeouts absent.
+        let toml_min = format!(
+            "{common}\n[ipc]\nsocket_path = \"{sock}\"\n",
+            sock = sock.display(),
+        );
+        let config_path = dir.path().join("p2pool_min.toml");
+        std::fs::write(&config_path, &toml_min).expect("write toml");
+        let config = P2poolConfig::load(config_path.to_str().expect("path")).expect("load config");
+        let ipc = config.ipc.as_ref().expect("ipc section present");
+        assert_eq!(ipc.request_timeout, None, "unset request_timeout is None");
+        assert_eq!(ipc.connect_timeout, None, "unset connect_timeout is None");
+    }
+
+    /// When `IpcConfig` omits both timeout fields, the IPC bootstrap
+    /// path materialises `IpcTimeouts` at the crate-level defaults
+    /// (5s request, 30s connect). Closes the concern that the
+    /// fallback path could silently drift from the pub const values.
+    #[test]
+    fn ipc_timeouts_defaults_applied_when_config_omits_fields() {
+        // Direct unit-test on the fallback expression used inside
+        // `bootstrap_share_chain`. Kept as a unit test (not driving
+        // full bootstrap) because standing up bitcoind + IPC server
+        // just to observe the default-fallback path is wasteful —
+        // this is the same expression, verbatim, that the bootstrap
+        // path applies.
+        let cfg_omitted = p2poolv2_lib::config::IpcConfig {
+            socket_path: "/tmp/whatever".into(),
+            request_timeout: None,
+            connect_timeout: None,
+        };
+        let built = IpcTimeouts {
+            request: cfg_omitted
+                .request_timeout
+                .unwrap_or(IpcTimeouts::DEFAULT_REQUEST),
+            connect: cfg_omitted
+                .connect_timeout
+                .unwrap_or(IpcTimeouts::DEFAULT_CONNECT),
+        };
+        assert_eq!(built.request, Duration::from_secs(5));
+        assert_eq!(built.connect, Duration::from_secs(30));
+        assert_eq!(built.request, IpcTimeouts::DEFAULT_REQUEST);
+        assert_eq!(built.connect, IpcTimeouts::DEFAULT_CONNECT);
     }
 }

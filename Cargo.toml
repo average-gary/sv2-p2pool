@@ -26,7 +26,9 @@ publish = false
 [workspace.dependencies]
 async-trait = "0.1"
 dashmap     = "6"
+humantime-serde = "1"
 tokio       = { version = "1.44", features = ["full"] }
+tokio-util  = { version = "0.7", features = ["rt"] }
 tracing     = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow      = "1"

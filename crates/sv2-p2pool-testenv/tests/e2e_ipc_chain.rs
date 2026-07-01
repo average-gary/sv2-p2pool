@@ -47,8 +47,19 @@ use std::time::{Duration, Instant};
 use bitcoin::BlockHash;
 use bitcoin::hashes::Hash as _;
 use p2poolv2_ipc::{ChainReadBackend, ShareHeaderOutcome};
-use sv2_p2pool::share_chain::IpcChain;
+use prometheus::Registry;
+use sv2_p2pool::share_chain::{IpcChain, IpcChainMetrics, IpcTimeouts};
 use sv2_p2pool_engine::{ShareChainReader, ShareHeaderLookup};
+
+/// Fresh (default timeouts, fresh registry) metrics tuple for
+/// [`IpcChain::connect`]. All e2e tests use the crate defaults —
+/// timeouts are not what these tests exercise.
+fn test_ipc_args() -> (IpcTimeouts, IpcChainMetrics) {
+    (
+        IpcTimeouts::default(),
+        IpcChainMetrics::register(&Registry::new()).expect("register on fresh registry"),
+    )
+}
 
 /// In-memory `ChainReadBackend` driven by tests. Seedable + mutable so
 /// the (b) reorg-walk scenario can yank a header mid-walk.
@@ -168,7 +179,8 @@ async fn ipc_chain_get_chain_tip_returns_configured_value() {
     );
     wait_for_socket(&sock, Duration::from_secs(5)).await;
 
-    let chain = IpcChain::connect(sock.to_str().expect("utf-8 sock path"))
+    let (timeouts, metrics) = test_ipc_args();
+    let chain = IpcChain::connect(sock.to_str().expect("utf-8 sock path"), timeouts, metrics)
         .await
         .expect("IpcChain::connect");
 
@@ -241,7 +253,8 @@ async fn ipc_chain_walks_full_100_hop_ancestry_to_genesis() {
     );
     wait_for_socket(&sock, Duration::from_secs(5)).await;
 
-    let chain = IpcChain::connect(sock.to_str().expect("utf-8 sock path"))
+    let (timeouts, metrics) = test_ipc_args();
+    let chain = IpcChain::connect(sock.to_str().expect("utf-8 sock path"), timeouts, metrics)
         .await
         .expect("IpcChain::connect");
 
@@ -304,7 +317,8 @@ async fn ipc_chain_walk_truncates_on_missing_header_midway() {
     );
     wait_for_socket(&sock, Duration::from_secs(5)).await;
 
-    let chain = IpcChain::connect(sock.to_str().expect("utf-8 sock path"))
+    let (timeouts, metrics) = test_ipc_args();
+    let chain = IpcChain::connect(sock.to_str().expect("utf-8 sock path"), timeouts, metrics)
         .await
         .expect("IpcChain::connect");
 
@@ -360,7 +374,8 @@ async fn ipc_chain_subscribe_tip_delivers_burst_of_50_updates() {
     );
     wait_for_socket(&sock, Duration::from_secs(5)).await;
 
-    let chain = IpcChain::connect(sock.to_str().expect("utf-8 sock path"))
+    let (timeouts, metrics) = test_ipc_args();
+    let chain = IpcChain::connect(sock.to_str().expect("utf-8 sock path"), timeouts, metrics)
         .await
         .expect("IpcChain::connect");
     let snapshot = chain.tip_snapshot();

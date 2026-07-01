@@ -1,0 +1,32 @@
+# p2poolv2 daemon example config — the sv2-p2pool binary connects to
+# this daemon via Cap'n Proto over the Unix socket declared in [ipc].
+# The daemon owns the rocksdb store; the pool process owns only the
+# IPC client.
+#
+# Only the sections directly relevant to Phase 3 hardening are shown
+# here; a full p2poolv2 config also carries [network], [store],
+# [stratum], [bitcoinrpc], [logging], and [api] sections — copy those
+# from the p2poolv2 repo's own example.
+
+# ---------------------------------------------------------------
+# Cap'n Proto IPC surface consumed by sv2-p2pool's IpcChain backend.
+# ---------------------------------------------------------------
+[ipc]
+# Filesystem path of the Unix socket the daemon binds. Absolute
+# paths are recommended; the parent directory must exist and be
+# writable by the daemon.
+socket_path = "/var/run/p2poolv2/ipc.sock"
+
+# OPTIONAL — per-request timeout applied by the sv2-p2pool IpcChain
+# client to each in-flight ShareChainReader call (get_chain_tip,
+# get_share_header, get_tip_height). Values are humantime strings
+# ("5s", "250ms", "1m"). Unset => the client applies its default
+# (5s). Bumps ipc_request_timeouts_total{op=<method>} on Elapsed.
+# request_timeout = "5s"
+
+# OPTIONAL — connect-phase timeout applied to the whole pre-init
+# capnp handshake (Sv2P2poolIpcClient::connect + get_network +
+# best-effort get_chain_tip / get_tip_height + subscribe_chain_tip).
+# A daemon that accepts the socket but wedges on any of these
+# fails IpcChain::connect within this budget. Unset => 30s.
+# connect_timeout = "30s"
