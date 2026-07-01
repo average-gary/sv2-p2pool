@@ -17,7 +17,7 @@ The remaining engineering question for Phase 2-B was **how** to drop `p2poolv2_l
 - **All five live chain-reads** covered by one trait surface — no parallel code paths.
 - **Sync reorg-watcher signature preserved** so `Engine::start_reorg_watcher`'s public API doesn't churn.
 - **No `async-trait`** in the engine's hot path. The 100-hop reorg ancestor walk should not pay `Box::pin`-per-call macro overhead unnecessarily.
-- **No feature-flag rollout, no parallel `InProcessChain` build alongside `IpcChain` in shipped releases.** The AGPL goal forbids keeping the in-process path alive in production indefinitely.
+- **No compile-time feature-flag rollout: both backends compile unconditionally.** The AGPL goal forbids keeping the in-process path alive in production *indefinitely*, but as-shipped the pool binary carries both `IpcChain` and `InProcessChain` and picks between them at runtime based on `p2pool_config.ipc.socket_path`. See "Backends — two, not three" for the rationale, and the "Update — Phase 3 Track 3 (2026-07-01)" addendum at the end of this ADR for the reconciliation history and the plan to drop `InProcessChain`.
 - **Discriminated wire errors**: the engine's reorg walker distinguishes "genesis reached", "header not found", and "transport error". A bare `getShareHeader -> (header)` collapses all three into `capnp::Error` — that semantic must survive on the wire.
 
 ## Considered Options
@@ -125,3 +125,38 @@ Landed across three commits on `phase-2b/track-a` and surfaced through one PR:
 - Schema source-of-truth: `vendor/p2poolv2/p2poolv2-capnp-types/proto/p2poolv2.capnp`.
 - Trait + backends: `crates/sv2-p2pool-engine/src/share_chain_reader.rs`, `crates/sv2-p2pool-pool/src/share_chain.rs`.
 - End-to-end test: `crates/sv2-p2pool-testenv/tests/e2e_ipc_chain.rs`.
+
+## Update — Phase 3 Track 3 (2026-07-01) — reconciling drift with the shipped design
+
+The original "Decision Drivers" bullet on feature-flag rollout was worded strongly enough to imply that the in-process path would be **absent** from shipped releases. That is not what actually shipped, and is not what the "Backends — two, not three" section of this ADR describes either. The two statements were internally inconsistent. This addendum reconciles them; the shipped design wins because the tests + dev story depend on it.
+
+### What actually shipped
+
+- `crates/sv2-p2pool-pool/Cargo.toml` has **no `[features]` table**. There is no `cargo` gate that hides `InProcessChain` from the shipped binary. Both backends are always compiled.
+- `bootstrap_share_chain` at `crates/sv2-p2pool-pool/src/share_chain.rs:206` selects between the two paths **at runtime** via `if let Some(ipc_cfg) = p2pool_config.ipc.as_ref() { IpcChain } else { InProcessChain }`. The switch is a config setting, not a build feature.
+- `pool.rs` has a live production code path (around lines 301-333) that hands the reorg watcher + tip-height publisher a `ChainStoreHandle` when running in `InProcessChain` mode. Deleting the in-process path would require rewriting that wiring, not just deleting `InProcessChain` in isolation.
+- `crates/sv2-p2pool-pool/src/share_chain.rs::tests` has five tests that construct an `InProcessChain` directly and drive the whole in-process bootstrap:
+  - `bootstrap_share_chain_in_process_path`,
+  - `bootstrap_share_chain_builds_engine_handles`,
+  - `declare_mining_job_captures_share_chain_tip`,
+  - `notify_share_chain_reorg_selective_invalidation`,
+  - `engine_reorg_watcher_polls_chain_handle`.
+
+  Removing `InProcessChain` (or gating it behind `#[cfg(test)]`) would break `cargo test --workspace --lib` and delete meaningful coverage of the engine's reorg watcher + declare-job flow that today runs against a real `p2poolv2_lib::ChainStoreHandle`, not a mock.
+
+### Why the dual-path is acceptable *for now*
+
+- **AGPL boundary is intact where it matters.** The engine crate never links `p2poolv2_lib` — that was the AGPL goal ADR 0010/0011 set. `cargo tree -p sv2-p2pool-engine | grep p2poolv2_lib` is still empty. The dual-path only affects the pool crate, which was always inside the AGPL boundary.
+- **Deployment story hasn't fully migrated.** Single-process dev, the existing test suite, and any operator not yet running a separate p2poolv2 daemon still need `InProcessChain`. Dropping it before those consumers have moved would strand them without an upgrade path.
+- **Trait-level uniformity means the engine doesn't care.** Both backends implement `ShareChainReader`; from the engine's perspective there is one path. The parallel-code-paths worry from the original "Decision Drivers" bullet doesn't apply at the engine layer — it applies only inside the pool binary, where the runtime `if let Some(ipc_cfg)` is a five-line switch.
+
+### Follow-up work to actually retire `InProcessChain`
+
+The AGPL-clean intent hasn't gone away; it has been re-scoped to "eventually" rather than "in this ADR's release train". Concrete next steps when the deployment story catches up:
+
+1. Migrate the five in-process tests to drive `IpcChain` against an in-process capnp daemon (the pattern `crates/sv2-p2pool-testenv/tests/e2e_ipc_chain.rs` already uses — spawn `p2poolv2_ipc::spawn_ipc_server_full` over a UDS tempdir and point `IpcChain::connect` at it). Two of those e2e tests were promoted out of `#[ignore]` in Phase 3 Track 3 item #11 so the pattern is exercised on every default `cargo test`.
+2. Rework `pool.rs`'s InProcessChain reorg-watcher / tip-height branches to consume the `IpcChain` atomic snapshot, matching what the IPC branch already does.
+3. Delete `InProcessChain`, its bootstrap branch, and the `chain_store` / `store` / `store_writer_join` fields on `ShareChainHandles`. Remove the `p2poolv2_lib`/`bitcoindrpc` path-deps from `sv2-p2pool-pool/Cargo.toml` (the pool binary would then link `p2poolv2_lib` at all only via the `sv2-p2pool-testenv` dev-dep, which is fine).
+4. Update this ADR's status to reflect the completed single-path design.
+
+Until those four steps land, the shipped design is: **two backends compiled unconditionally into the pool binary, selected at runtime by config**. That is what "Backends — two, not three" always described; this addendum brings the "Decision Drivers" bullet in line with it and documents the retirement path so a future contributor doesn't get whiplash between the two.
