@@ -24,3 +24,36 @@ zmq_block = "tcp://localhost:28332"
 [monitoring]
 listen_address = "127.0.0.1:9090"
 cache_refresh_secs = 15
+
+# ---------------------------------------------------------------------------
+# Per-miner payout script binding (accounting payout resolver, ADR 0014).
+#
+# Optional. When present, `sv2-p2pool` builds a `StaticMapResolver` from
+# the entries below and installs it on the engine. Each entry binds a
+# JDC's `user_identifier` (matched against inbound
+# `DeclareMiningJob.user_identifier` values after `trim → NFKC`
+# normalisation) to a coinbase `script_pubkey` (hex-encoded).
+#
+# When absent, the engine defaults to `NullResolver` — every miner
+# falls back to the pool-wide `coinbase_reward_script` above, matching
+# the byte-for-byte pre-ADR-0014 semantics.
+#
+# Validation is at binary boot:
+#   - invalid hex → parse error, refusing to start
+#   - empty user_identifier → parse error
+#   - two entries that normalise to the same key → parse error
+#     (error carries BOTH raw keys so you can locate the conflict)
+#
+# See docs/adr/0014-payout-resolver-wakeup.md for policy guidance,
+# including the sync-only contract on any custom resolver
+# implementation and the monotonic
+# `sv2_p2pool_engine_payout_binding_installed_total` metric for
+# operator dashboards.
+#
+# [[payout.static.entries]]
+# user_identifier = "miner-alice"
+# script_hex      = "0014ab00000000000000000000000000000000000000"
+#
+# [[payout.static.entries]]
+# user_identifier = "miner-bob"
+# script_hex      = "0014cd00000000000000000000000000000000000000"

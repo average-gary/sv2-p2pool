@@ -32,6 +32,7 @@ pub mod block;
 pub mod coinbase;
 mod engine_impl;
 pub mod metrics;
+pub mod payout_resolver;
 pub mod recent_solutions;
 pub mod reorg_detector;
 pub mod share_chain_reader;
@@ -45,6 +46,9 @@ pub use coinbase::{
     reconstruct_coinbase_with_extranonce,
 };
 pub use metrics::{EngineMetrics, PushSolutionDropReason, ScmjProposalRejectReason};
+pub use payout_resolver::{
+    NullResolver, PayoutScriptResolver, StaticMapResolver, StaticMapResolverError,
+};
 pub use recent_solutions::RecentSolutions;
 pub use reorg_detector::{DEFAULT_POLL_PERIOD, ReorgDetector};
 // Re-exports so consumers don't need to depend on `sv2-p2pool-ipc` for
@@ -285,14 +289,6 @@ pub type UserIdentifierIndex = Arc<DashMap<String, JdToken>>;
 /// across the trait boundary, while this map is engine-internal state.
 pub type AllocatedTokenMap = Arc<DashMap<JdToken, RequestId>>;
 
-/// Test-only payout-script resolver type. Stored under
-/// `P2poolV2Engine::test_payout_resolver` so tests can stub the
-/// per-miner payout-script lookup without standing up the (future)
-/// accounting selector. Production paths leave this `None` — the cfg
-/// gate enforces that at compile time.
-#[cfg(test)]
-type TestPayoutResolver = Box<dyn Fn(&str) -> Option<ScriptBuf> + Send + Sync>;
-
 /// Backend handles for the engine.
 ///
 /// When present, the trait methods perform real share-chain validation
@@ -364,15 +360,15 @@ pub struct P2poolV2Engine {
     /// bindings (same user_identifier, different live token) and
     /// fall back to the pool-wide default rather than overwrite.
     user_identifier_index: UserIdentifierIndex,
-    /// Test-only override hook for the payout-script resolver. When
-    /// `Some`, `resolve_payout_script` consults this closure instead
-    /// of returning `None`. Lets the unit tests exercise the
-    /// duplicate-binding + size-budget branches without standing up
-    /// the (future) accounting selector. Production paths always
-    /// leave this `None` — the cfg gate makes that a compile-time
-    /// guarantee.
-    #[cfg(test)]
-    test_payout_resolver: std::sync::Mutex<Option<TestPayoutResolver>>,
+    /// Per-miner payout-script resolver. Consulted by
+    /// `resolve_payout_script` inside `handle_allocate_mining_job_token`
+    /// to bind a custom coinbase output. Defaults to
+    /// [`NullResolver`] (returns `None` for every user), which
+    /// preserves byte-for-byte pool-wide-fallback semantics.
+    /// [`P2poolV2Engine::with_payout_resolver`] installs a production
+    /// resolver (e.g. [`StaticMapResolver`] built from the pool's
+    /// `[payout.static]` config section).
+    payout_resolver: Arc<dyn PayoutScriptResolver>,
     recent_solutions: Arc<RecentSolutions>,
     /// Bitcoin network this engine targets. Used by accounting + payout.
     network: bitcoin::Network,
@@ -422,8 +418,7 @@ impl P2poolV2Engine {
             allocated_tokens: Arc::new(DashMap::new()),
             token_payout: Arc::new(DashMap::new()),
             user_identifier_index: Arc::new(DashMap::new()),
-            #[cfg(test)]
-            test_payout_resolver: std::sync::Mutex::new(None),
+            payout_resolver: Arc::new(NullResolver),
             recent_solutions: Arc::new(RecentSolutions::new(DEFAULT_RECENT_SOLUTIONS_TTL)),
             network,
             reorg_watcher: None,
@@ -537,43 +532,44 @@ impl P2poolV2Engine {
     }
 
     /// Resolve a per-miner payout `ScriptBuf` from a normalized
-    /// `user_identifier`. Returns `None` until the accounting selector
-    /// is wired (Phase 3c follow-up, ADR 0002 § Follow-ups). The
-    /// signature is kept intentionally narrow so that the future
-    /// accounting hook can be slotted in without changing
-    /// `handle_allocate_mining_job_token`.
+    /// `user_identifier`.
+    ///
+    /// Delegates to the installed [`PayoutScriptResolver`] (default:
+    /// [`NullResolver`], returning `None` for every user). The call is
+    /// wrapped in the
+    /// `sv2_p2pool_engine_payout_resolver_resolve_duration_seconds`
+    /// histogram so a future implementor's block-on-in-resolve
+    /// regression is visible in metrics.
     ///
     /// Crate-private because the only legitimate caller is the trait
     /// impl in `engine_impl`.
     pub(crate) fn resolve_payout_script(&self, user_identifier: &str) -> Option<ScriptBuf> {
-        #[cfg(test)]
-        {
-            if let Ok(guard) = self.test_payout_resolver.lock()
-                && let Some(resolver) = guard.as_ref()
-            {
-                return resolver(user_identifier);
-            }
+        if let Some(m) = self.metrics.as_ref() {
+            let timer = m.payout_resolver_resolve_duration_seconds.start_timer();
+            let out = self.payout_resolver.resolve(user_identifier);
+            timer.observe_duration();
+            out
+        } else {
+            self.payout_resolver.resolve(user_identifier)
         }
-        // Phase 3c Step 2: accounting selector not yet wired. Returning
-        // `None` keeps every miner on the pool-wide `coinbase_reward_script`
-        // until the selector lands.
-        let _ = user_identifier;
-        None
     }
 
-    /// Install a test-only payout resolver. The closure is invoked
-    /// inside `resolve_payout_script` for every `user_identifier` the
-    /// trait impl sees.
-    #[cfg(test)]
-    pub(crate) fn set_test_payout_resolver<F>(&self, resolver: F)
-    where
-        F: Fn(&str) -> Option<ScriptBuf> + Send + Sync + 'static,
-    {
-        let mut guard = self
-            .test_payout_resolver
-            .lock()
-            .expect("test_payout_resolver mutex poisoned");
-        *guard = Some(Box::new(resolver));
+    /// Install a per-miner payout-script resolver.
+    ///
+    /// Overrides the default [`NullResolver`]. Production callers pass
+    /// a [`StaticMapResolver`] built from the pool's `[payout.static]`
+    /// config section; tests pass a raw closure via `Arc::new` (the
+    /// `#[cfg(test)]` blanket impl in [`crate::payout_resolver`]
+    /// covers `Fn(&str) -> Option<ScriptBuf>`).
+    pub fn with_payout_resolver(mut self, resolver: Arc<dyn PayoutScriptResolver>) -> Self {
+        self.payout_resolver = resolver;
+        self
+    }
+
+    /// Access the installed [`PayoutScriptResolver`]. `Pool::start`
+    /// logs `resolver.name()` at INFO for operator visibility.
+    pub fn payout_resolver(&self) -> &Arc<dyn PayoutScriptResolver> {
+        &self.payout_resolver
     }
 
     /// Borrow the inverse index for tests + the trait impl.

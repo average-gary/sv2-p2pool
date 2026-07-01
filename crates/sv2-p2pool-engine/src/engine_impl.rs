@@ -986,38 +986,12 @@ impl JobValidationEngine for P2poolV2Engine {
         //    every miner gets the pool-wide fallback.
         let script = self.resolve_payout_script(&normalized)?;
 
-        // 2. Duplicate-binding guard. If the same user_identifier
-        //    already has a live binding to a *different* token, we do
-        //    NOT overwrite — the JDC has already received the prior
-        //    binding's TxOut and will be building coinbases against
-        //    it. Returning `None` here keeps the JDS on its pool-wide
-        //    fallback for *this* token; the prior token's binding is
-        //    untouched and will continue to credit its share-finder
-        //    until evicted by the janitor.
-        //
-        //    Using `entry().or_insert_with(|| token)` would be a tighter
-        //    primitive but DashMap's `entry` API is not ergonomic for
-        //    the "match-or-take" semantics we want; a plain `get`
-        //    keeps the logic readable.
-        if let Some(existing) = self.user_identifier_index().get(&normalized) {
-            let existing_token = *existing.value();
-            if existing_token != token {
-                debug!(
-                    new_token = token,
-                    existing_token,
-                    user_identifier = %normalized,
-                    "handle_allocate_mining_job_token: user_identifier already bound to a \
-                     different live token; falling back to pool-wide script"
-                );
-                return None;
-            }
-            // Same user re-bound to the same token: idempotent; fall through.
-        }
-
-        // 3. Size budget. The serialized size of the candidate output
+        // 2. Size budget. The serialized size of the candidate output
         //    must fit within what the JDS would have produced
         //    otherwise. If it doesn't, fall back rather than emit an
-        //    oversize coinbase.
+        //    oversize coinbase. Evaluated BEFORE the DashMap
+        //    entry-lock below so an oversize candidate doesn't need
+        //    to be rolled back on the atomic-insert path.
         let candidate = TxOut {
             value: bitcoin::Amount::ZERO,
             script_pubkey: script.clone(),
@@ -1034,18 +1008,93 @@ impl JobValidationEngine for P2poolV2Engine {
             return None;
         }
 
-        // 4. Commit the binding. Insert into the forward map first so
-        //    `lookup_payout_script` succeeds immediately; the inverse
-        //    index follows. The two writes are not atomic together but
-        //    `handle_push_solution` only reads the forward map, so a
-        //    transient inverse-miss is harmless — at worst a concurrent
-        //    duplicate allocation falls back to pool-wide.
-        self.token_payout.insert(token, script);
-        self.user_identifier_index().insert(normalized, token);
+        // 3. Duplicate-binding guard AND commit, atomically.
+        //
+        //    Prior revision did the check and the two writes as three
+        //    separate operations, which under two-JDC contention could:
+        //      - install an orphan inverse-index entry pointing at a
+        //        `token_payout` binding that a racing insert had
+        //        overwritten, OR
+        //      - overwrite a live binding when two JDCs allocated for
+        //        the same user_identifier in the same tick.
+        //
+        //    The wake-up of a real `Some`-returning resolver
+        //    (Phase 3-c, Tier 5 #13) is what makes the race reachable,
+        //    so the tightening co-ships in the same PR.
+        //
+        //    Ordering: reserve the inverse-index slot first (via
+        //    `entry(user_identifier).or_insert_with`). If we lost the
+        //    race and the slot is already held by a different token,
+        //    fall back — do NOT touch `token_payout`. If we won the
+        //    race, register the token → script mapping unconditionally
+        //    (safe because we hold the entry lock and this is the
+        //    unique writer for that user_identifier).
+        //
+        //    Under-lock semantics for `entry().or_insert_with(...)`:
+        //    the closure runs at most once per key, and readers of
+        //    `token_payout` for the reserved user_identifier's token
+        //    can't observe a partial state — we set
+        //    `token_payout[token] = script` before returning to the
+        //    outer scope.
+        let mut is_new_binding = false;
+        let mut duplicate_conflict = false;
+        {
+            let entry = self
+                .user_identifier_index()
+                .entry(normalized.clone())
+                .or_insert_with(|| {
+                    // Slot was empty — claim it AND install the
+                    // forward binding atomically. Any concurrent
+                    // duplicate allocation for the same user takes
+                    // the else-branch below and falls back.
+                    self.token_payout.insert(token, script.clone());
+                    is_new_binding = true;
+                    token
+                });
+            let existing_token = *entry.value();
+            if existing_token != token {
+                // A different token already holds this user's slot;
+                // fall back to pool-wide for THIS allocation. The
+                // prior binding stays untouched.
+                duplicate_conflict = true;
+            } else if !is_new_binding {
+                // Idempotent re-bind of the same (token, user_identifier)
+                // pair. Ensure the forward map is populated in case the
+                // caller lost it (e.g. an evictor drained it between
+                // allocations). Cheap: DashMap::insert is O(1) amortised.
+                self.token_payout.insert(token, script.clone());
+            }
+        }
+        if duplicate_conflict {
+            debug!(
+                new_token = token,
+                user_identifier = %normalized,
+                "handle_allocate_mining_job_token: user_identifier already bound to a \
+                 different live token; falling back to pool-wide script"
+            );
+            return None;
+        }
+
+        // 4. Bump the monotonic `payout_binding_installed_total`
+        //    counter ONLY on a fresh binding. Idempotent re-binds
+        //    (same token, same user) must not double-count — the E2E
+        //    witness in `tests/e2e_per_miner_binding.rs` asserts
+        //    `>= 1`, but downstream dashboards may derive per-miner
+        //    binding rate and would be misled by spurious increments.
+        if is_new_binding {
+            if let Some(m) = self.metrics() {
+                m.payout_binding_installed_total
+                    .with_label_values(&[normalized.as_str()])
+                    .inc();
+            }
+        }
 
         debug!(
             token,
-            serialized_len, "handle_allocate_mining_job_token: per-miner payout binding installed"
+            serialized_len,
+            is_new_binding,
+            user_identifier = %normalized,
+            "handle_allocate_mining_job_token: per-miner payout binding installed"
         );
         Some(candidate)
     }
@@ -2563,19 +2612,20 @@ mod tests {
         // user_identifier with leading + trailing ASCII whitespace
         // and a non-NFKC form ('fi' ligature U+FB01) should normalize
         // before being keyed.
-        let engine = P2poolV2Engine::default();
         let script = payout_script(1);
         // Resolver only matches the *normalized* form so we can prove
         // the trait method normalized before calling.
         let expected_normalized = "final";
         let script_clone = script.clone();
-        engine.set_test_payout_resolver(move |uid| {
-            if uid == expected_normalized {
-                Some(script_clone.clone())
-            } else {
-                None
-            }
-        });
+        let engine = P2poolV2Engine::default().with_payout_resolver(std::sync::Arc::new(
+            move |uid: &str| {
+                if uid == expected_normalized {
+                    Some(script_clone.clone())
+                } else {
+                    None
+                }
+            },
+        ));
 
         // Input with ligature ﬁ (U+FB01) — NFKC decomposes it to 'fi'.
         // Plus leading/trailing whitespace that the trim must strip.
@@ -2705,10 +2755,12 @@ mod tests {
     async fn allocate_token_duplicate_user_identifier_falls_back() {
         // Two distinct tokens for the same user_identifier should not
         // overwrite the prior binding. The second call returns None.
-        let engine = P2poolV2Engine::default();
         let script = payout_script(2);
         let script_clone = script.clone();
-        engine.set_test_payout_resolver(move |_| Some(script_clone.clone()));
+        let engine =
+            P2poolV2Engine::default().with_payout_resolver(std::sync::Arc::new(move |_: &str| {
+                Some(script_clone.clone())
+            }));
 
         // First allocation succeeds.
         let first = engine
@@ -2741,10 +2793,12 @@ mod tests {
     async fn allocate_token_idempotent_for_same_token() {
         // Same user_identifier + same token: idempotent — the binding
         // sticks and a custom TxOut is returned.
-        let engine = P2poolV2Engine::default();
         let script = payout_script(3);
         let script_clone = script.clone();
-        engine.set_test_payout_resolver(move |_| Some(script_clone.clone()));
+        let engine =
+            P2poolV2Engine::default().with_payout_resolver(std::sync::Arc::new(move |_: &str| {
+                Some(script_clone.clone())
+            }));
 
         let first = engine
             .handle_allocate_mining_job_token(200, "miner-Y", 64)
@@ -2766,10 +2820,10 @@ mod tests {
         // Force the resolver to return a script that, once wrapped in
         // a TxOut, exceeds the size budget. Method must return None
         // rather than emit an oversize coinbase.
-        let engine = P2poolV2Engine::default();
         // Big script: 1024 zero bytes — way over any sane budget.
         let big = bitcoin::ScriptBuf::from_bytes(vec![0u8; 1024]);
-        engine.set_test_payout_resolver(move |_| Some(big.clone()));
+        let engine = P2poolV2Engine::default()
+            .with_payout_resolver(std::sync::Arc::new(move |_: &str| Some(big.clone())));
 
         // Budget too small to fit the candidate TxOut.
         let out = engine
@@ -2777,6 +2831,173 @@ mod tests {
             .await;
         assert!(out.is_none(), "oversize TxOut must fall back to None");
         assert!(engine.token_payout().is_empty());
+    }
+
+    /// Two concurrent `handle_allocate_mining_job_token` calls for the
+    /// same `user_identifier` under a `Some`-returning resolver MUST
+    /// leave both indices consistent: exactly one token wins, no
+    /// orphan inverse-index entry survives, and `token_payout` /
+    /// `user_identifier_index` agree on which token bound the user.
+    /// Locks the DashMap TOCTOU tightening co-shipped with the
+    /// resolver wakeup (Phase 3-c, Tier 5 #13 + Tier 3 #8).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn payout_resolver_toctou_no_orphan_under_contention() {
+        use std::sync::Arc;
+
+        let script = payout_script(9);
+        let script_clone = script.clone();
+        let engine = Arc::new(
+            P2poolV2Engine::default()
+                .with_payout_resolver(Arc::new(move |_: &str| Some(script_clone.clone()))),
+        );
+
+        // Fire many concurrent allocations for the same user under
+        // *different* tokens. The winning token is nondeterministic
+        // but consistency must hold.
+        const N: u64 = 64;
+        let mut handles = Vec::with_capacity(N as usize);
+        for token in 0..N {
+            let engine = engine.clone();
+            handles.push(tokio::spawn(async move {
+                engine
+                    .handle_allocate_mining_job_token(token, "miner-shared", 64)
+                    .await
+            }));
+        }
+        for h in handles {
+            // Ignore individual returns; we assert on final state.
+            let _ = h.await;
+        }
+
+        // Exactly one binding must survive.
+        assert_eq!(
+            engine.token_payout().len(),
+            1,
+            "TOCTOU: exactly one binding must have won the race"
+        );
+        assert_eq!(
+            engine.user_identifier_index().len(),
+            1,
+            "TOCTOU: no orphan inverse-index entries under contention"
+        );
+        // The winning token in the inverse index MUST have a matching
+        // forward entry. No dangling inverse-index pointer.
+        let bound_token = engine
+            .user_identifier_index()
+            .get("miner-shared")
+            .map(|e| *e.value())
+            .expect("inverse index must have exactly one entry");
+        assert!(
+            engine.token_payout().contains_key(&bound_token),
+            "inverse index points at token {bound_token} but forward map does not have it"
+        );
+    }
+
+    /// The `payout_binding_installed_total{user_identifier}` counter
+    /// bumps exactly once per NEW binding — collisions on the
+    /// duplicate-binding guard must NOT double-increment.
+    #[tokio::test]
+    async fn payout_binding_installed_total_increments_on_new_binding() {
+        use std::sync::Arc;
+
+        use prometheus::Registry;
+
+        use crate::EngineMetrics;
+
+        let registry = Registry::new();
+        let metrics = EngineMetrics::register(&registry).expect("register");
+
+        let script = payout_script(11);
+        let script_clone = script.clone();
+        let engine = P2poolV2Engine::default()
+            .with_metrics(metrics.clone())
+            .with_payout_resolver(Arc::new(move |_: &str| Some(script_clone.clone())));
+
+        // First allocation: new binding → counter goes to 1.
+        let first = engine
+            .handle_allocate_mining_job_token(500, "miner-counter", 64)
+            .await;
+        assert!(first.is_some());
+        assert_eq!(
+            metrics
+                .payout_binding_installed_total
+                .with_label_values(&["miner-counter"])
+                .get(),
+            1,
+            "first allocation must bump the counter to 1"
+        );
+
+        // Second allocation with the SAME token+user: idempotent
+        // re-bind → must NOT double-increment.
+        let second = engine
+            .handle_allocate_mining_job_token(500, "miner-counter", 64)
+            .await;
+        assert!(second.is_some());
+        assert_eq!(
+            metrics
+                .payout_binding_installed_total
+                .with_label_values(&["miner-counter"])
+                .get(),
+            1,
+            "idempotent re-bind must not double-increment the counter"
+        );
+
+        // Third allocation with a DIFFERENT token but same user:
+        // duplicate-binding guard fires → counter stays at 1 for this
+        // user (the guard falls back to pool-wide for the new token).
+        let third = engine
+            .handle_allocate_mining_job_token(501, "miner-counter", 64)
+            .await;
+        assert!(third.is_none());
+        assert_eq!(
+            metrics
+                .payout_binding_installed_total
+                .with_label_values(&["miner-counter"])
+                .get(),
+            1,
+            "duplicate-binding guard must not double-increment the counter"
+        );
+    }
+
+    /// The `payout_resolver_resolve_duration_seconds` histogram MUST
+    /// record at least one observation whenever `resolve_payout_script`
+    /// is consulted (i.e. any non-rejected allocation).
+    #[tokio::test]
+    async fn payout_resolver_resolve_duration_seconds_records_on_resolve() {
+        use std::sync::Arc;
+
+        use prometheus::Registry;
+
+        use crate::EngineMetrics;
+
+        let registry = Registry::new();
+        let metrics = EngineMetrics::register(&registry).expect("register");
+
+        let script = payout_script(12);
+        let script_clone = script.clone();
+        let engine = P2poolV2Engine::default()
+            .with_metrics(metrics.clone())
+            .with_payout_resolver(Arc::new(move |_: &str| Some(script_clone.clone())));
+
+        assert_eq!(
+            metrics
+                .payout_resolver_resolve_duration_seconds
+                .get_sample_count(),
+            0,
+            "histogram starts empty"
+        );
+
+        let _ = engine
+            .handle_allocate_mining_job_token(700, "miner-histo", 64)
+            .await;
+
+        assert!(
+            metrics
+                .payout_resolver_resolve_duration_seconds
+                .get_sample_count()
+                >= 1,
+            "histogram must have recorded at least one observation after the resolver was consulted"
+        );
     }
 
     #[test]

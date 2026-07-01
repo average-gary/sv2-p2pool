@@ -46,7 +46,7 @@ use stratum_apps::{
     stratum_core::bitcoin::consensus::Encodable, task_manager::TaskManager,
     tp_type::TemplateProviderType, utils::types::GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS,
 };
-use sv2_p2pool_engine::{EngineMetrics, TdpHandle};
+use sv2_p2pool_engine::{EngineMetrics, NullResolver, PayoutScriptResolver, TdpHandle};
 use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 
@@ -55,7 +55,7 @@ use crate::{PoolBuilder, metrics_endpoint, share_chain, tdp_demux};
 /// Top-level pool runtime.
 ///
 /// Construct via [`PoolBuilder::build_pool`]; drive via [`Pool::start`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Pool {
     config: PoolConfig,
     /// Phase 2.5b: optional p2poolv2 share-chain config. When present,
@@ -75,6 +75,17 @@ pub struct Pool {
     /// pool's `metrics_registry`. Use `127.0.0.1:0` in tests for an
     /// OS-assigned port.
     metrics_addr: Option<std::net::SocketAddr>,
+    /// Per-miner payout-script resolver, threaded from [`PoolBuilder`]
+    /// and applied to the engine inside [`Pool::start`] (see ADR 0014).
+    ///
+    /// The wiring fix lives here: an earlier revision routed the
+    /// resolver through the inner `PoolBuilder::new` that `Pool::start`
+    /// constructs on its own — that path did NOT persist the resolver
+    /// from the outer PoolBuilder, so it was silently ignored in
+    /// production. By pinning the resolver to `Pool` itself we
+    /// guarantee `Pool::start` applies it directly on
+    /// `engine_concrete` before wrapping in `Arc::new`.
+    payout_resolver: Option<Arc<dyn PayoutScriptResolver>>,
     cancellation_token: CancellationToken,
     shutdown_notify: Arc<Notify>,
     is_alive: Arc<AtomicBool>,
@@ -87,6 +98,7 @@ impl Pool {
             p2pool_config: None,
             metrics_registry: Registry::new(),
             metrics_addr: None,
+            payout_resolver: None,
             cancellation_token: CancellationToken::new(),
             shutdown_notify: Arc::new(Notify::new()),
             is_alive: Arc::new(AtomicBool::new(true)),
@@ -104,6 +116,37 @@ impl Pool {
     pub fn with_p2pool_config(mut self, p2pool_config: P2poolConfig) -> Self {
         self.p2pool_config = Some(p2pool_config);
         self
+    }
+
+    /// Attach a per-miner payout-script resolver. Applied to the
+    /// engine inside [`Pool::start`] before construction of the
+    /// `Arc<dyn JobValidationEngine>`. Normally called via
+    /// [`crate::PoolBuilder::with_payout_resolver`]; this direct
+    /// accessor exists mostly for tests that build a `Pool` without
+    /// the intermediate builder.
+    pub fn with_payout_resolver(mut self, resolver: Arc<dyn PayoutScriptResolver>) -> Self {
+        self.payout_resolver = Some(resolver);
+        self
+    }
+
+    /// Borrow the currently-installed resolver, if any. Used by the
+    /// `pool_start_applies_resolver_from_pool_field` test to verify
+    /// the wiring fix.
+    pub fn payout_resolver(&self) -> Option<&Arc<dyn PayoutScriptResolver>> {
+        self.payout_resolver.as_ref()
+    }
+
+    /// Extract the resolver `Pool::start` will install on the engine.
+    /// Falls back to [`NullResolver`] when no resolver is configured.
+    ///
+    /// Factored out so the wiring test
+    /// [`pool_start_applies_resolver_from_pool_field`] can verify
+    /// exactly what `Pool::start` would install without spinning up
+    /// the full pool runtime.
+    pub(crate) fn resolver_for_start(&self) -> Arc<dyn PayoutScriptResolver> {
+        self.payout_resolver
+            .clone()
+            .unwrap_or_else(|| Arc::new(NullResolver))
     }
 
     /// Borrow the Prometheus registry the engine's counters are
@@ -188,6 +231,20 @@ impl Pool {
                 .build_engine()
                 .with_tdp(tdp.clone())
         };
+
+        // CRITICAL WIRING FIX (ADR 0014 §Correctness §1): the inner
+        // `PoolBuilder::new` above does NOT persist a resolver from
+        // the outer builder that produced this `Pool`. Apply the
+        // resolver DIRECTLY on `engine_concrete` here from the Pool's
+        // own field so it actually reaches production callers. When
+        // no resolver was supplied, fall back to `NullResolver`
+        // (byte-for-byte pool-wide-fallback preserved).
+        let resolver_for_engine = self.resolver_for_start();
+        info!(
+            resolver = resolver_for_engine.name(),
+            "installing payout-script resolver on engine"
+        );
+        engine_concrete = engine_concrete.with_payout_resolver(resolver_for_engine);
 
         // Register engine counters on the pool's Prometheus registry.
         // Pool::start can be called multiple times in tests; on a
@@ -684,6 +741,24 @@ impl Drop for Pool {
     }
 }
 
+impl std::fmt::Debug for Pool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `Arc<dyn PayoutScriptResolver>` has no `Debug` bound by design
+        // (see ADR 0014 § Trait shape). Render it via its `name()`
+        // discriminant so operator debug output stays useful without
+        // leaking script bytes.
+        f.debug_struct("Pool")
+            .field("config", &self.config)
+            .field("p2pool_config", &self.p2pool_config)
+            .field("metrics_addr", &self.metrics_addr)
+            .field(
+                "payout_resolver",
+                &self.payout_resolver.as_ref().map(|r| r.name()),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -739,5 +814,52 @@ listen_address = "127.0.0.1:0"
     fn config_network_regtest_round_trips() {
         let pool = Pool::new(pool_config_with_network("regtest"));
         assert_eq!(pool.config_network(), bitcoin::Network::Regtest);
+    }
+
+    /// Lock the wiring fix from ADR 0014 §Correctness §1: a resolver
+    /// attached to `Pool` (i.e. via [`Pool::with_payout_resolver`],
+    /// which is what [`crate::PoolBuilder::build_pool*`] uses)
+    /// reaches `Pool::start`'s engine construction.
+    ///
+    /// We don't spin up the full pool runtime here — that needs
+    /// bitcoind + p2poolv2 + JDC. Instead we exercise
+    /// [`Pool::resolver_for_start`] (the function `Pool::start`
+    /// itself calls, factored out for exactly this test) and verify
+    /// it hands back the operator-installed resolver.
+    #[test]
+    fn pool_start_applies_resolver_from_pool_field() {
+        use sv2_p2pool_engine::StaticMapResolver;
+
+        let resolver: Arc<dyn PayoutScriptResolver> = Arc::new(
+            StaticMapResolver::new([(
+                "miner-42".to_string(),
+                bitcoin::ScriptBuf::from_bytes(vec![0x11; 22]),
+            )])
+            .expect("build resolver"),
+        );
+        let pool =
+            Pool::new(pool_config_with_network("regtest")).with_payout_resolver(resolver.clone());
+
+        let extracted = pool.resolver_for_start();
+        assert_eq!(
+            extracted.name(),
+            "static-map",
+            "Pool::start must extract the operator's resolver, not fall back to NullResolver"
+        );
+        // Round-trip a resolve call to prove it's the SAME resolver
+        // (not just a same-name replacement).
+        assert!(
+            extracted.resolve("miner-42").is_some(),
+            "extracted resolver must resolve the same entries the caller installed"
+        );
+    }
+
+    /// Absent resolver → `Pool::start` falls back to `NullResolver`,
+    /// preserving today's pool-wide-fallback semantics for
+    /// deployments that omit `[payout.static]`.
+    #[test]
+    fn pool_start_defaults_to_null_resolver_when_unset() {
+        let pool = Pool::new(pool_config_with_network("regtest"));
+        assert_eq!(pool.resolver_for_start().name(), "null");
     }
 }

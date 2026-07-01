@@ -14,10 +14,12 @@
 pub mod args;
 pub mod builder;
 pub mod metrics_endpoint;
+pub mod payout_config;
 pub mod pool;
 pub mod share_chain;
 pub mod tdp_demux;
 
 pub use args::process_cli_args;
 pub use builder::PoolBuilder;
+pub use payout_config::{PayoutConfigError, RawPayoutSection};
 pub use pool::Pool;
