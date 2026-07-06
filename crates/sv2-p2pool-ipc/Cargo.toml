@@ -14,7 +14,7 @@ capnp-rpc = "0.25"
 # Schema crate. Dual-licensed MIT OR Apache-2.0 so this AGPL-free client
 # can depend on it without inheriting the daemon's license; see ADR 0010.
 p2poolv2-capnp-types = { path = "../../vendor/p2poolv2/p2poolv2-capnp-types" }
-tokio = { workspace = true, features = ["net", "io-util", "rt", "macros"] }
+tokio = { workspace = true, features = ["net", "io-util", "rt", "macros", "sync"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"
 thiserror = { workspace = true }
@@ -23,6 +23,16 @@ tracing = { workspace = true }
 # client API. bitcoin-rs is MIT/Apache, so this does not affect the
 # AGPL boundary; the client stays consumable by non-AGPL callers.
 bitcoin = "0.32"
+# Prometheus metrics surface. Same version pin as the engine + pool
+# crates so registrations against a shared registry share a compatible
+# collector type. Item #4 of the Phase 3 hardening pass adds the
+# `ipc_client_driver_exit_total{result}` counter here.
+prometheus = "0.13"
+# `Lazy` static initializer for the process-wide prometheus collectors
+# owned by this crate. `std::sync::OnceLock` is stable but doesn't
+# provide the `Deref` ergonomics `prometheus::IntCounterVec` benefits
+# from.
+once_cell = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

@@ -99,6 +99,51 @@ impl ScmjProposalRejectReason {
     }
 }
 
+/// Stable `reason` label values for
+/// [`EngineMetrics::set_custom_mining_job_validation_skipped`].
+///
+/// Each variant maps to one branch in
+/// [`crate::P2poolV2Engine::handle_set_custom_mining_job`] where the
+/// per-SCMJ `validate_block_proposal` round-trip is skipped and the
+/// engine falls through to structural-only acceptance. Operators want
+/// to alert on a sustained skip rate (`no_handles` / `no_tdp` /
+/// `no_template_id` all mean the pool is running in reduced-safety mode)
+/// AND on transient errors (`tdp_fetch_failed`, `bitcoind_rpc_error`
+/// which pass through as skips rather than JDC-facing rejections).
+#[derive(Debug, Clone, Copy)]
+pub enum ScmjValidationSkipReason {
+    /// No `TdpHandle` wired on the engine. Structural-only mode.
+    NoTdp,
+    /// `EngineHandles` not wired (unit tests / Phase 2.5a).
+    NoHandles,
+    /// Handles + TDP wired, but the cached `DeclaredJob` has no
+    /// `template_id` — the JDC declared before TDP populated it.
+    NoTemplateId,
+    /// TDP `RequestTransactionData` for tx bodies failed. Same skip
+    /// semantics as `NoTemplateId` but caused by a transient upstream
+    /// issue rather than missing state.
+    TdpFetchFailed,
+    /// `BitcoindLike::validate_block_proposal` returned an
+    /// `Err(BitcoindRpcError::*)`. The engine treats this as a skip
+    /// (structural checks binding) rather than reject-to-JDC to avoid
+    /// blocking legitimate templates on bitcoind transport issues; the
+    /// separate `scmj_proposal_rejected{reason="rpc_error"}` counter
+    /// still captures the underlying condition for alerting.
+    BitcoindRpcError,
+}
+
+impl ScmjValidationSkipReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoTdp => "no_tdp",
+            Self::NoHandles => "no_handles",
+            Self::NoTemplateId => "no_template_id",
+            Self::TdpFetchFailed => "tdp_fetch_failed",
+            Self::BitcoindRpcError => "bitcoind_rpc_error",
+        }
+    }
+}
+
 /// Counter set tracked by the engine. All counters are monotonic.
 ///
 /// Cheap to clone — every field is `IntCounter`, which is internally
@@ -164,11 +209,15 @@ pub struct EngineMetrics {
 
     /// `SetCustomMiningJob` calls that took the structural-only
     /// fallback path (no TDP wired, no cached `template_id`, or no
-    /// handles). These never call `validate_block_proposal`. Tracked so
-    /// operators can confirm the pool is in full-validation mode and
-    /// alert if the ratio of validated → skipped flips (which would
-    /// silently downgrade consensus correctness).
-    pub set_custom_mining_job_validation_skipped: IntCounter,
+    /// handles). These never call `validate_block_proposal`. Broken
+    /// down by `reason` — see [`ScmjValidationSkipReason`] for the
+    /// stable label values. Tracked so operators can confirm the pool
+    /// is in full-validation mode and alert if the ratio of validated
+    /// → skipped flips (which would silently downgrade consensus
+    /// correctness), and so they can distinguish a boot-time
+    /// misconfiguration (`no_handles`) from a runtime transient
+    /// (`tdp_fetch_failed` / `bitcoind_rpc_error`).
+    pub set_custom_mining_job_validation_skipped: IntCounterVec,
 
     /// Current size of the declared-jobs cache. Updated periodically
     /// by the engine's stats sweeper task (same cadence as
@@ -270,9 +319,12 @@ impl EngineMetrics {
                 "sv2_p2pool_engine_set_custom_mining_job_validation_seconds",
                 "Wall-clock latency of validate_block_proposal calls made during handle_set_custom_mining_job",
             ))?,
-            set_custom_mining_job_validation_skipped: int_counter(
-                "sv2_p2pool_engine_set_custom_mining_job_validation_skipped_total",
-                "SetCustomMiningJob calls that bypassed validate_block_proposal (structural-only / no TDP / no template_id)",
+            set_custom_mining_job_validation_skipped: IntCounterVec::new(
+                Opts::new(
+                    "sv2_p2pool_engine_set_custom_mining_job_validation_skipped_total",
+                    "SetCustomMiningJob calls that bypassed validate_block_proposal (structural-only / no TDP / no template_id / no handles / bitcoind rpc error)",
+                ),
+                &["reason"],
             )?,
         };
 
@@ -288,6 +340,9 @@ impl EngineMetrics {
         ))?;
         registry.register(Box::new(
             metrics.set_custom_mining_job_validation_seconds.clone(),
+        ))?;
+        registry.register(Box::new(
+            metrics.set_custom_mining_job_validation_skipped.clone(),
         ))?;
 
         // Seed the tip-height gauge to -1 ("unknown") so dashboards
@@ -317,6 +372,17 @@ impl EngineMetrics {
                 .set_custom_mining_job_proposal_rejected
                 .with_label_values(&[reason.as_str()]);
         }
+        for reason in [
+            ScmjValidationSkipReason::NoTdp,
+            ScmjValidationSkipReason::NoHandles,
+            ScmjValidationSkipReason::NoTemplateId,
+            ScmjValidationSkipReason::TdpFetchFailed,
+            ScmjValidationSkipReason::BitcoindRpcError,
+        ] {
+            metrics
+                .set_custom_mining_job_validation_skipped
+                .with_label_values(&[reason.as_str()]);
+        }
 
         Ok(metrics)
     }
@@ -338,7 +404,17 @@ impl EngineMetrics {
             .inc();
     }
 
-    fn all_counters(&self) -> [&IntCounter; 11] {
+    /// Increment the
+    /// `set_custom_mining_job_validation_skipped_total{reason}` counter
+    /// for the given reason. Use this at every fall-through site where
+    /// `validate_block_proposal` is bypassed.
+    pub fn record_scmj_validation_skip(&self, reason: ScmjValidationSkipReason) {
+        self.set_custom_mining_job_validation_skipped
+            .with_label_values(&[reason.as_str()])
+            .inc();
+    }
+
+    fn all_counters(&self) -> [&IntCounter; 10] {
         [
             &self.declare_mining_job_accepted,
             &self.declare_mining_job_rejected,
@@ -350,7 +426,6 @@ impl EngineMetrics {
             &self.blocks_submit_failed,
             &self.reorg_notifications,
             &self.jobs_invalidated_total,
-            &self.set_custom_mining_job_validation_skipped,
         ]
     }
 
@@ -401,6 +476,38 @@ mod tests {
         assert!(
             names.contains(&"sv2_p2pool_engine_sweeper_last_run_timestamp_seconds".to_string())
         );
+        assert!(
+            names.contains(
+                &"sv2_p2pool_engine_set_custom_mining_job_validation_skipped_total".to_string()
+            ),
+            "labeled skip counter must be registered"
+        );
+    }
+
+    #[test]
+    fn validation_skipped_counter_registers_all_reason_labels_at_zero() {
+        // The labeled skip counter must expose every declared reason
+        // at zero from boot, so dashboards don't have to special-case
+        // "label not yet present". Regression guard for Item #5.
+        let registry = Registry::new();
+        let metrics = EngineMetrics::register(&registry).expect("register");
+        for reason in [
+            ScmjValidationSkipReason::NoTdp,
+            ScmjValidationSkipReason::NoHandles,
+            ScmjValidationSkipReason::NoTemplateId,
+            ScmjValidationSkipReason::TdpFetchFailed,
+            ScmjValidationSkipReason::BitcoindRpcError,
+        ] {
+            let counter = metrics
+                .set_custom_mining_job_validation_skipped
+                .with_label_values(&[reason.as_str()]);
+            assert_eq!(
+                counter.get(),
+                0,
+                "reason {} should start at 0",
+                reason.as_str()
+            );
+        }
     }
 
     #[test]

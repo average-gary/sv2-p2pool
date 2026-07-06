@@ -44,7 +44,9 @@ pub use coinbase::{
     CoinbaseReconstructError, merkle_path, reconstruct_coinbase,
     reconstruct_coinbase_with_extranonce,
 };
-pub use metrics::{EngineMetrics, PushSolutionDropReason, ScmjProposalRejectReason};
+pub use metrics::{
+    EngineMetrics, PushSolutionDropReason, ScmjProposalRejectReason, ScmjValidationSkipReason,
+};
 pub use recent_solutions::RecentSolutions;
 pub use reorg_detector::{DEFAULT_POLL_PERIOD, ReorgDetector};
 // Re-exports so consumers don't need to depend on `sv2-p2pool-ipc` for
@@ -274,6 +276,19 @@ pub type TokenPayoutMap = Arc<DashMap<JdToken, ScriptBuf>>;
 /// contract for Phase 3c Step 2.
 pub type UserIdentifierIndex = Arc<DashMap<String, JdToken>>;
 
+/// Reverse pointer from `JdToken` back to its normalized
+/// `user_identifier`. Populated alongside `token_payout` +
+/// `user_identifier_index` writes in `handle_allocate_mining_job_token`.
+///
+/// The forward `user_identifier_index` maps identifier → token; this
+/// map is its inverse, letting [`P2poolV2Engine::drop_token_payout`]
+/// resolve the identifier of an evicted token in O(1) rather than
+/// scanning `user_identifier_index` linearly on every token eviction.
+/// Under sustained JDS eviction traffic (10s TTL on the active side,
+/// 10min on the allocated side), that scan is the hottest path in the
+/// token lifecycle — Item #10 of the Phase 3 hardening pass.
+pub type TokenToUserIdentifierIndex = Arc<DashMap<JdToken, String>>;
+
 /// Token → request_id binding. Mirrors
 /// `BitcoinCoreIPCEngine::allocated_token_entries`'s lookup role at
 /// `vendor/sv2-apps/pool-apps/jd-server/src/lib/job_declarator/job_validation/bitcoin_core_ipc.rs:213`.
@@ -364,6 +379,13 @@ pub struct P2poolV2Engine {
     /// bindings (same user_identifier, different live token) and
     /// fall back to the pool-wide default rather than overwrite.
     user_identifier_index: UserIdentifierIndex,
+    /// Reverse pointer: `JdToken` → normalized `user_identifier`.
+    /// Populated by `handle_allocate_mining_job_token` at the same
+    /// time as `token_payout` + `user_identifier_index`. Read by
+    /// `drop_token_payout` so the inverse-index cleanup can do an
+    /// O(1) remove instead of the previous O(n) `retain` scan.
+    /// Item #10 of the Phase 3 hardening pass.
+    token_to_user_identifier: TokenToUserIdentifierIndex,
     /// Test-only override hook for the payout-script resolver. When
     /// `Some`, `resolve_payout_script` consults this closure instead
     /// of returning `None`. Lets the unit tests exercise the
@@ -422,6 +444,7 @@ impl P2poolV2Engine {
             allocated_tokens: Arc::new(DashMap::new()),
             token_payout: Arc::new(DashMap::new()),
             user_identifier_index: Arc::new(DashMap::new()),
+            token_to_user_identifier: Arc::new(DashMap::new()),
             #[cfg(test)]
             test_payout_resolver: std::sync::Mutex::new(None),
             recent_solutions: Arc::new(RecentSolutions::new(DEFAULT_RECENT_SOLUTIONS_TTL)),
@@ -581,20 +604,49 @@ impl P2poolV2Engine {
         &self.user_identifier_index
     }
 
+    /// Borrow the token → user_identifier reverse pointer for the
+    /// trait impl. Populated at
+    /// `handle_allocate_mining_job_token` time; consumed by
+    /// `drop_token_payout` for O(1) inverse-index cleanup.
+    pub(crate) fn token_to_user_identifier(&self) -> &TokenToUserIdentifierIndex {
+        &self.token_to_user_identifier
+    }
+
     /// Drop the per-token payout binding (if any) and the matching
     /// inverse-index entry. Invoked by the `TokenPayoutEvictor` impl
     /// when the JDS's `TokenManager` evicts the corresponding token.
+    ///
+    /// Item #9 (Phase 3 hardening): the inverse-index sweep is
+    /// ALWAYS attempted, even when the forward `token_payout` remove
+    /// misses. A prior code path guarded the sweep on the forward
+    /// remove succeeding — but the JDS invokes both `on_allocated_evicted`
+    /// AND `on_active_evicted` for the same allocated token during a
+    /// single token lifecycle, so the second call would find the
+    /// forward map already empty and orphan-leak the inverse-index
+    /// row. Doing the sweep unconditionally is idempotent.
+    ///
+    /// Item #10 (Phase 3 hardening): use the reverse pointer
+    /// (`token_to_user_identifier`) for an O(1) inverse-index lookup
+    /// instead of the previous O(n) `retain` scan. The `remove_if`
+    /// predicate double-checks that the inverse row still points at
+    /// our token so a concurrent
+    /// `handle_allocate_mining_job_token`-driven overwrite can't be
+    /// silently clobbered by a late eviction.
     pub(crate) fn drop_token_payout(&self, token: JdToken) {
-        // Take the script first so we can find the user_identifier in
-        // the inverse index without an extra full-table scan.
-        if let Some((_, _script)) = self.token_payout.remove(&token) {
-            // Drop the inverse entry pointing at this token. There's
-            // no per-token reverse pointer; do a linear scan and remove
-            // matches. The map is small (one entry per active miner)
-            // so this is cheap in practice and we don't need an extra
-            // forward pointer.
+        // Always attempt the forward remove — `_script` is discarded
+        // but the remove is what actually frees the coinbase script.
+        let _ = self.token_payout.remove(&token);
+        // Always look up + remove the reverse pointer, regardless of
+        // whether the forward remove hit. See Item #9 rationale.
+        if let Some((_, user_identifier)) = self.token_to_user_identifier.remove(&token) {
+            // Only clear the forward `user_identifier_index` row if
+            // it still points at OUR token — concurrent
+            // `handle_allocate_mining_job_token` calls could have
+            // already overwritten it with a fresh binding.
             self.user_identifier_index
-                .retain(|_, bound_token| *bound_token != token);
+                .remove_if(&user_identifier, |_ident, bound_token| {
+                    *bound_token == token
+                });
         }
     }
 
