@@ -87,8 +87,9 @@ use sv2_p2pool_engine::{
     BoxFuture, EngineHandles, ShareChainReader, ShareHeaderLookup, ShareHeaderRead,
 };
 use sv2_p2pool_ipc::{
-    ChainTipResult as IpcChainTipResult, IpcClientError, ShareHeaderLookup as IpcShareHeaderLookup,
-    Sv2P2poolIpcClient, TipHeightResult as IpcTipHeightResult,
+    ChainTipResult as IpcChainTipResult, IpcClientError, IpcClientHealth,
+    ShareHeaderLookup as IpcShareHeaderLookup, Sv2P2poolIpcClient,
+    TipHeightResult as IpcTipHeightResult,
 };
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -798,6 +799,14 @@ async fn actor_main(
         }
     };
 
+    // Item #4 (Phase 3 hardening): observe the client's health watch
+    // so a silent driver exit tears this actor down (which the
+    // watchdog thread then translates into a pool-wide shutdown_signal
+    // flip). Without this, the actor would keep serving requests that
+    // now all fail with `capnp::Error::disconnected(...)` on the next
+    // await, and the pool would never learn the IPC link is dead.
+    let mut health_rx = client.health();
+
     // 2. Capture network (sync at the trait surface; one capnp call
     //    here, then served from the actor's local copy forever after).
     let network = match client.get_network().await {
@@ -901,7 +910,49 @@ async fn actor_main(
     }
 
     // 6. Request loop.
-    while let Some(req) = cmd_rx.recv().await {
+    //
+    // Item #4 (Phase 3 hardening): also select on the health watch so
+    // a silent driver exit terminates the actor promptly. Without
+    // this we'd keep pulling requests from `cmd_rx` and dispatching
+    // them onto a client whose driver is dead — every one would
+    // await forever (the driver is what wakes capnp promises).
+    loop {
+        let req = tokio::select! {
+            biased;
+            // Health takes priority: if the driver died we want to
+            // exit BEFORE dispatching another request.
+            changed = health_rx.changed() => {
+                match changed {
+                    Ok(()) => {
+                        let current = *health_rx.borrow_and_update();
+                        if matches!(current, IpcClientHealth::Disconnected) {
+                            error!(
+                                "IpcChain actor: Sv2P2poolIpcClient reports Disconnected — \
+                                 RpcSystem driver has exited; tearing down actor"
+                            );
+                            break;
+                        }
+                        // Not disconnected yet (e.g. a future state
+                        // transition we don't recognize); loop and
+                        // re-select.
+                        continue;
+                    }
+                    Err(_) => {
+                        // Sender dropped; equivalent to Disconnected.
+                        error!(
+                            "IpcChain actor: health watch sender dropped — client is unreachable"
+                        );
+                        break;
+                    }
+                }
+            }
+            maybe_req = cmd_rx.recv() => {
+                match maybe_req {
+                    Some(r) => r,
+                    None => break,
+                }
+            }
+        };
         // Each request spawns into a `spawn_local` so the loop keeps
         // pumping while a slow capnp round-trip is in flight. Without
         // this a 100-hop reorg ancestry walk serialises behind

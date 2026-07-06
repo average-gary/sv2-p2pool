@@ -48,8 +48,31 @@ use tracing::{debug, info, warn};
 
 use crate::{
     DeclaredJob, P2poolV2Engine, ShareHeaderLookup, TipMetadata, coinbase,
-    metrics::PushSolutionDropReason,
+    metrics::{PushSolutionDropReason, ScmjValidationSkipReason},
 };
+
+/// SV2 error code returned by `handle_set_custom_mining_job` when the
+/// JDC-supplied `min_ntime` disagrees with the tip snapshot captured at
+/// declare time (either below the tip's `min_ntime` or wildly in the
+/// future). Defined locally because the upstream `mining_sv2` crate's
+/// analogous const may not be available on every pinned version we
+/// depend on; the string value matches the upstream convention so a
+/// future consolidation is drop-in.
+pub const ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_NTIME: &str = "invalid-min-ntime";
+
+/// Maximum allowable forward drift (in seconds) of the JDC-supplied
+/// `min_ntime` relative to the tip snapshot's captured `min_ntime`.
+///
+/// SetCustomMiningJob validation clamps `min_ntime` to
+/// `[tip.min_ntime, tip.min_ntime + MAX_NTIME_FORWARD_DRIFT_SECS]`.
+/// Values below `tip.min_ntime` mean the JDC is targeting a tip we
+/// consider stale; values further ahead than this bound are treated as
+/// almost-certainly wrong (clock skew or malicious). 2h matches the
+/// same tolerance bitcoind applies to `nTime` at block acceptance
+/// (`MAX_FUTURE_BLOCK_TIME`), so we neither reject templates that
+/// bitcoind would happily accept nor accept templates that bitcoind
+/// would reject on its side.
+pub const MAX_NTIME_FORWARD_DRIFT_SECS: u32 = 2 * 60 * 60;
 
 #[async_trait]
 impl JobValidationEngine for P2poolV2Engine {
@@ -410,6 +433,49 @@ impl JobValidationEngine for P2poolV2Engine {
                     ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_NBITS,
                 ));
             }
+
+            // min_ntime cross-check. Reject if the JDC's value falls
+            // outside the [tip.min_ntime, tip.min_ntime +
+            // MAX_NTIME_FORWARD_DRIFT_SECS] window. Below the tip's
+            // captured min_ntime means the JDC is building on a tip
+            // we consider stale; wildly in the future is either clock
+            // skew or a malicious template that bitcoind would reject
+            // at block-submit time anyway.
+            //
+            // We compare against the *captured* tip snapshot, not the
+            // current wall clock, so the check is deterministic: a
+            // template built against tip N must satisfy tip N's
+            // min_ntime, regardless of how long ago tip N was seen.
+            let custom_ntime = set_custom_mining_job.min_ntime;
+            let tip_ntime = declared.tip.min_ntime;
+            // Skip the check entirely if the captured tip's min_ntime
+            // is 0 — that's the structural-only sentinel value where
+            // we don't have a real tip to compare against. `tip_was_captured`
+            // already excludes the all-defaults case (via prev_hash /
+            // nbits) but a real tip could still carry min_ntime==0 in
+            // corner cases (very early genesis testing). Being
+            // permissive here matches how the nbits check treats a
+            // captured-but-zero tip.
+            if tip_ntime != 0 {
+                let too_early = custom_ntime < tip_ntime;
+                let too_late = custom_ntime
+                    .checked_sub(tip_ntime)
+                    .map(|drift| drift > MAX_NTIME_FORWARD_DRIFT_SECS)
+                    .unwrap_or(false);
+                if too_early || too_late {
+                    debug!(
+                        custom = custom_ntime,
+                        declared = tip_ntime,
+                        max_drift = MAX_NTIME_FORWARD_DRIFT_SECS,
+                        too_early,
+                        too_late,
+                        "SetCustomMiningJob: min_ntime outside acceptable window"
+                    );
+                    return bump_and_return(SetCustomMiningJobResult::Error(
+                        ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_NTIME,
+                    ));
+                }
+            }
         } else {
             debug!(
                 request_id,
@@ -555,7 +621,7 @@ impl JobValidationEngine for P2poolV2Engine {
                             "SetCustomMiningJob: TDP fetch of tx bodies failed before proposal-validation; falling back to structural-only acceptance"
                         );
                         if let Some(m) = self.metrics() {
-                            m.set_custom_mining_job_validation_skipped.inc();
+                            m.record_scmj_validation_skip(ScmjValidationSkipReason::TdpFetchFailed);
                         }
                         // Treat as skip rather than reject: the JDC
                         // didn't do anything wrong, we just lost
@@ -617,33 +683,67 @@ impl JobValidationEngine for P2poolV2Engine {
                         ));
                     }
                     Err(e) => {
+                        // Item #7 (Phase 3 hardening): bitcoind RPC
+                        // errors on the SCMJ validation path used to
+                        // reject the JDC-supplied job with
+                        // `ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_COINBASE_TX`.
+                        // That penalizes a well-behaved JDC for a
+                        // bitcoind transport issue on OUR side and
+                        // wedges the pool the moment bitcoind is
+                        // briefly unreachable. Mirror the TDP-miss
+                        // skip path instead: bump the labeled skip
+                        // counter (reason = `bitcoind_rpc_error`),
+                        // log the underlying error at warn so ops
+                        // can trace bitcoind health, and fall through
+                        // to structural-only Success. The separate
+                        // `scmj_proposal_rejected{reason="rpc_error"}`
+                        // counter still fires so alerting on bitcoind
+                        // health is unaffected.
                         warn!(
                             request_id,
                             template_id,
                             error = %e,
-                            "SetCustomMiningJob: validate_block_proposal RPC error; rejecting"
+                            "SetCustomMiningJob: validate_block_proposal RPC error; falling back to structural-only acceptance"
                         );
                         if let Some(m) = self.metrics() {
                             m.record_scmj_proposal_rejection(
                                 crate::ScmjProposalRejectReason::RpcError,
                             );
+                            m.record_scmj_validation_skip(
+                                ScmjValidationSkipReason::BitcoindRpcError,
+                            );
                         }
-                        return bump_and_return(SetCustomMiningJobResult::Error(
-                            ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_COINBASE_TX,
-                        ));
+                        // Fall through to structural success below.
                     }
                 }
             }
             _ => {
+                // Distinguish which piece is missing so operators can
+                // tell a boot-time misconfiguration (no_handles /
+                // no_tdp) from a benign per-job miss (no_template_id
+                // — the JDC declared before TDP populated it).
+                // Priority order: handles > tdp > template_id. That
+                // matches the "root cause first" mental model — if
+                // handles are missing, template_id is definitionally
+                // also missing.
+                let reason = if self.handles().is_none() {
+                    ScmjValidationSkipReason::NoHandles
+                } else if self.tdp().is_none() {
+                    ScmjValidationSkipReason::NoTdp
+                } else {
+                    // Handles + TDP wired but no template_id captured.
+                    ScmjValidationSkipReason::NoTemplateId
+                };
                 debug!(
                     request_id,
                     has_tdp = self.tdp().is_some(),
                     has_handles = self.handles().is_some(),
                     has_template_id = declared.template_id.is_some(),
+                    reason = reason.as_str(),
                     "SetCustomMiningJob: skipping validate_block_proposal (structural-only fallback)"
                 );
                 if let Some(m) = self.metrics() {
-                    m.set_custom_mining_job_validation_skipped.inc();
+                    m.record_scmj_validation_skip(reason);
                 }
             }
         }
@@ -1040,8 +1140,17 @@ impl JobValidationEngine for P2poolV2Engine {
         //    `handle_push_solution` only reads the forward map, so a
         //    transient inverse-miss is harmless — at worst a concurrent
         //    duplicate allocation falls back to pool-wide.
+        //
+        //    Item #10 (Phase 3 hardening): also populate the reverse
+        //    pointer (`token_to_user_identifier`) so `drop_token_payout`
+        //    can do O(1) inverse cleanup rather than a full-table scan.
+        //    Done AFTER the forward map so `handle_push_solution`
+        //    (which only reads the forward map) never sees a
+        //    reverse-pointer-only inconsistent state.
         self.token_payout.insert(token, script);
-        self.user_identifier_index().insert(normalized, token);
+        self.user_identifier_index()
+            .insert(normalized.clone(), token);
+        self.token_to_user_identifier().insert(token, normalized);
 
         debug!(
             token,
@@ -1521,6 +1630,30 @@ mod tests {
         coinbase_tx_outputs_serialized: Vec<u8>,
         merkle_path: Vec<[u8; 32]>,
     ) -> stratum_apps::stratum_core::mining_sv2::SetCustomMiningJob<'static> {
+        build_set_custom_mining_job_with_ntime(
+            token,
+            version,
+            prev_hash_bytes,
+            nbits,
+            0,
+            coinbase_tx_outputs_serialized,
+            merkle_path,
+        )
+    }
+
+    /// Variant of `build_set_custom_mining_job` that lets callers pin
+    /// the `min_ntime` field. Introduced for Phase 3 Item #6 tests
+    /// (min_ntime pre-check) — the fixture path needs to submit an
+    /// `min_ntime` that satisfies the captured tip's constraint.
+    fn build_set_custom_mining_job_with_ntime(
+        token: u64,
+        version: u32,
+        prev_hash_bytes: [u8; 32],
+        nbits: u32,
+        min_ntime: u32,
+        coinbase_tx_outputs_serialized: Vec<u8>,
+        merkle_path: Vec<[u8; 32]>,
+    ) -> stratum_apps::stratum_core::mining_sv2::SetCustomMiningJob<'static> {
         use stratum_apps::stratum_core::{
             binary_sv2::{B064K, Seq0255},
             mining_sv2::SetCustomMiningJob,
@@ -1535,7 +1668,7 @@ mod tests {
             token: token_b0255(token),
             version,
             prev_hash: prev_hash_bytes.to_vec().try_into().expect("32 bytes"),
-            min_ntime: 0,
+            min_ntime,
             nbits,
             coinbase_tx_version: 2,
             coinbase_prefix: Vec::<u8>::new().try_into().expect("empty fits"),
@@ -2459,11 +2592,15 @@ mod tests {
             .map(|m| m.as_byte_array().to_owned())
             .collect();
 
-        let custom = build_set_custom_mining_job(
+        // Item #6 (Phase 3 hardening): SCMJ now cross-checks
+        // min_ntime against the captured tip. Use the tip's
+        // min_ntime verbatim so the fixture's happy path stays valid.
+        let custom = build_set_custom_mining_job_with_ntime(
             99,
             0x20000000,
             tip_prev_hash_bytes,
             tip_nbits,
+            tip_min_ntime,
             outputs_serialized,
             merkle_arr,
         );
@@ -2512,10 +2649,27 @@ mod tests {
                 .get(),
             0
         );
+        // Item #5 (Phase 3 hardening): skip counter is now labeled
+        // by reason. Sum across the known reasons and assert the
+        // total stayed at zero — the validation path ran end-to-end.
+        let total_skipped: u64 = [
+            "no_tdp",
+            "no_handles",
+            "no_template_id",
+            "tdp_fetch_failed",
+            "bitcoind_rpc_error",
+        ]
+        .iter()
+        .map(|r| {
+            metrics
+                .set_custom_mining_job_validation_skipped
+                .with_label_values(&[r])
+                .get()
+        })
+        .sum();
         assert_eq!(
-            metrics.set_custom_mining_job_validation_skipped.get(),
-            0,
-            "validation path ran end-to-end; skip counter must stay at zero"
+            total_skipped, 0,
+            "validation path ran end-to-end; skip counter must stay at zero across every reason"
         );
         // Histogram observed at least once.
         let h = metrics.set_custom_mining_job_validation_seconds.clone();
@@ -2646,8 +2800,14 @@ mod tests {
 
     #[tokio::test]
     async fn scmj_proposal_validation_rpc_error_bumps_rpc_error_counter() {
-        // BitcoindRpcError → SCMJ rejected, rpc_error counter +1. The
-        // mock's validate_block_proposal is unscripted, which returns
+        // Item #7 (Phase 3 hardening): a `BitcoindRpcError` on the SCMJ
+        // validation path now falls through to structural-only Success
+        // rather than returning `Error(INVALID_COINBASE_TX)`. The
+        // separate `scmj_proposal_rejected{reason="rpc_error"}` counter
+        // still increments so alerting on bitcoind transport health is
+        // unaffected — and a NEW labeled skip counter fires to signal
+        // the reduced-safety mode. The mock's validate_block_proposal
+        // is unscripted, which returns
         // Err(BitcoindRpcError::Other("MockBitcoind::validate_block_proposal called without a canned response")).
         use std::sync::Arc;
 
@@ -2666,10 +2826,19 @@ mod tests {
 
         let result = engine.handle_set_custom_mining_job(custom, 99).await;
         assert!(
-            matches!(result, SetCustomMiningJobResult::Error(_)),
-            "RPC error must produce SCMJ Error"
+            matches!(result, SetCustomMiningJobResult::Success),
+            "RPC error must fall through to structural Success (Item #7)"
         );
-        assert_eq!(metrics.set_custom_mining_job_rejected.get(), 1);
+        assert_eq!(
+            metrics.set_custom_mining_job_rejected.get(),
+            0,
+            "SCMJ error counter must NOT increment on the RPC-error skip path"
+        );
+        assert_eq!(
+            metrics.set_custom_mining_job_accepted.get(),
+            1,
+            "SCMJ accepted counter must increment on the RPC-error skip path"
+        );
         assert_eq!(
             metrics
                 .set_custom_mining_job_proposal_rejected
@@ -2685,6 +2854,14 @@ mod tests {
                 .get(),
             0,
             "consensus_rejected stays at zero when bitcoind never gave a verdict"
+        );
+        assert_eq!(
+            metrics
+                .set_custom_mining_job_validation_skipped
+                .with_label_values(&["bitcoind_rpc_error"])
+                .get(),
+            1,
+            "labeled skip counter must fire with reason=bitcoind_rpc_error"
         );
     }
 
@@ -2783,15 +2960,22 @@ mod tests {
     fn token_payout_evictor_drops_allocated() {
         let engine = P2poolV2Engine::default();
         // Pre-populate as if handle_allocate_mining_job_token ran.
+        // Item #10 (Phase 3 hardening): also populate the new reverse
+        // pointer so drop_token_payout's O(1) sweep can find the
+        // matching inverse-index row.
         engine.token_payout().insert(99, payout_script(4));
         engine
             .user_identifier_index()
             .insert("miner-A".to_string(), 99);
+        engine
+            .token_to_user_identifier()
+            .insert(99, "miner-A".to_string());
         assert_eq!(engine.token_payout().len(), 1);
 
         TokenPayoutEvictor::on_allocated_evicted(&engine, 99);
         assert!(engine.token_payout().is_empty());
         assert!(engine.user_identifier_index().is_empty());
+        assert!(engine.token_to_user_identifier().is_empty());
     }
 
     #[test]
@@ -2803,11 +2987,15 @@ mod tests {
         engine
             .user_identifier_index()
             .insert("miner-B".to_string(), 7);
+        engine
+            .token_to_user_identifier()
+            .insert(7, "miner-B".to_string());
 
         // active_token=42, allocated_token=7.
         TokenPayoutEvictor::on_active_evicted(&engine, 42, 7);
         assert!(engine.token_payout().is_empty());
         assert!(engine.user_identifier_index().is_empty());
+        assert!(engine.token_to_user_identifier().is_empty());
     }
 
     #[test]
@@ -2819,11 +3007,545 @@ mod tests {
         engine
             .user_identifier_index()
             .insert("miner-C".to_string(), 1);
+        engine
+            .token_to_user_identifier()
+            .insert(1, "miner-C".to_string());
 
         TokenPayoutEvictor::on_allocated_evicted(&engine, 999);
         // Unrelated entry survives.
         assert_eq!(engine.token_payout().len(), 1);
         assert!(engine.token_payout().contains_key(&1));
         assert!(engine.user_identifier_index().contains_key("miner-C"));
+        assert!(engine.token_to_user_identifier().contains_key(&1));
+    }
+
+    // ------------------------------------------------------------------
+    //  Item #5, #6, #7, #9, #10 (Phase 3 hardening) regression tests
+    // ------------------------------------------------------------------
+
+    /// Item #5: the labeled skip counter must fire with reason=`no_tdp`
+    /// when handles are wired but the engine has no TDP handle.
+    ///
+    /// Constructs an engine with `EngineHandles` (chain + bitcoind) but
+    /// leaves `tdp` unset, drives a full declare→SCMJ cycle, and asserts
+    /// the labeled counter for `no_tdp` is +1 while every other reason
+    /// stays at zero.
+    #[tokio::test]
+    async fn validation_skipped_records_reason_label_no_tdp() {
+        use std::sync::Arc;
+
+        use bitcoin::hashes::Hash as _;
+        use bitcoindrpc::{BitcoindLike, mock::MockBitcoind};
+        use prometheus::Registry;
+        use stratum_apps::stratum_core::{
+            binary_sv2::B016M, job_declaration_sv2::ProvideMissingTransactionsSuccess,
+        };
+
+        use crate::share_chain_reader::mock::MockShareChain;
+        use crate::{EngineHandles, EngineMetrics, ShareChainReader};
+
+        let registry = Registry::new();
+        let metrics = EngineMetrics::register(&registry).expect("register");
+
+        let chain: Arc<dyn ShareChainReader> = Arc::new(MockShareChain::with_no_genesis());
+        let bitcoind: Arc<dyn BitcoindLike> = Arc::new(MockBitcoind::default());
+        // Handles wired but NO tdp (`.with_tdp(...)` deliberately not called).
+        // `declared.tip` stays at TipMetadata::default() so the min_ntime
+        // pre-check is skipped as well.
+        let engine = P2poolV2Engine::with_handles(
+            bitcoin::Network::Regtest,
+            EngineHandles { chain, bitcoind },
+        )
+        .with_metrics(metrics.clone());
+
+        // Two-step declare mirroring the fixture's happy path.
+        let cb = build_coinbase(vec![0; 16]);
+        let (prefix, suffix) = split_coinbase(&cb, 16);
+        let fake_tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from_bytes(vec![1, 2, 3, 4]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::ZERO,
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let wtxid_bytes: [u8; 32] = *fake_tx.compute_wtxid().as_byte_array();
+        let serialized_tx = bitcoin::consensus::serialize(&fake_tx);
+        let tx_bytes: B016M<'static> = serialized_tx.try_into().expect("fits");
+        let pmts = ProvideMissingTransactionsSuccess {
+            request_id: 7,
+            transaction_list: stratum_apps::stratum_core::binary_sv2::Seq064K::new(vec![tx_bytes])
+                .expect("fits"),
+        };
+        let declare = build_declare_mining_job(
+            7,
+            99,
+            0x20000000,
+            prefix.clone(),
+            suffix.clone(),
+            vec![wtxid_bytes],
+        );
+        assert!(matches!(
+            engine.handle_declare_mining_job(declare, Some(pmts)).await,
+            DeclareMiningJobResult::Success
+        ));
+
+        // Cross-checks: tip is default, so the SCMJ takes the
+        // fallback-arm path — no_tdp counter must bump.
+        let cached = engine.declared_jobs().get(&7).expect("cached");
+        let reconstructed = crate::coinbase::reconstruct_coinbase(
+            &cached.coinbase_tx_prefix,
+            &cached.coinbase_tx_suffix,
+        )
+        .expect("reconstruct");
+        let outputs_serialized = bitcoin::consensus::serialize(&reconstructed.output);
+        let coinbase_txid = reconstructed.compute_txid();
+        let txid_list = cached.txid_list.as_ref().expect("txid_list").clone();
+        let merkle = crate::coinbase::merkle_path(coinbase_txid, &txid_list);
+        let merkle_arr: Vec<[u8; 32]> = merkle
+            .iter()
+            .map(|m| m.as_byte_array().to_owned())
+            .collect();
+        let custom = build_set_custom_mining_job(
+            99,
+            0x20000000,
+            [0u8; 32],
+            0,
+            outputs_serialized,
+            merkle_arr,
+        );
+
+        let result = engine.handle_set_custom_mining_job(custom, 99).await;
+        assert!(matches!(result, SetCustomMiningJobResult::Success));
+        assert_eq!(
+            metrics
+                .set_custom_mining_job_validation_skipped
+                .with_label_values(&["no_tdp"])
+                .get(),
+            1,
+            "no_tdp reason counter must fire on the fallback arm"
+        );
+        for other in [
+            "no_handles",
+            "no_template_id",
+            "tdp_fetch_failed",
+            "bitcoind_rpc_error",
+        ] {
+            assert_eq!(
+                metrics
+                    .set_custom_mining_job_validation_skipped
+                    .with_label_values(&[other])
+                    .get(),
+                0,
+                "sibling reason {other} must stay at zero"
+            );
+        }
+    }
+
+    /// Item #5: `no_handles` reason. Engine constructed with
+    /// `P2poolV2Engine::new` (no handles, no TDP). Even without
+    /// handles, SetCustomMiningJob still passes structural checks;
+    /// the fallback arm bumps the counter with `no_handles` since
+    /// handles trumps tdp in the priority ordering.
+    #[tokio::test]
+    async fn validation_skipped_records_reason_label_no_handles() {
+        use bitcoin::hashes::Hash as _;
+        use prometheus::Registry;
+        use stratum_apps::stratum_core::{
+            binary_sv2::{B016M, Seq064K},
+            job_declaration_sv2::ProvideMissingTransactionsSuccess,
+        };
+
+        use crate::EngineMetrics;
+
+        let registry = Registry::new();
+        let metrics = EngineMetrics::register(&registry).expect("register");
+        let engine = P2poolV2Engine::new(bitcoin::Network::Regtest).with_metrics(metrics.clone());
+
+        let cb = build_coinbase(vec![0; 16]);
+        let (prefix, suffix) = split_coinbase(&cb, 16);
+        let fake_tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from_bytes(vec![1, 2, 3, 4]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::ZERO,
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let wtxid_bytes: [u8; 32] = *fake_tx.compute_wtxid().as_byte_array();
+        let tx_bytes: B016M<'static> = bitcoin::consensus::serialize(&fake_tx)
+            .try_into()
+            .expect("fits");
+        let pmts = ProvideMissingTransactionsSuccess {
+            request_id: 7,
+            transaction_list: Seq064K::new(vec![tx_bytes]).expect("fits"),
+        };
+        let declare = build_declare_mining_job(
+            7,
+            99,
+            0x20000000,
+            prefix.clone(),
+            suffix.clone(),
+            vec![wtxid_bytes],
+        );
+        assert!(matches!(
+            engine.handle_declare_mining_job(declare, Some(pmts)).await,
+            DeclareMiningJobResult::Success
+        ));
+
+        let cached = engine.declared_jobs().get(&7).expect("cached");
+        let reconstructed = crate::coinbase::reconstruct_coinbase(
+            &cached.coinbase_tx_prefix,
+            &cached.coinbase_tx_suffix,
+        )
+        .expect("reconstruct");
+        let outputs_serialized = bitcoin::consensus::serialize(&reconstructed.output);
+        let coinbase_txid = reconstructed.compute_txid();
+        let txid_list = cached.txid_list.as_ref().expect("txid_list").clone();
+        let merkle = crate::coinbase::merkle_path(coinbase_txid, &txid_list);
+        let merkle_arr: Vec<[u8; 32]> = merkle
+            .iter()
+            .map(|m| m.as_byte_array().to_owned())
+            .collect();
+        let custom = build_set_custom_mining_job(
+            99,
+            0x20000000,
+            [0u8; 32],
+            0,
+            outputs_serialized,
+            merkle_arr,
+        );
+
+        let result = engine.handle_set_custom_mining_job(custom, 99).await;
+        assert!(matches!(result, SetCustomMiningJobResult::Success));
+        assert_eq!(
+            metrics
+                .set_custom_mining_job_validation_skipped
+                .with_label_values(&["no_handles"])
+                .get(),
+            1,
+            "no_handles reason must fire when neither handles nor TDP are wired"
+        );
+    }
+
+    /// Item #5: `no_template_id` reason. Engine wired with handles +
+    /// TDP but the declare-time snapshot has no `template_id`
+    /// (e.g. no `NewTemplate` recorded). The SCMJ path hits the
+    /// fallback arm with `no_template_id`.
+    #[tokio::test]
+    async fn validation_skipped_records_reason_label_no_template_id() {
+        use std::sync::Arc;
+
+        use bitcoin::hashes::Hash as _;
+        use bitcoindrpc::{BitcoindLike, mock::MockBitcoind};
+        use prometheus::Registry;
+        use stratum_apps::stratum_core::{
+            binary_sv2::{B016M, Seq064K},
+            job_declaration_sv2::ProvideMissingTransactionsSuccess,
+        };
+
+        use crate::share_chain_reader::mock::MockShareChain;
+        use crate::{EngineHandles, EngineMetrics, ShareChainReader, TdpHandle};
+
+        let registry = Registry::new();
+        let metrics = EngineMetrics::register(&registry).expect("register");
+        let chain: Arc<dyn ShareChainReader> = Arc::new(MockShareChain::with_no_genesis());
+        let bitcoind: Arc<dyn BitcoindLike> = Arc::new(MockBitcoind::default());
+        let (req_tx, _req_rx) = async_channel::unbounded();
+        let tdp = TdpHandle::new(req_tx);
+        // Deliberately do NOT call `record_new_template` — template_id
+        // stays None on the cached DeclaredJob. Also no `record_set_new_prev_hash`,
+        // so tip stays default and min_ntime pre-check is skipped.
+        let engine = P2poolV2Engine::with_handles(
+            bitcoin::Network::Regtest,
+            EngineHandles { chain, bitcoind },
+        )
+        .with_tdp(tdp)
+        .with_metrics(metrics.clone());
+
+        let cb = build_coinbase(vec![0; 16]);
+        let (prefix, suffix) = split_coinbase(&cb, 16);
+        let fake_tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from_bytes(vec![1, 2, 3, 4]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::ZERO,
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let wtxid_bytes: [u8; 32] = *fake_tx.compute_wtxid().as_byte_array();
+        let tx_bytes: B016M<'static> = bitcoin::consensus::serialize(&fake_tx)
+            .try_into()
+            .expect("fits");
+        let pmts = ProvideMissingTransactionsSuccess {
+            request_id: 7,
+            transaction_list: Seq064K::new(vec![tx_bytes]).expect("fits"),
+        };
+        let declare = build_declare_mining_job(
+            7,
+            99,
+            0x20000000,
+            prefix.clone(),
+            suffix.clone(),
+            vec![wtxid_bytes],
+        );
+        assert!(matches!(
+            engine.handle_declare_mining_job(declare, Some(pmts)).await,
+            DeclareMiningJobResult::Success
+        ));
+
+        let cached = engine.declared_jobs().get(&7).expect("cached");
+        assert!(
+            cached.template_id.is_none(),
+            "template_id must be None to exercise this arm"
+        );
+        let reconstructed = crate::coinbase::reconstruct_coinbase(
+            &cached.coinbase_tx_prefix,
+            &cached.coinbase_tx_suffix,
+        )
+        .expect("reconstruct");
+        let outputs_serialized = bitcoin::consensus::serialize(&reconstructed.output);
+        let coinbase_txid = reconstructed.compute_txid();
+        let txid_list = cached.txid_list.as_ref().expect("txid_list").clone();
+        let merkle = crate::coinbase::merkle_path(coinbase_txid, &txid_list);
+        let merkle_arr: Vec<[u8; 32]> = merkle
+            .iter()
+            .map(|m| m.as_byte_array().to_owned())
+            .collect();
+        let custom = build_set_custom_mining_job(
+            99,
+            0x20000000,
+            [0u8; 32],
+            0,
+            outputs_serialized,
+            merkle_arr,
+        );
+
+        let result = engine.handle_set_custom_mining_job(custom, 99).await;
+        assert!(matches!(result, SetCustomMiningJobResult::Success));
+        assert_eq!(
+            metrics
+                .set_custom_mining_job_validation_skipped
+                .with_label_values(&["no_template_id"])
+                .get(),
+            1,
+            "no_template_id reason must fire when TDP is wired but template_id is None"
+        );
+    }
+
+    /// Item #6: SCMJ with a `min_ntime` below the captured tip's
+    /// value must produce `Error(INVALID_NTIME)`.
+    #[tokio::test]
+    async fn min_ntime_mismatch_returns_invalid_ntime_error() {
+        use std::sync::Arc;
+
+        use bitcoindrpc::{BitcoindLike, ProposalOutcome, mock::MockBitcoind};
+        use prometheus::Registry;
+
+        use crate::EngineMetrics;
+
+        let registry = Registry::new();
+        let metrics = EngineMetrics::register(&registry).expect("register");
+        let bitcoind: Arc<dyn BitcoindLike> =
+            Arc::new(MockBitcoind::default().with_proposal_outcome(ProposalOutcome::Accepted));
+
+        // Fixture captures tip.min_ntime = 1_700_000_000. Rebuild the
+        // SCMJ with min_ntime = 1 (way below) → INVALID_NTIME.
+        let (engine, _happy_custom) =
+            scmj_validation_fixture(bitcoind.clone(), metrics.clone()).await;
+
+        // Re-run the setup for a second declared job (request_id = 8).
+        // The fixture already declared request_id=7 and consumed the
+        // matching token via handle_declare_mining_job; we redo the
+        // declare with a new request_id and matching token so the SCMJ
+        // has a fresh cached job to consume.
+        // Simpler: build the SCMJ against the token that the fixture
+        // just wrote, but with a bad min_ntime. Since the fixture
+        // already produced a happy `custom` variable, we can't reuse
+        // its token (already consumed). Instead: build the fixture
+        // twice — the second one runs against a different token.
+        // Easiest path: just check the mismatch on a fresh engine.
+        drop(engine);
+
+        let registry = Registry::new();
+        let metrics = EngineMetrics::register(&registry).expect("register");
+        let bitcoind: Arc<dyn BitcoindLike> =
+            Arc::new(MockBitcoind::default().with_proposal_outcome(ProposalOutcome::Accepted));
+        let (engine, custom_happy) = scmj_validation_fixture(bitcoind, metrics.clone()).await;
+
+        // Rebuild the SCMJ from the fixture's cached job but with a
+        // deliberately bad min_ntime (below the captured tip).
+        let cached = engine.declared_jobs().get(&7).expect("cached");
+        let reconstructed = crate::coinbase::reconstruct_coinbase(
+            &cached.coinbase_tx_prefix,
+            &cached.coinbase_tx_suffix,
+        )
+        .expect("reconstruct");
+        let outputs_serialized = bitcoin::consensus::serialize(&reconstructed.output);
+        let coinbase_txid = reconstructed.compute_txid();
+        let txid_list = cached.txid_list.as_ref().expect("txid_list").clone();
+        let merkle = crate::coinbase::merkle_path(coinbase_txid, &txid_list);
+        let merkle_arr: Vec<[u8; 32]> = merkle
+            .iter()
+            .map(|m| bitcoin::hashes::Hash::as_byte_array(m).to_owned())
+            .collect();
+        // Prev-hash + nbits mirror the happy SCMJ; only the ntime is
+        // pathological.
+        let bad_ntime_custom = build_set_custom_mining_job_with_ntime(
+            99,
+            0x20000000,
+            [9u8; 32],
+            0x207fffff,
+            1, // below the fixture's tip_min_ntime = 1_700_000_000
+            outputs_serialized.clone(),
+            merkle_arr.clone(),
+        );
+        let result = engine
+            .handle_set_custom_mining_job(bad_ntime_custom, 99)
+            .await;
+        match result {
+            SetCustomMiningJobResult::Error(code) => {
+                assert_eq!(
+                    code, ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_NTIME,
+                    "min_ntime below tip must return INVALID_NTIME"
+                );
+            }
+            _ => panic!("expected Error(INVALID_NTIME) for min_ntime below tip"),
+        }
+
+        // Silence unused-variable lint on the fixture's happy custom.
+        let _ = custom_happy;
+    }
+
+    /// Item #7: a `BitcoindRpcError` on the SCMJ validation path
+    /// results in structural-only Success (skip fall-through), the
+    /// labeled skip counter bumps with `reason=bitcoind_rpc_error`.
+    /// This mirrors — with a different assertion focus — the
+    /// updated `scmj_proposal_validation_rpc_error_bumps_rpc_error_counter`
+    /// test above; here the focus is on the labeled SKIP counter.
+    #[tokio::test]
+    async fn bitcoind_rpc_error_treated_as_skip_with_reason() {
+        use std::sync::Arc;
+
+        use bitcoindrpc::{BitcoindLike, mock::MockBitcoind};
+        use prometheus::Registry;
+
+        use crate::EngineMetrics;
+
+        let registry = Registry::new();
+        let metrics = EngineMetrics::register(&registry).expect("register");
+        // Default MockBitcoind: validate_block_proposal is unscripted
+        // and returns Err(BitcoindRpcError::Other("...")).
+        let bitcoind: Arc<dyn BitcoindLike> = Arc::new(MockBitcoind::default());
+        let (engine, custom) = scmj_validation_fixture(bitcoind, metrics.clone()).await;
+
+        let result = engine.handle_set_custom_mining_job(custom, 99).await;
+        assert!(
+            matches!(result, SetCustomMiningJobResult::Success),
+            "RPC error falls through to Success"
+        );
+        assert_eq!(
+            metrics
+                .set_custom_mining_job_validation_skipped
+                .with_label_values(&["bitcoind_rpc_error"])
+                .get(),
+            1,
+            "labeled skip counter must bump with reason=bitcoind_rpc_error"
+        );
+    }
+
+    /// Item #9: `drop_token_payout` sweeps the inverse index even when
+    /// the forward `token_payout` is already empty. Simulates a
+    /// double-eviction call from the JDS (on_allocated_evicted after
+    /// on_active_evicted, or vice-versa) that finds the forward map
+    /// already gone.
+    #[test]
+    fn drop_token_payout_sweeps_inverse_even_when_forward_already_gone() {
+        let engine = P2poolV2Engine::default();
+        // Populate ONLY the inverse index + reverse pointer; leave
+        // token_payout empty as if the forward remove already ran.
+        engine
+            .user_identifier_index()
+            .insert("miner-orphan".to_string(), 55);
+        engine
+            .token_to_user_identifier()
+            .insert(55, "miner-orphan".to_string());
+        assert!(engine.token_payout().is_empty());
+
+        engine.drop_token_payout(55);
+
+        assert!(
+            engine.user_identifier_index().is_empty(),
+            "inverse index must be swept even when forward map was already empty"
+        );
+        assert!(
+            engine.token_to_user_identifier().is_empty(),
+            "reverse pointer must also be cleared"
+        );
+    }
+
+    /// Item #10: `drop_token_payout` uses the reverse pointer to
+    /// remove exactly the one inverse-index row for `token`, without
+    /// touching other users' rows. Also asserts a concurrent overwrite
+    /// (miner reused for a fresh token before the eviction fires) is
+    /// preserved via the `remove_if` predicate.
+    #[test]
+    fn drop_token_payout_uses_reverse_pointer() {
+        let engine = P2poolV2Engine::default();
+
+        // Two live miners with distinct tokens.
+        engine.token_payout().insert(1, payout_script(1));
+        engine.token_payout().insert(2, payout_script(2));
+        engine.user_identifier_index().insert("alice".into(), 1);
+        engine.user_identifier_index().insert("bob".into(), 2);
+        engine.token_to_user_identifier().insert(1, "alice".into());
+        engine.token_to_user_identifier().insert(2, "bob".into());
+
+        // Drop alice's binding.
+        engine.drop_token_payout(1);
+
+        // Only alice's rows are gone; bob's are untouched.
+        assert!(engine.token_payout().contains_key(&2));
+        assert!(!engine.token_payout().contains_key(&1));
+        assert!(engine.user_identifier_index().contains_key("bob"));
+        assert!(!engine.user_identifier_index().contains_key("alice"));
+        assert!(engine.token_to_user_identifier().contains_key(&2));
+        assert!(!engine.token_to_user_identifier().contains_key(&1));
+
+        // Concurrent-overwrite guard: pretend the JDS re-bound
+        // "bob" to a NEW token (=3) between the reverse-pointer
+        // read and the inverse-index remove.
+        engine.user_identifier_index().insert("bob".into(), 3);
+        // A late eviction for token=2 must NOT touch bob's row
+        // now — the reverse pointer still says (2 → "bob") but the
+        // forward row's bound token is now 3.
+        engine.drop_token_payout(2);
+        assert_eq!(
+            *engine
+                .user_identifier_index()
+                .get("bob")
+                .expect("bob's row must survive the late eviction")
+                .value(),
+            3,
+            "concurrent overwrite must be preserved by remove_if predicate"
+        );
     }
 }

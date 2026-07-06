@@ -78,8 +78,11 @@ use p2poolv2_capnp_types::p2poolv2_capnp::{
 };
 use thiserror::Error;
 use tokio::net::UnixStream;
+use tokio::sync::watch;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info};
+
+pub mod metrics;
 
 /// Errors emitted by the IPC client.
 #[derive(Debug, Error)]
@@ -175,15 +178,43 @@ pub enum ValidationOutcome {
     MissingTransactions(Vec<Vec<u8>>),
 }
 
+/// Health state of the IPC client's `RpcSystem` driver.
+///
+/// Observed by callers via [`Sv2P2poolIpcClient::health`]. Flips to
+/// [`IpcClientHealth::Disconnected`] the moment the driver task exits
+/// — either because of a transport-level error (Item #4 of the
+/// Phase 3 hardening pass) or because the client itself was dropped.
+/// The variant does not distinguish the two: callers only care that
+/// the driver is no longer pumping messages, and the labeled
+/// [`crate::metrics::IPC_CLIENT_DRIVER_EXIT_TOTAL`] counter carries
+/// the finer-grained `result="error"|"clean"` split for dashboards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcClientHealth {
+    /// The RpcSystem driver is still running.
+    Connected,
+    /// The RpcSystem driver has terminated. All in-flight capnp
+    /// calls will now fail with `capnp::Error::disconnected(...)` on
+    /// the next await; the client should be re-connected or the
+    /// process shut down.
+    Disconnected,
+}
+
 /// Connected client. Wraps a [`share_chain::Client`] capability handle.
 ///
 /// `Clone`-able cheaply (capnp client capabilities are reference-counted),
 /// but `!Send` because the underlying [`RpcSystem`] driver runs in a
 /// `LocalSet`. The driver is spawned automatically on construction; it
 /// runs until the `Sv2P2poolIpcClient` (the last clone) is dropped.
+///
+/// The client also owns a [`watch::Sender<IpcClientHealth>`] whose
+/// receiver is handed out via [`Sv2P2poolIpcClient::health`]. The
+/// sender is stored inside an `Rc` so cloning the client shares the
+/// same sender + broadcast tree — every clone observes the driver's
+/// exit event.
 #[derive(Clone)]
 pub struct Sv2P2poolIpcClient {
     client: share_chain::Client,
+    health_tx: Rc<watch::Sender<IpcClientHealth>>,
 }
 
 impl Sv2P2poolIpcClient {
@@ -213,18 +244,85 @@ impl Sv2P2poolIpcClient {
         let mut rpc_system = RpcSystem::new(Box::new(network), None);
         let client: share_chain::Client = rpc_system.bootstrap(rpc_twoparty_capnp::Side::Server);
 
+        // Health broadcast. `watch` is the right primitive here: the
+        // value is a small enum, receivers should re-read the current
+        // state whenever they wake up, and multiple clones of the
+        // client share the same sender via `Rc`. `watch::Sender` is
+        // `!Send + !Sync` when wrapped in `Rc`, which matches the
+        // client's overall `!Send` constraint — the whole thing lives
+        // on a `LocalSet`.
+        let (health_tx, _health_rx) = watch::channel(IpcClientHealth::Connected);
+        let health_tx = Rc::new(health_tx);
+        let health_tx_for_driver = Rc::clone(&health_tx);
+
         // Drive the RpcSystem in the background. capnp-rpc's RpcSystem
         // is !Send + a Future; spawn_local lives on a LocalSet and is
         // the only way to drive it.
+        //
+        // Item #4 (Phase 3 hardening): the driver used to only emit
+        // a `warn!()` line on error, so silent disconnects were
+        // invisible to the pool binary — the actor would happily
+        // return `capnp::Error::disconnected(...)` on every method
+        // call after the driver died, with no way to distinguish
+        // that from a transient RPC error. We now:
+        //   1. Flip the health watch to `Disconnected` BEFORE
+        //      logging, so any caller waiting on
+        //      `changed().await` observes the flip immediately.
+        //   2. Escalate the log to `error!` for the transport-error
+        //      case (from `warn!`) so the ops on-call sees it.
+        //   3. Bump `ipc_client_driver_exit_total{result}` with the
+        //      appropriate label so alerting can key on the counter.
         tokio::task::spawn_local(async move {
-            if let Err(e) = rpc_system.await {
-                warn!(error = %e, "RpcSystem driver exited");
-            } else {
-                debug!("RpcSystem driver exited cleanly");
+            match rpc_system.await {
+                Ok(()) => {
+                    debug!("RpcSystem driver exited cleanly");
+                    // Even a clean exit means the client is no
+                    // longer pumping messages; callers on the health
+                    // watch should treat that as Disconnected too.
+                    // The counter split (`result="clean"` vs
+                    // `result="error"`) preserves the operator's
+                    // ability to alert only on error.
+                    let _ = health_tx_for_driver.send(IpcClientHealth::Disconnected);
+                    metrics::IPC_CLIENT_DRIVER_EXIT_TOTAL
+                        .with_label_values(&[metrics::DRIVER_EXIT_RESULT_CLEAN])
+                        .inc();
+                }
+                Err(e) => {
+                    // Flip health FIRST so a task observing the watch
+                    // wakes up before we spend microseconds formatting
+                    // the log line. Order matters when the caller's
+                    // shutdown latency is what we're trying to
+                    // minimize.
+                    let _ = health_tx_for_driver.send(IpcClientHealth::Disconnected);
+                    metrics::IPC_CLIENT_DRIVER_EXIT_TOTAL
+                        .with_label_values(&[metrics::DRIVER_EXIT_RESULT_ERROR])
+                        .inc();
+                    error!(error = %e, "RpcSystem driver exited with error — IPC client is no longer usable");
+                }
             }
         });
 
-        Ok(Self { client })
+        Ok(Self { client, health_tx })
+    }
+
+    /// Subscribe to health-state changes of the RpcSystem driver.
+    ///
+    /// The returned [`watch::Receiver`] starts with the current
+    /// health value (initially [`IpcClientHealth::Connected`]) and
+    /// updates whenever the driver task exits.
+    ///
+    /// Callers typically spawn a supervisor task that
+    /// `changed().await`s and, on [`IpcClientHealth::Disconnected`],
+    /// tears down whatever downstream resources depend on the client
+    /// still pumping messages (see the `IpcChain` actor in
+    /// `sv2-p2pool-pool`).
+    ///
+    /// Note: `Sv2P2poolIpcClient` is `!Send` — the receiver returned
+    /// here is `Send`-able (`watch::Receiver<T: Send + Sync>` is
+    /// `Send`), but obtaining one still requires calling `health`
+    /// from the client's `LocalSet`.
+    pub fn health(&self) -> watch::Receiver<IpcClientHealth> {
+        self.health_tx.subscribe()
     }
 
     /// Call `validateTemplate` against the server. Returns the
@@ -872,6 +970,101 @@ mod tests {
                 let client = Sv2P2poolIpcClient::connect(&sock).await.expect("connect");
                 let res = client.get_chain_tip().await;
                 assert!(res.is_err(), "expected error from unwired backend");
+            })
+            .await;
+    }
+
+    /// Item #4 (Phase 3 hardening): when the RpcSystem driver exits,
+    /// the client's health watch must flip to `Disconnected` and the
+    /// `ipc_client_driver_exit_total` counter must bump. We drive the
+    /// exit by connecting a client to a bare `UnixListener` (no
+    /// capnp-rpc server behind it), accepting the socket, and then
+    /// dropping the accepted peer — that closes the transport under
+    /// the RpcSystem's feet. The driver observes the EOF and exits;
+    /// either the `error` or `clean` counter bumps depending on the
+    /// exact capnp-rpc semantics for this shutdown. The assertion is
+    /// on the SUM of the two labels so the test is robust to future
+    /// capnp-rpc changes.
+    #[tokio::test]
+    async fn ipc_driver_exit_bumps_counter_and_flips_health_watch() {
+        use std::time::Duration;
+
+        use tokio::net::UnixListener;
+
+        let (_dir, sock) = temp_socket();
+
+        // Baseline counters — delta-based to survive process-wide
+        // shared collectors and any other test that may have run.
+        let baseline_error = crate::metrics::IPC_CLIENT_DRIVER_EXIT_TOTAL
+            .with_label_values(&[crate::metrics::DRIVER_EXIT_RESULT_ERROR])
+            .get();
+        let baseline_clean = crate::metrics::IPC_CLIENT_DRIVER_EXIT_TOTAL
+            .with_label_values(&[crate::metrics::DRIVER_EXIT_RESULT_CLEAN])
+            .get();
+
+        // Bare listener: no capnp-rpc server behind it.
+        let listener = UnixListener::bind(&sock).expect("bind uds");
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let accept_task =
+                    tokio::spawn(async move { listener.accept().await.expect("accept") });
+
+                let client = Sv2P2poolIpcClient::connect(&sock).await.expect("connect");
+                assert_eq!(
+                    *client.health().borrow(),
+                    IpcClientHealth::Connected,
+                    "health starts at Connected"
+                );
+
+                // Grab the accepted peer, then drop it so the client
+                // sees an EOF.
+                let (peer, _addr) = accept_task.await.expect("accept task");
+                drop(peer);
+
+                // Wait for the flip. `changed().await` wakes on any
+                // transition; bound the wait.
+                let mut health_rx = client.health();
+                let deadline = tokio::time::sleep(Duration::from_secs(5));
+                tokio::pin!(deadline);
+                loop {
+                    let current = *health_rx.borrow_and_update();
+                    if matches!(current, IpcClientHealth::Disconnected) {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = &mut deadline => {
+                            panic!(
+                                "health watch never flipped to Disconnected within 5s; \
+                                 current = {:?}",
+                                *health_rx.borrow()
+                            );
+                        }
+                        changed = health_rx.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // The counter must have bumped somewhere (either
+                // arm). Which arm fires depends on whether capnp-rpc
+                // sees the drop as EOF-clean or transport-error.
+                let after_error = crate::metrics::IPC_CLIENT_DRIVER_EXIT_TOTAL
+                    .with_label_values(&[crate::metrics::DRIVER_EXIT_RESULT_ERROR])
+                    .get();
+                let after_clean = crate::metrics::IPC_CLIENT_DRIVER_EXIT_TOTAL
+                    .with_label_values(&[crate::metrics::DRIVER_EXIT_RESULT_CLEAN])
+                    .get();
+                let total_before = baseline_error + baseline_clean;
+                let total_after = after_error + after_clean;
+                assert!(
+                    total_after > total_before,
+                    "ipc_client_driver_exit_total must bump on driver exit: \
+                     before(error+clean)={total_before}, after={total_after}"
+                );
             })
             .await;
     }
